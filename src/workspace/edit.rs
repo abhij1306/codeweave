@@ -1,0 +1,693 @@
+use super::io_helpers::{atomic_write, render_diff, restore_one};
+use super::journal::{trim_journal, MutationRecord};
+use super::util::{
+    changes_without_independent_preconditions, line_offset, line_range_bytes,
+    stale_snapshot_for_paths,
+};
+use super::WorkspaceActor;
+use crate::index::{content_hash, decode_handle, CodeIndex};
+use crate::model::{bool_value, required_str, string_list, usize_value, AppError, AppResult};
+use crate::security::{resolve_for_write, validate_relative};
+use crate::symbols::{extract_symbols, parse_has_error};
+use crate::tasks::StartRequest;
+use chrono::Utc;
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{atomic::Ordering, Arc};
+use std::time::Instant;
+use uuid::Uuid;
+
+#[derive(Debug, Clone)]
+pub(super) struct PlannedFile {
+    pub(super) path: String,
+    pub(super) before: Option<String>,
+    pub(super) after: Option<String>,
+}
+
+struct AppliedEdit {
+    planned: Vec<PlannedFile>,
+    request_id: String,
+    apply_result: Vec<MutationRecord>,
+    diff: String,
+    snapshot_rebased_from: Option<String>,
+}
+
+enum PreparedEdit {
+    Preview(Value),
+    Applied(AppliedEdit),
+}
+
+impl WorkspaceActor {
+    pub async fn code_edit(self: &Arc<Self>, params: &Value) -> AppResult<Value> {
+        let validate = string_list(params, "validate");
+        self.tasks.validate_profiles(&validate)?;
+        let write_guard = self.write_lock.clone().lock_owned().await;
+        let actor = Arc::clone(self);
+        let params_owned = params.clone();
+        let prepared =
+            tokio::task::spawn_blocking(move || actor.prepare_edit(&params_owned, write_guard))
+                .await
+                .map_err(AppError::internal)??;
+
+        let applied = match prepared {
+            PreparedEdit::Preview(value) => return Ok(value),
+            PreparedEdit::Applied(applied) => applied,
+        };
+        let AppliedEdit {
+            planned,
+            request_id,
+            apply_result,
+            diff,
+            snapshot_rebased_from,
+        } = applied;
+
+        let mut validation = Vec::new();
+        let mut validation_failed = false;
+        for profile in validate {
+            match self
+                .tasks
+                .start(
+                    &self.root,
+                    StartRequest {
+                        profile: Some(profile.clone()),
+                        command: None,
+                        cwd: None,
+                        shell: false,
+                        background: false,
+                        timeout_ms: None,
+                    },
+                )
+                .await
+            {
+                Ok(result) => {
+                    if result.get("status").and_then(Value::as_str) != Some("succeeded") {
+                        validation_failed = true;
+                    }
+                    validation.push(json!({"profile": profile, "result": result}));
+                }
+                Err(error) => {
+                    validation_failed = true;
+                    validation.push(json!({
+                        "profile": profile,
+                        "error": error.0,
+                    }));
+                }
+            }
+            if validation_failed {
+                break;
+            }
+        }
+        let rollback_on_failure = bool_value(params, "rollback_on_failure", true);
+        if validation_failed && rollback_on_failure {
+            let write_guard = self.write_lock.clone().lock_owned().await;
+            let actor = Arc::clone(self);
+            let rollback_request_id = request_id.clone();
+            let rollback_result = tokio::task::spawn_blocking(move || {
+                let _write_guard = write_guard;
+                actor.recheck_applied_state(&planned)?;
+                actor.restore_plan(&planned, &rollback_request_id)
+            })
+            .await
+            .map_err(AppError::internal)?;
+            if let Err(error) = rollback_result {
+                return Ok(json!({
+                    "applied": true,
+                    "rolled_back": false,
+                    "reason": "validation_failed_rollback_conflict",
+                    "rollback_error": error.0,
+                    "snapshot_rebased_from": snapshot_rebased_from,
+                    "diff": diff,
+                    "validation": validation,
+                    "generation": self.generation(),
+                    "snapshot_id": self.snapshot(),
+                    "mutations": apply_result
+                }));
+            }
+            return Ok(json!({
+                "applied": false,
+                "rolled_back": true,
+                "reason": "validation_failed",
+                "snapshot_rebased_from": snapshot_rebased_from,
+                "diff": diff,
+                "validation": validation,
+                "generation": self.generation(),
+                "snapshot_id": self.snapshot(),
+                "mutations": apply_result
+            }));
+        }
+
+        self.reconcile_pending_async().await?;
+        Ok(json!({
+            "applied": true,
+            "rolled_back": false,
+            "snapshot_rebased_from": snapshot_rebased_from,
+            "diff": diff,
+            "validation": validation,
+            "generation": self.generation(),
+            "snapshot_id": self.snapshot(),
+            "mutations": apply_result
+        }))
+    }
+
+    fn prepare_edit(
+        &self,
+        params: &Value,
+        write_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> AppResult<PreparedEdit> {
+        self.reconcile_pending()?;
+        let current_snapshot = self.snapshot();
+        let requested_snapshot = params
+            .get("snapshot_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let changes = params
+            .get("changes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AppError::invalid("changes must be an array"))?;
+        if changes.is_empty() {
+            return Err(AppError::invalid("changes cannot be empty"));
+        }
+        let snapshot_matches = requested_snapshot
+            .as_deref()
+            .map(|expected| expected == current_snapshot)
+            .unwrap_or(true);
+        if !snapshot_matches {
+            let unsafe_paths = changes_without_independent_preconditions(changes);
+            if !unsafe_paths.is_empty() {
+                return Err(stale_snapshot_for_paths(
+                    requested_snapshot.as_deref().unwrap_or_default(),
+                    &current_snapshot,
+                    &unsafe_paths,
+                ));
+            }
+        }
+        let index = self.index.read();
+        self.preflight_overlaps(changes, &index)?;
+        let mut plan: HashMap<String, PlannedFile> = HashMap::new();
+        for change in changes {
+            self.plan_change(
+                change,
+                requested_snapshot.is_some() && snapshot_matches,
+                &mut plan,
+                &index,
+            )?;
+        }
+        drop(index);
+        let mut planned: Vec<PlannedFile> = plan.into_values().collect();
+        planned.sort_by(|a, b| a.path.cmp(&b.path));
+        for item in &planned {
+            if let Some(after) = &item.after {
+                let absolute = resolve_for_write(&self.root, &item.path)?;
+                if parse_has_error(&absolute, after) == Some(true) {
+                    return Err(AppError::details(
+                        "SYNTAX_ERROR",
+                        "Tree-sitter found syntax errors in planned content",
+                        json!({"path": item.path}),
+                    ));
+                }
+            }
+        }
+        let diff = render_diff(&planned);
+        let snapshot_rebased_from = requested_snapshot.filter(|_| !snapshot_matches);
+        if bool_value(params, "preview", false) {
+            return Ok(PreparedEdit::Preview(json!({
+                "preview": true,
+                "workspace_id": self.id,
+                "generation": self.generation(),
+                "snapshot_id": current_snapshot,
+                "snapshot_rebased_from": snapshot_rebased_from,
+                "diff": diff,
+                "files": planned.iter().map(|item| &item.path).collect::<Vec<_>>()
+            })));
+        }
+        self.recheck_preconditions(&planned)?;
+        let request_id = format!("req_{}", Uuid::new_v4().simple());
+        let apply_result = self.commit_plan(&planned, &request_id)?;
+        drop(write_guard);
+        Ok(PreparedEdit::Applied(AppliedEdit {
+            planned,
+            request_id,
+            apply_result,
+            diff,
+            snapshot_rebased_from,
+        }))
+    }
+
+    fn preflight_overlaps(&self, changes: &[Value], index: &CodeIndex) -> AppResult<()> {
+        let mut ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        for change in changes {
+            if change.get("kind").and_then(Value::as_str) != Some("replace") {
+                continue;
+            }
+            let path = required_str(change, "path")?.replace('\\', "/");
+            let old = required_str(change, "old_text")?;
+            let expected = usize_value(change, "expected_replacements", 1);
+            let content = &index
+                .get(&path)
+                .ok_or_else(|| {
+                    AppError::details(
+                        "PATH_NOT_INDEXED",
+                        "Replace path is not indexed",
+                        json!({"path": path}),
+                    )
+                })?
+                .content;
+            let (base_offset, selected) = if let Some(encoded) =
+                change.get("handle").and_then(Value::as_str)
+            {
+                let handle = decode_handle(encoded)?;
+                if handle.workspace_id != self.id || handle.path != path {
+                    return Err(AppError::new(
+                        "INVALID_HANDLE",
+                        "Edit handle does not match workspace/path",
+                    ));
+                }
+                let (start, end) = line_range_bytes(content, handle.start_line, handle.end_line)?;
+                (start, &content[start..end])
+            } else {
+                (0, content.as_str())
+            };
+            let found: Vec<_> = selected
+                .match_indices(old)
+                .map(|(start, text)| {
+                    let start = base_offset + start;
+                    (start, start + text.len())
+                })
+                .collect();
+            if found.len() != expected {
+                return Err(AppError::details(
+                    "EXACT_MATCH_COUNT",
+                    "Exact replacement count did not match",
+                    json!({"path": path, "expected": expected, "actual": found.len()}),
+                ));
+            }
+            let existing = ranges.entry(path.clone()).or_default();
+            for range in found {
+                if existing
+                    .iter()
+                    .any(|other| range.0 < other.1 && other.0 < range.1)
+                {
+                    return Err(AppError::details(
+                        "OVERLAPPING_EDITS",
+                        "Two exact edits overlap",
+                        json!({"path": path}),
+                    ));
+                }
+                existing.push(range);
+            }
+        }
+        Ok(())
+    }
+
+    fn plan_change(
+        &self,
+        change: &Value,
+        has_snapshot: bool,
+        plan: &mut HashMap<String, PlannedFile>,
+        index: &CodeIndex,
+    ) -> AppResult<()> {
+        let kind = required_str(change, "kind")?;
+        let path = required_str(change, "path")?.replace('\\', "/");
+        validate_relative(&path)?;
+        let expected_hash = change.get("expected_hash").and_then(Value::as_str);
+        let edit_handle = change
+            .get("handle")
+            .and_then(Value::as_str)
+            .map(decode_handle)
+            .transpose()?;
+        if let Some(handle) = &edit_handle {
+            if handle.workspace_id != self.id || handle.path != path {
+                return Err(AppError::new(
+                    "INVALID_HANDLE",
+                    "Edit handle does not match workspace/path",
+                ));
+            }
+        }
+        let handle_hash = edit_handle
+            .as_ref()
+            .map(|handle| handle.content_hash.as_str());
+        let before = plan
+            .get(&path)
+            .map(|item| item.after.clone())
+            .unwrap_or_else(|| index.get(&path).map(|file| file.content.clone()));
+        let original_hash = plan
+            .get(&path)
+            .and_then(|item| item.before.as_ref())
+            .map(|content| content_hash(content))
+            .or_else(|| before.as_ref().map(|content| content_hash(content)));
+        let edits_existing_file = kind != "create" || before.is_some();
+        if edits_existing_file && !has_snapshot && expected_hash.is_none() && handle_hash.is_none()
+        {
+            return Err(AppError::details(
+                "MISSING_PRECONDITION",
+                "Existing-file edits require snapshot_id, expected_hash, or handle",
+                json!({"path": path}),
+            ));
+        }
+        if let Some(expected) = expected_hash.or(handle_hash) {
+            if original_hash.as_deref() != Some(expected) {
+                return Err(AppError::details(
+                    "STALE_FILE",
+                    "File hash precondition failed",
+                    json!({"path": path, "expected_hash": expected, "actual_hash": original_hash}),
+                ));
+            }
+        }
+        match kind {
+            "replace" => {
+                let old = required_str(change, "old_text")?;
+                let new = change
+                    .get("new_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let expected = usize_value(change, "expected_replacements", 1);
+                let current = before.ok_or_else(|| {
+                    AppError::details(
+                        "PATH_NOT_FOUND",
+                        "Replace path does not exist",
+                        json!({"path": path}),
+                    )
+                })?;
+                let after = if let Some(handle) = &edit_handle {
+                    let (start, end) =
+                        line_range_bytes(&current, handle.start_line, handle.end_line)?;
+                    let selected = &current[start..end];
+                    let count = selected.match_indices(old).count();
+                    if count != expected {
+                        return Err(AppError::details(
+                            "EXACT_MATCH_COUNT",
+                            "Exact replacement count did not match the provenance range",
+                            json!({"path": path, "expected": expected, "actual": count, "start_line": handle.start_line, "end_line": handle.end_line}),
+                        ));
+                    }
+                    let mut value = current.clone();
+                    value.replace_range(start..end, &selected.replacen(old, new, expected));
+                    value
+                } else {
+                    let count = current.match_indices(old).count();
+                    if count != expected {
+                        return Err(AppError::details(
+                            "EXACT_MATCH_COUNT",
+                            "Exact replacement count did not match current planned content",
+                            json!({"path": path, "expected": expected, "actual": count}),
+                        ));
+                    }
+                    current.replacen(old, new, expected)
+                };
+                put_plan(plan, path, Some(current), Some(after));
+            }
+            "insert" => {
+                let symbol_name = required_str(change, "anchor_symbol")?;
+                let position = required_str(change, "position")?;
+                let insert = required_str(change, "content")?;
+                let current = before
+                    .ok_or_else(|| AppError::new("PATH_NOT_FOUND", "Insert path does not exist"))?;
+                let absolute = resolve_for_write(&self.root, &path)?;
+                let symbol = extract_symbols(&absolute, &current)
+                    .into_iter()
+                    .find(|item| item.name == symbol_name)
+                    .ok_or_else(|| {
+                        AppError::details(
+                            "SYMBOL_NOT_FOUND",
+                            "Anchor symbol not found in current planned content",
+                            json!({"path": path, "symbol": symbol_name}),
+                        )
+                    })?;
+                let offset = line_offset(
+                    &current,
+                    match position {
+                        "before" => symbol.start_line,
+                        "after" => symbol.end_line + 1,
+                        "inside_start" => symbol.start_line + 1,
+                        "inside_end" => symbol.end_line,
+                        _ => return Err(AppError::invalid("Invalid insert position")),
+                    },
+                );
+                let mut after = current.clone();
+                after.insert_str(offset, insert);
+                put_plan(plan, path, Some(current), Some(after));
+            }
+            "create" => {
+                let content = change
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let overwrite = bool_value(change, "overwrite", false);
+                if before.is_some() && !overwrite {
+                    return Err(AppError::details(
+                        "PATH_EXISTS",
+                        "Create target already exists",
+                        json!({"path": path}),
+                    ));
+                }
+                put_plan(plan, path, before, Some(content));
+            }
+            "delete" => {
+                let current = before.ok_or_else(|| {
+                    AppError::new("PATH_NOT_FOUND", "Delete target does not exist")
+                })?;
+                put_plan(plan, path, Some(current), None);
+            }
+            "rename" => {
+                let to = required_str(change, "to")?.replace('\\', "/");
+                validate_relative(&to)?;
+                let current = before.ok_or_else(|| {
+                    AppError::new("PATH_NOT_FOUND", "Rename source does not exist")
+                })?;
+                if plan.get(&to).and_then(|item| item.after.as_ref()).is_some()
+                    || index.get(&to).is_some()
+                {
+                    return Err(AppError::details(
+                        "PATH_EXISTS",
+                        "Rename target already exists",
+                        json!({"path": to}),
+                    ));
+                }
+                put_plan(plan, path, Some(current.clone()), None);
+                put_plan(plan, to, None, Some(current));
+            }
+            _ => {
+                return Err(AppError::details(
+                    "INVALID_CHANGE_KIND",
+                    "Unknown change kind",
+                    json!({"kind": kind}),
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    fn recheck_preconditions(&self, plan: &[PlannedFile]) -> AppResult<()> {
+        for item in plan {
+            let absolute = self.root.join(&item.path);
+            let actual = if absolute.exists() {
+                Some(fs::read_to_string(&absolute).map_err(|e| {
+                    AppError::details("READ_FAILED", e.to_string(), json!({"path": item.path}))
+                })?)
+            } else {
+                None
+            };
+            let actual_hash = actual.as_ref().map(|value| content_hash(value));
+            let expected_hash = item.before.as_ref().map(|value| content_hash(value));
+            if actual_hash != expected_hash {
+                return Err(AppError::details(
+                    "STALE_FILE",
+                    "File changed after planning and before commit",
+                    json!({"path": item.path, "expected_hash": expected_hash, "actual_hash": actual_hash}),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn commit_plan(
+        &self,
+        plan: &[PlannedFile],
+        request_id: &str,
+    ) -> AppResult<Vec<MutationRecord>> {
+        let mut completed: Vec<PlannedFile> = Vec::new();
+        for item in plan {
+            let absolute = resolve_for_write(&self.root, &item.path)?;
+            self.internal_writes
+                .lock()
+                .insert(absolute.clone(), Instant::now());
+            let result = match &item.after {
+                Some(content) => atomic_write(&absolute, content),
+                None => {
+                    if absolute.exists() {
+                        fs::remove_file(&absolute)
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            if let Err(error) = result {
+                self.internal_writes.lock().remove(&absolute);
+                let mut restored_paths = Vec::new();
+                let mut rollback_failures = Vec::new();
+                for rollback in completed.iter().rev() {
+                    self.internal_writes
+                        .lock()
+                        .insert(self.root.join(&rollback.path), Instant::now());
+                    match restore_one(&self.root, rollback) {
+                        Ok(()) => restored_paths.push(rollback.path.clone()),
+                        Err(rollback_error) => rollback_failures.push(json!({
+                            "path": rollback.path,
+                            "error": rollback_error.to_string()
+                        })),
+                    }
+                }
+                let manual_recovery_required = !rollback_failures.is_empty();
+                let code = if manual_recovery_required {
+                    "PARTIAL_COMMIT"
+                } else {
+                    "ATOMIC_WRITE_FAILED"
+                };
+                return Err(AppError::details(
+                    code,
+                    error.to_string(),
+                    json!({
+                        "failed_path": item.path,
+                        "completed_before_failure": completed.iter().map(|value| &value.path).collect::<Vec<_>>(),
+                        "restored_paths": restored_paths,
+                        "rollback_failures": rollback_failures,
+                        "manual_recovery_required": manual_recovery_required
+                    }),
+                ));
+            }
+            completed.push(item.clone());
+        }
+        let paths: HashSet<PathBuf> = plan.iter().map(|item| self.root.join(&item.path)).collect();
+        self.index
+            .write()
+            .refresh_paths(&self.root, &paths, self.policy.max_file_bytes)?;
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.recompute_snapshot();
+        let mut records = Vec::new();
+        for item in plan {
+            records.push(MutationRecord {
+                mutation_id: format!("mut_{}", Uuid::new_v4().simple()),
+                session_id: self.session_id.clone(),
+                path: item.path.clone(),
+                before_hash: item.before.as_ref().map(|value| content_hash(value)),
+                after_hash: item.after.as_ref().map(|value| content_hash(value)),
+                source: "mcp_edit".to_owned(),
+                request_id: request_id.to_owned(),
+                timestamp: Utc::now(),
+                generation,
+            });
+        }
+        self.record_mutations(&records)?;
+        Ok(records)
+    }
+
+    pub(super) fn recheck_applied_state(&self, plan: &[PlannedFile]) -> AppResult<()> {
+        for item in plan {
+            let absolute = self.root.join(&item.path);
+            let actual = if absolute.exists() {
+                Some(fs::read_to_string(&absolute).map_err(|error| {
+                    AppError::details("READ_FAILED", error.to_string(), json!({"path": item.path}))
+                })?)
+            } else {
+                None
+            };
+            let actual_hash = actual.as_ref().map(|value| content_hash(value));
+            let expected_hash = item.after.as_ref().map(|value| content_hash(value));
+            if actual_hash != expected_hash {
+                return Err(AppError::details(
+                    "ROLLBACK_CONFLICT",
+                    "Validation failed, but rollback was skipped because a file changed after the edit",
+                    json!({"path": item.path, "expected_hash": expected_hash, "actual_hash": actual_hash}),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_plan(&self, plan: &[PlannedFile], request_id: &str) -> AppResult<()> {
+        for item in plan.iter().rev() {
+            self.internal_writes
+                .lock()
+                .insert(self.root.join(&item.path), Instant::now());
+            restore_one(&self.root, item)?;
+        }
+        let paths: HashSet<PathBuf> = plan.iter().map(|item| self.root.join(&item.path)).collect();
+        self.index
+            .write()
+            .refresh_paths(&self.root, &paths, self.policy.max_file_bytes)?;
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.recompute_snapshot();
+        let records: Vec<_> = plan
+            .iter()
+            .map(|item| MutationRecord {
+                mutation_id: format!("mut_{}", Uuid::new_v4().simple()),
+                session_id: self.session_id.clone(),
+                path: item.path.clone(),
+                before_hash: item.after.as_ref().map(|value| content_hash(value)),
+                after_hash: item.before.as_ref().map(|value| content_hash(value)),
+                source: "rollback".to_owned(),
+                request_id: request_id.to_owned(),
+                timestamp: Utc::now(),
+                generation,
+            })
+            .collect();
+        self.record_mutations(&records)?;
+        Ok(())
+    }
+
+    pub(super) fn record_mutations(&self, records: &[MutationRecord]) -> AppResult<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut journal = self.mutations.lock();
+            journal.extend(records.iter().cloned());
+            trim_journal(&mut journal);
+        }
+        let mut file = self.journal_file.lock();
+        for record in records {
+            let mut encoded = serde_json::to_vec(record).map_err(|error| {
+                AppError::details(
+                    "JOURNAL_SERIALIZATION_FAILED",
+                    error.to_string(),
+                    json!({"mutation_id": record.mutation_id}),
+                )
+            })?;
+            encoded.push(b'\n');
+            file.write_all(&encoded).map_err(|error| {
+                AppError::details(
+                    "JOURNAL_WRITE_FAILED",
+                    error.to_string(),
+                    json!({"mutation_id": record.mutation_id}),
+                )
+            })?;
+        }
+        file.flush().map_err(|error| {
+            AppError::details("JOURNAL_FLUSH_FAILED", error.to_string(), json!({}))
+        })
+    }
+}
+
+fn put_plan(
+    plan: &mut HashMap<String, PlannedFile>,
+    path: String,
+    before: Option<String>,
+    after: Option<String>,
+) {
+    if let Some(existing) = plan.get_mut(&path) {
+        existing.after = after;
+    } else {
+        plan.insert(
+            path.clone(),
+            PlannedFile {
+                path,
+                before,
+                after,
+            },
+        );
+    }
+}

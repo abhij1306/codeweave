@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose an improvement to CodeWeave
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and compatibility considerations
+      description: Consider paths, authentication, commands, edits, Git operations, transports, and existing clients.

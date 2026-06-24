@@ -1,0 +1,30 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8820,
+    "authMode": "bearer",
+    "tokenFile": ".mcp-token"
+  },
+  "workspace": {
+    "defaultPath": "/path/to/projects/example",
+    "allowedRoots": ["/path/to/projects"],
+    "artifactPaths": ["artifacts"]
+  },
+  "skills": {
+    "enabled": false,
+    "roots": [],
+    "explicitOnly": true
+  },
+  "policy": {
+    "maxFileBytes": 2000000,
+    "maxContextChars": 50000,
+    "maxSearchResults": 100,
+    "maxTaskOutputChars": 30000,
+    "shellEnabled": false,
+    "allowedCommands": ["git", "rg", "node", "npm", "npx", "pnpm", "python", "pytest", "cargo"]
+  },
+  "tasks": {
+    "test": { "command": ["cargo", "test"], "timeoutMs": 120000 },
+    "check": { "command": ["cargo", "check"], "timeoutMs": 120000 }
+  }
+}

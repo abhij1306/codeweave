@@ -1,0 +1,25 @@
+# Rust build output
+target/
+
+# Local CodeWeave configuration and credentials
+config.json
+codeweave.config.json
+.mcp-token
+.env
+.env.*
+!.env.example
+
+# Runtime state
+.codeweave-cache/
+*.log
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.swp
+*~

@@ -1,0 +1,45 @@
+name: Bug report
+description: Report reproducible incorrect behavior
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Please remove credentials, private source code, personal data, and local absolute paths before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: CodeWeave version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options: [stdio, HTTP]
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Problem
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or output
+      render: text

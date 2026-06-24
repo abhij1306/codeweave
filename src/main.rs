@@ -1,0 +1,1339 @@
+mod index;
+mod manager;
+mod model;
+mod repository;
+mod security;
+mod symbols;
+mod tasks;
+mod workspace;
+
+use anyhow::{Context, Result};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
+    routing::get,
+    Json, Router,
+};
+use clap::{Parser, ValueEnum};
+use manager::WorkspaceManager;
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use subtle::ConstantTimeEq;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    sync::RwLock,
+};
+use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
+use uuid::Uuid;
+
+const SERVER_NAME: &str = "codeweave-rust";
+const PROTOCOL_VERSION: &str = "2025-03-26";
+const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Transport {
+    Http,
+    Stdio,
+}
+
+#[derive(Parser, Debug)]
+#[command(version, about = "Rust-only CodeWeave MCP server")]
+struct Cli {
+    #[arg(long, default_value = "config.json")]
+    config: PathBuf,
+    #[arg(long, value_enum, default_value_t = Transport::Http)]
+    transport: Transport,
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long)]
+    port: Option<u16>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerConfig {
+    #[serde(default = "default_host")]
+    host: String,
+    #[serde(default = "default_port")]
+    port: u16,
+    #[serde(default = "default_auth")]
+    auth_mode: String,
+    #[serde(default = "default_token")]
+    token_file: String,
+}
+fn default_host() -> String {
+    "127.0.0.1".into()
+}
+fn default_port() -> u16 {
+    8820
+}
+fn default_auth() -> String {
+    "bearer".into()
+}
+fn default_token() -> String {
+    ".mcp-token".into()
+}
+
+#[derive(Clone)]
+struct SessionState {
+    last_active: Instant,
+    manager: Arc<WorkspaceManager>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    manager: Arc<WorkspaceManager>,
+    config: Value,
+    server: ServerConfig,
+    token: Option<Arc<Vec<u8>>>,
+    sessions: Arc<RwLock<HashMap<String, SessionState>>>,
+}
+
+fn load_config(path: &Path) -> Result<(ServerConfig, Value)> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut root: Value = serde_json::from_str(&text).context("parsing config JSON")?;
+    let server: ServerConfig =
+        serde_json::from_value(root.get("server").cloned().unwrap_or_else(|| json!({})))?;
+    let object = root
+        .as_object_mut()
+        .context("config root must be an object")?;
+    object.entry("cache_root").or_insert_with(|| {
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        Value::String(base.join(".codeweave-cache").to_string_lossy().into_owned())
+    });
+    object.remove("server");
+    object.remove("rust");
+    Ok((server, root))
+}
+
+fn config_relative_path(config_path: &Path, configured_path: &str) -> PathBuf {
+    let configured = PathBuf::from(configured_path);
+    if configured.is_absolute() {
+        configured
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(configured)
+    }
+}
+
+fn is_loopback(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+}
+
+fn authorized(headers: &HeaderMap, state: &AppState) -> bool {
+    let Some(expected) = &state.token else {
+        return true;
+    };
+    let supplied = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .as_bytes();
+    supplied.len() == expected.len() && bool::from(supplied.ct_eq(expected.as_slice()))
+}
+
+fn request_session_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+}
+
+async fn touch_session(state: &AppState, session_id: &str) -> Option<Arc<WorkspaceManager>> {
+    let now = Instant::now();
+    let mut sessions = state.sessions.write().await;
+    sessions.retain(|_, session| now.duration_since(session.last_active) < SESSION_TTL);
+    let session = sessions.get_mut(session_id)?;
+    session.last_active = now;
+    Some(session.manager.clone())
+}
+
+fn session_error(status: StatusCode, message: &str) -> axum::response::Response {
+    (
+        status,
+        Json(json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32001, "message": message },
+            "id": Value::Null
+        })),
+    )
+        .into_response()
+}
+
+fn tools() -> Value {
+    let read = json!({
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+    });
+    let write = json!({
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+    });
+    let execution = json!({"taskSupport":"forbidden"});
+
+    // Keep the public schemas deliberately simple. Some hosted MCP clients reject or
+    // mishandle deeply nested oneOf/not/const schemas even though they are valid JSON Schema.
+    // These definitions mirror the TypeScript gateway that is known to work with Perplexity;
+    // the Rust request normalizer still accepts the richer compatibility forms internally.
+    json!([
+      {
+        "name":"workspace",
+        "title":"Workspace",
+        "description":"Open or switch the single active repository, view its summary or changes, refresh it, or explicitly list/read configured skills. Pass path to switch repositories without restarting the server. Skills must only be used when the user explicitly asks.",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "action":{"default":"open","type":"string","enum":["open","summary","refresh","changes","skills","skill"]},
+            "path":{"type":"string","description":"Absolute repository path to make active. Must be within configured allowed roots."},
+            "workspace_id":{"type":"string"},
+            "skill_name":{"type":"string","description":"Skill directory name. Use only after an explicit user request to use that skill."},
+            "force":{"type":"boolean"}
+          },
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"code_context",
+        "title":"Ranked Code Context",
+        "description":"Find relevant code for a task. Pass a short list of identifiers or concepts in terms, not the full user request.",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "terms":{"minItems":1,"maxItems":12,"type":"array","items":{"type":"string","minLength":1,"maxLength":80}},
+            "paths":{"type":"array","items":{"type":"string"}},
+            "workspace_id":{"type":"string"}
+          },
+          "required":["terms"],
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"code_fetch",
+        "title":"Fetch Exact Code or Logs",
+        "description":"Read a file, file range, symbol, task log, or previous continuation. For a single file, pass path directly; use items to batch reads.",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "path":{"type":"string"},
+            "start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
+            "end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
+            "items":{"type":"array","items":{"type":"object","propertyNames":{"type":"string"},"additionalProperties":{}}},
+            "workspace_id":{"type":"string"}
+          },
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"code_search",
+        "title":"Deterministic Code Search",
+        "description":"Search the project by text, regex, filename, symbol, references, outline, or repository map. Literal text search is the default.",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "query":{"default":"","type":"string"},
+            "mode":{"type":"string","enum":["literal","regex","filename","symbol","references","outline","repo_map"]},
+            "workspace_id":{"type":"string"}
+          },
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"code_write",
+        "title":"Write One File",
+        "description":"Create or overwrite exactly one file. Use expected_hash when replacing an existing file.",
+        "annotations":write.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "path":{"type":"string"},
+            "content":{"type":"string"},
+            "overwrite":{"type":"boolean","default":true},
+            "expected_hash":{"type":"string"},
+            "validate":{"type":"array","items":{"type":"string"}},
+            "rollback_on_failure":{"type":"boolean"},
+            "workspace_id":{"type":"string"}
+          },
+          "required":["path","content"],
+          "additionalProperties":false,
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"code_replace",
+        "title":"Replace Text in One File",
+        "description":"Replace exact text in exactly one file. The replacement count is checked before writing.",
+        "annotations":write.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "path":{"type":"string"},
+            "old_text":{"type":"string"},
+            "new_text":{"type":"string"},
+            "expected_replacements":{"type":"integer","minimum":1,"default":1},
+            "expected_hash":{"type":"string"},
+            "handle":{"type":"string"},
+            "validate":{"type":"array","items":{"type":"string"}},
+            "rollback_on_failure":{"type":"boolean"},
+            "workspace_id":{"type":"string"}
+          },
+          "required":["path","old_text","new_text"],
+          "additionalProperties":false,
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"code_insert",
+        "title":"Insert Text in One File",
+        "description":"Insert text before, after, or inside one named symbol in exactly one file.",
+        "annotations":write.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "path":{"type":"string"},
+            "content":{"type":"string"},
+            "anchor_symbol":{"type":"string"},
+            "position":{"type":"string","enum":["before","after","inside_start","inside_end"]},
+            "expected_hash":{"type":"string"},
+            "validate":{"type":"array","items":{"type":"string"}},
+            "rollback_on_failure":{"type":"boolean"},
+            "workspace_id":{"type":"string"}
+          },
+          "required":["path","content","anchor_symbol","position"],
+          "additionalProperties":false,
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"code_delete",
+        "title":"Delete One File",
+        "description":"Delete exactly one file with an optional content-hash precondition.",
+        "annotations":write.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "path":{"type":"string"},
+            "expected_hash":{"type":"string"},
+            "validate":{"type":"array","items":{"type":"string"}},
+            "rollback_on_failure":{"type":"boolean"},
+            "workspace_id":{"type":"string"}
+          },
+          "required":["path"],
+          "additionalProperties":false,
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"code_rename",
+        "title":"Rename One File",
+        "description":"Rename exactly one file with an optional content-hash precondition.",
+        "annotations":write.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "path":{"type":"string"},
+            "to":{"type":"string"},
+            "expected_hash":{"type":"string"},
+            "validate":{"type":"array","items":{"type":"string"}},
+            "rollback_on_failure":{"type":"boolean"},
+            "workspace_id":{"type":"string"}
+          },
+          "required":["path","to"],
+          "additionalProperties":false,
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"git",
+        "title":"Git",
+        "description":"Check Git status or diff, inspect history, stage files, commit, or restore files. Restore requires confirm=true.",
+        "annotations":write.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "action":{"type":"string","enum":["status","diff","log","show","blame","stage","commit","restore"]},
+            "paths":{"type":"array","items":{"type":"string"}},
+            "ref":{"type":"string"},
+            "message":{"type":"string"},
+            "confirm":{"type":"boolean"},
+            "workspace_id":{"type":"string"}
+          },
+          "required":["action"],
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"run",
+        "title":"Run Task or Controlled Command",
+        "description":"Run tests, builds, or another allowed command. Use a configured profile when available, otherwise pass command as an argument array. Also supports background task status, output, and cancellation.",
+        "annotations":write,
+        "execution":execution,
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "action":{"default":"start","type":"string","enum":["start","status","output","cancel"]},
+            "command":{"type":"array","items":{"type":"string"}},
+            "profile":{"type":"string"},
+            "cwd":{"type":"string"},
+            "task_id":{"type":"string"},
+            "workspace_id":{"type":"string"}
+          },
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      }
+    ])
+}
+
+fn workspace_catalog(config: &Value) -> Value {
+    let workspaces = config
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let id = item.get("id")?.as_str()?;
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or(id);
+                    Some(json!({"id": id, "name": name}))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "workspaces": workspaces,
+        "count": workspaces.len(),
+        "instruction": "Pass workspace_id to open or to any code tool when more than one workspace is configured."
+    })
+}
+
+fn object(value: Value) -> Map<String, Value> {
+    value.as_object().cloned().unwrap_or_default()
+}
+
+fn split_command_line(input: &str) -> std::result::Result<Vec<String>, model::AppError> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && quote == Some('"') {
+            if chars.peek().is_some_and(|next| matches!(next, '"' | '\\')) {
+                current.push(chars.next().expect("peeked character must exist"));
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch.is_whitespace() && quote.is_none() {
+            if !current.is_empty() {
+                args.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if quote.is_some() {
+        return Err(model::AppError::invalid(
+            "Command string has an unterminated quote",
+        ));
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    if args.is_empty() {
+        return Err(model::AppError::invalid("Command cannot be empty"));
+    }
+    Ok(args)
+}
+
+fn is_code_mutation(method: &str) -> bool {
+    matches!(
+        method,
+        "code_edit" | "code_write" | "code_replace" | "code_insert" | "code_delete" | "code_rename"
+    )
+}
+
+fn normalize_code_mutation(method: &str, params: &mut Map<String, Value>) {
+    if method == "code_edit" {
+        if !params.contains_key("changes") {
+            if let Some(edits) = params.remove("edits") {
+                params.insert("changes".into(), edits);
+            } else if let (Some(path), Some(content)) =
+                (params.remove("path"), params.remove("content"))
+            {
+                params.insert(
+                    "changes".into(),
+                    json!([{"kind":"create","path":path,"content":content,"overwrite":true}]),
+                );
+            }
+        }
+        return;
+    }
+
+    let (kind, fields): (&str, &[&str]) = match method {
+        "code_write" => ("create", &["path", "content", "overwrite", "expected_hash"]),
+        "code_replace" => (
+            "replace",
+            &[
+                "path",
+                "old_text",
+                "new_text",
+                "expected_replacements",
+                "expected_hash",
+                "handle",
+            ],
+        ),
+        "code_insert" => (
+            "insert",
+            &[
+                "path",
+                "content",
+                "anchor_symbol",
+                "position",
+                "expected_hash",
+            ],
+        ),
+        "code_delete" => ("delete", &["path", "expected_hash"]),
+        "code_rename" => ("rename", &["path", "to", "expected_hash"]),
+        _ => return,
+    };
+
+    let mut change = Map::new();
+    change.insert("kind".into(), Value::String(kind.into()));
+    for field in fields {
+        if let Some(value) = params.remove(*field) {
+            change.insert((*field).into(), value);
+        }
+    }
+    if method == "code_write" && !change.contains_key("overwrite") {
+        change.insert("overwrite".into(), Value::Bool(true));
+    }
+    params.insert("changes".into(), Value::Array(vec![Value::Object(change)]));
+}
+
+async fn prepare(
+    manager: &Arc<WorkspaceManager>,
+    config: &Value,
+    method: &str,
+    input: Value,
+) -> Result<Value, model::AppError> {
+    let mut params = object(input);
+    if method == "code_context" {
+        if let Some(terms) = params.remove("terms").and_then(|v| v.as_array().cloned()) {
+            params.insert(
+                "query".into(),
+                Value::String(
+                    terms
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+            );
+        }
+    }
+    let default_id = config
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .filter(|v| v.len() == 1)
+        .and_then(|v| v[0].get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if method == "workspace"
+        && params
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("open")
+            == "open"
+    {
+        if !params.contains_key("workspace") {
+            if let Some(id) = params
+                .remove("workspace_id")
+                .or_else(|| default_id.clone().map(Value::String))
+            {
+                params.insert("workspace".into(), id);
+            }
+        }
+    } else if is_code_mutation(method) && !params.contains_key("snapshot_id") {
+        let mut summary_request = json!({"action": "summary"});
+        if let Some(workspace_id) = params.get("workspace_id") {
+            summary_request["workspace_id"] = workspace_id.clone();
+        }
+        let summary = manager.dispatch("workspace", &summary_request).await?;
+        if let Some(snapshot) = summary.get("snapshot_id") {
+            params.insert("snapshot_id".into(), snapshot.clone());
+        }
+    }
+    if method == "code_fetch" && !params.contains_key("items") {
+        if let Some(ranges) = params
+            .remove("ranges")
+            .and_then(|value| value.as_array().cloned())
+        {
+            let items = ranges
+                .into_iter()
+                .map(|range| {
+                    let mut item = json!({
+                        "kind": "path",
+                        "value": range.get("path").cloned().unwrap_or(Value::Null),
+                    });
+                    if let Some(value) = range.get("start_line").or_else(|| range.get("start")) {
+                        item["start_line"] = value.clone();
+                    }
+                    if let Some(value) = range.get("end_line").or_else(|| range.get("end")) {
+                        item["end_line"] = value.clone();
+                    }
+                    item
+                })
+                .collect::<Vec<_>>();
+            params.insert("items".into(), json!(items));
+        } else if let Some(path) = params.remove("path") {
+            let mut item = json!({"kind":"path","value":path});
+            if let Some(v) = params.remove("start_line") {
+                item["start_line"] = v;
+            }
+            if let Some(v) = params.remove("end_line") {
+                item["end_line"] = v;
+            }
+            params.insert("items".into(), json!([item]));
+        }
+    }
+    if method == "run" {
+        if let Some(command) = params.get("command").and_then(Value::as_str) {
+            params.insert("command".into(), json!(split_command_line(command)?));
+        }
+    }
+    if is_code_mutation(method) {
+        normalize_code_mutation(method, &mut params);
+    }
+    Ok(Value::Object(params))
+}
+
+fn tool_result(value: Value) -> Value {
+    let structured = if value.is_object() {
+        value
+    } else {
+        json!({"value": value})
+    };
+    let text = serde_json::to_string(&structured).unwrap_or_else(|_| "{}".into());
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": structured
+    })
+}
+
+fn tool_failure(error: model::AppError) -> Value {
+    let body = error.0;
+    let retryable = body
+        .details
+        .as_ref()
+        .and_then(|details| details.get("retryable"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || matches!(
+            body.code.as_str(),
+            "STALE_SNAPSHOT" | "STALE_FILE" | "STALE_HANDLE" | "STALE_CONTINUATION"
+        );
+    let structured = json!({
+        "error": {
+            "code": body.code,
+            "message": body.message,
+            "retryable": retryable,
+            "details": body.details
+        }
+    });
+    let text = serde_json::to_string(&structured).unwrap_or_else(|_| "{}".into());
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": structured,
+        "isError": true
+    })
+}
+
+async fn handle_rpc(
+    state: &AppState,
+    manager: &Arc<WorkspaceManager>,
+    request: Value,
+) -> Option<Value> {
+    let id = request.get("id").cloned()?;
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+    let result = match method {
+        "initialize" => Ok(
+            json!({"protocolVersion":PROTOCOL_VERSION,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":SERVER_NAME,"version":env!("CARGO_PKG_VERSION")},"instructions":"Use code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, the single-operation code_write/code_replace/code_insert/code_delete/code_rename tools for changes, run for builds/tests, and git for repository operations."}),
+        ),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({"tools":tools()})),
+        "tools/call" => {
+            let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if ![
+                "workspace",
+                "code_context",
+                "code_fetch",
+                "code_search",
+                "code_write",
+                "code_replace",
+                "code_insert",
+                "code_delete",
+                "code_rename",
+                "git",
+                "run",
+            ]
+            .contains(&name)
+            {
+                Ok(tool_failure(model::AppError::new(
+                    "METHOD_NOT_FOUND",
+                    format!("Unknown tool: {name}"),
+                )))
+            } else {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+                let result = if name == "workspace" && action == "list" {
+                    Ok(workspace_catalog(&state.config))
+                } else {
+                    match prepare(manager, &state.config, name, args).await {
+                        Ok(prepared) => manager.dispatch(name, &prepared).await,
+                        Err(error) => Err(error),
+                    }
+                };
+                Ok(match result {
+                    Ok(value) => tool_result(value),
+                    Err(error) => tool_failure(error),
+                })
+            }
+        }
+        _ => Err(model::AppError::new(
+            "METHOD_NOT_FOUND",
+            format!("Unknown MCP method: {method}"),
+        )),
+    };
+    Some(match result {
+        Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
+        Err(error) => {
+            let body = error.0;
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":body.message,"data":{"code":body.code,"details":body.details}}})
+        }
+    })
+}
+
+async fn live(State(state): State<AppState>) -> Json<Value> {
+    Json(
+        json!({"ok":true,"name":SERVER_NAME,"version":env!("CARGO_PKG_VERSION"),"transport":"http","auth":state.server.auth_mode}),
+    )
+}
+
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    match state.manager.dispatch("health", &json!({})).await {
+        Ok(value) => (
+            StatusCode::OK,
+            Json(json!({"ok":true,"gateway_ready":true,"engine":value})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok":false,"error":error.0})),
+        )
+            .into_response(),
+    }
+}
+
+async fn mcp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"unauthorized"})),
+        )
+            .into_response();
+    }
+
+    let initializing = body.get("method").and_then(Value::as_str) == Some("initialize");
+    let manager = if initializing {
+        state.manager.clone()
+    } else {
+        let Some(session_id) = request_session_id(&headers) else {
+            return session_error(StatusCode::BAD_REQUEST, "Missing MCP session id");
+        };
+        let Some(manager) = touch_session(&state, session_id).await else {
+            return session_error(StatusCode::NOT_FOUND, "Unknown MCP session");
+        };
+        manager
+    };
+
+    let response = handle_rpc(&state, &manager, body).await;
+    match response {
+        Some(value) => {
+            let mut response = (StatusCode::OK, Json(value)).into_response();
+            if initializing {
+                let session_id = Uuid::new_v4().to_string();
+                let manager = Arc::new(WorkspaceManager::default());
+                if let Err(error) = manager.dispatch("initialize", &state.config).await {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": error.0})),
+                    )
+                        .into_response();
+                }
+                state.sessions.write().await.insert(
+                    session_id.clone(),
+                    SessionState {
+                        last_active: Instant::now(),
+                        manager,
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert("mcp-session-id", session_id.parse().unwrap());
+            }
+            response
+        }
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+async fn mcp_get(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"unauthorized"})),
+        )
+            .into_response();
+    }
+    let Some(session_id) = request_session_id(&headers) else {
+        return session_error(StatusCode::BAD_REQUEST, "Missing MCP session id");
+    };
+    if touch_session(&state, session_id).await.is_none() {
+        return session_error(StatusCode::NOT_FOUND, "Unknown MCP session");
+    }
+
+    let stream = futures_util::stream::pending::<Result<Event, std::convert::Infallible>>();
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&headers, &state) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"unauthorized"})),
+        )
+            .into_response();
+    }
+    let Some(session_id) = request_session_id(&headers) else {
+        return session_error(StatusCode::BAD_REQUEST, "Missing MCP session id");
+    };
+    let removed = state.sessions.write().await.remove(session_id).is_some();
+    if !removed {
+        return session_error(StatusCode::NOT_FOUND, "Unknown MCP session");
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
+    if let Some(host) = &cli.host {
+        state.server.host = host.clone();
+    }
+    if let Some(port) = cli.port {
+        state.server.port = port;
+    }
+    if state.server.auth_mode == "none" && !is_loopback(&state.server.host) {
+        anyhow::bail!("refusing unauthenticated HTTP on non-loopback host")
+    }
+    let app = Router::new()
+        .route("/live", get(live))
+        .route("/health", get(health))
+        .route("/mcp", get(mcp_get).post(mcp).delete(mcp_delete))
+        .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state.clone());
+    let address = format!("{}:{}", state.server.host, state.server.port);
+    let listener = tokio::net::TcpListener::bind(&address).await?;
+    eprintln!("{SERVER_NAME} listening on http://{address}/mcp");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn run_stdio(state: AppState) -> Result<()> {
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(response) = handle_rpc(&state, &state.manager, request).await {
+            stdout
+                .write_all(serde_json::to_string(&response)?.as_bytes())
+                .await?;
+            stdout.write_all(b"\n").await?;
+            stdout.flush().await?;
+        }
+    }
+    Ok(())
+}
+
+fn load_or_create_bearer_token(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(value) => {
+            let token = value.trim();
+            if token.is_empty() {
+                anyhow::bail!("bearer token file is empty: {}", path.display());
+            }
+            eprintln!("bearer authentication loaded from {}", path.display());
+            Ok(token.to_owned())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("creating bearer token directory {}", parent.display())
+                })?;
+            }
+            let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+            std::fs::write(path, &token)
+                .with_context(|| format!("creating bearer token file {}", path.display()))?;
+            eprintln!("generated bearer token at {}", path.display());
+            Ok(token)
+        }
+        Err(error) => Err(error).with_context(|| format!("reading token file {}", path.display())),
+    }
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let (server, config) = load_config(&cli.config)?;
+    let token = if server.auth_mode == "bearer" {
+        let token_path = config_relative_path(&cli.config, &server.token_file);
+        let token_value = load_or_create_bearer_token(&token_path)?;
+        Some(Arc::new(token_value.into_bytes()))
+    } else {
+        None
+    };
+    let manager = Arc::new(WorkspaceManager::default());
+    manager
+        .dispatch("initialize", &config)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let state = AppState {
+        manager,
+        config,
+        server,
+        token,
+        sessions: Arc::new(RwLock::new(HashMap::new())),
+    };
+    match cli.transport {
+        Transport::Http => run_http(state, &cli).await,
+        Transport::Stdio => run_stdio(state).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool<'a>(all: &'a Value, name: &str) -> &'a Value {
+        all.as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
+            })
+            .expect("tool must exist")
+    }
+
+    #[test]
+    fn public_tool_schemas_are_hosted_client_compatible() {
+        let all = tools();
+        let items = all.as_array().expect("tools array");
+        assert_eq!(items.len(), 11);
+
+        for item in items {
+            let schema = &item["inputSchema"];
+            assert_eq!(schema["type"], "object");
+            assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
+            let encoded = schema.to_string();
+            assert!(!encoded.contains("\"oneOf\""));
+            assert!(!encoded.contains("\"allOf\""));
+            assert!(!encoded.contains("\"not\""));
+            assert!(!encoded.contains("\"const\""));
+            assert_eq!(item["execution"]["taskSupport"], "forbidden");
+        }
+
+        assert_eq!(
+            tool(&all, "code_context")["inputSchema"]["required"],
+            json!(["terms"])
+        );
+        assert_eq!(
+            tool(&all, "git")["inputSchema"]["required"],
+            json!(["action"])
+        );
+        assert!(items.iter().all(|item| item["name"] != "code_edit"));
+        assert_eq!(
+            tool(&all, "code_write")["inputSchema"]["required"],
+            json!(["path", "content"])
+        );
+        assert_eq!(
+            tool(&all, "code_replace")["inputSchema"]["required"],
+            json!(["path", "old_text", "new_text"])
+        );
+        assert_eq!(
+            tool(&all, "code_insert")["inputSchema"]["required"],
+            json!(["path", "content", "anchor_symbol", "position"])
+        );
+        assert_eq!(
+            tool(&all, "code_delete")["inputSchema"]["required"],
+            json!(["path"])
+        );
+        assert_eq!(
+            tool(&all, "code_rename")["inputSchema"]["required"],
+            json!(["path", "to"])
+        );
+    }
+
+    #[test]
+    fn command_strings_are_split_without_shell_expansion() {
+        assert_eq!(
+            split_command_line("cargo test --manifest-path 'project dir/Cargo.toml'").unwrap(),
+            vec![
+                "cargo".to_owned(),
+                "test".to_owned(),
+                "--manifest-path".to_owned(),
+                "project dir/Cargo.toml".to_owned(),
+            ]
+        );
+        assert!(split_command_line("cargo 'test").is_err());
+    }
+
+    #[tokio::test]
+    async fn prepare_normalizes_compatibility_inputs() {
+        let manager = Arc::new(WorkspaceManager::default());
+        let config = json!({"workspaces": []});
+
+        let context = prepare(
+            &manager,
+            &config,
+            "code_context",
+            json!({"query": "WorkspaceActor"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(context["query"], "WorkspaceActor");
+
+        let fetch = prepare(
+            &manager,
+            &config,
+            "code_fetch",
+            json!({"ranges": [{"path": "src/main.rs", "start": 2, "end": 4}]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetch["items"][0]["kind"], "path");
+        assert_eq!(fetch["items"][0]["start_line"], 2);
+        assert_eq!(fetch["items"][0]["end_line"], 4);
+
+        let edit = prepare(
+            &manager,
+            &config,
+            "code_edit",
+            json!({"snapshot_id": "snap_test", "edits": [{"kind": "delete", "path": "old.txt"}]}),
+        )
+        .await
+        .unwrap();
+        assert!(edit.get("edits").is_none());
+        assert_eq!(edit["changes"][0]["kind"], "delete");
+
+        let replace = prepare(
+            &manager,
+            &config,
+            "code_replace",
+            json!({
+                "snapshot_id": "snap_test",
+                "path": "src/main.rs",
+                "old_text": "old",
+                "new_text": "new",
+                "expected_replacements": 1
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replace["changes"][0]["kind"], "replace");
+        assert_eq!(replace["changes"][0]["path"], "src/main.rs");
+        assert!(replace.get("old_text").is_none());
+
+        let run = prepare(&manager, &config, "run", json!({"command": "cargo test"}))
+            .await
+            .unwrap();
+        assert_eq!(run["command"], json!(["cargo", "test"]));
+    }
+
+    #[tokio::test]
+    async fn narrow_write_tool_dispatches_through_transactional_engine() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let manager = Arc::new(WorkspaceManager::default());
+        let config = json!({
+            "workspaces": [{
+                "id": "main",
+                "name": "Main",
+                "path": root.path(),
+                "artifactPaths": []
+            }],
+            "workspace": {"allowedRoots": [root.path()]},
+            "skills": {"enabled": false, "roots": [], "explicitOnly": true},
+            "policy": {
+                "maxFileBytes": 1000000,
+                "maxContextChars": 50000,
+                "maxSearchResults": 100,
+                "maxTaskOutputChars": 30000,
+                "shellEnabled": false,
+                "allowedCommands": ["cargo"]
+            },
+            "tasks": {},
+            "cache_root": cache.path()
+        });
+        manager.dispatch("initialize", &config).await.unwrap();
+
+        let prepared = prepare(
+            &manager,
+            &config,
+            "code_write",
+            json!({
+                "workspace_id": "main",
+                "path": "created.txt",
+                "content": "created through code_write\n"
+            }),
+        )
+        .await
+        .unwrap();
+        let result = manager.dispatch("code_write", &prepared).await.unwrap();
+
+        assert_eq!(result["applied"], true);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("created.txt")).unwrap(),
+            "created through code_write\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_does_not_reopen_legacy_default_after_dynamic_switch() {
+        let configured = tempfile::tempdir().unwrap();
+        let dynamic = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(
+            configured.path().join("configured.rs"),
+            "fn configured() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dynamic.path().join("dynamic.rs"), "fn dynamic() {}\n").unwrap();
+        let manager = Arc::new(WorkspaceManager::default());
+        let daemon_config = json!({
+            "workspaces": [{"id": "main", "name": "Configured", "path": configured.path(), "artifactPaths": []}],
+            "workspace": {"allowedRoots": [configured.path().parent().unwrap()]},
+            "skills": {"enabled": false, "roots": [], "explicitOnly": true},
+            "policy": {"maxFileBytes": 1000000, "maxContextChars": 50000, "maxSearchResults": 100, "maxTaskOutputChars": 30000, "shellEnabled": false, "allowedCommands": ["cargo"]},
+            "tasks": {},
+            "cache_root": cache.path()
+        });
+        manager
+            .dispatch("initialize", &daemon_config)
+            .await
+            .unwrap();
+        manager
+            .dispatch(
+                "workspace",
+                &json!({"action": "open", "path": dynamic.path()}),
+            )
+            .await
+            .unwrap();
+        let public_config = json!({"workspaces": [{"id": "main", "name": "Configured", "path": configured.path()}]});
+        let prepared = prepare(
+            &manager,
+            &public_config,
+            "code_search",
+            json!({"workspace_id": "main", "mode": "filename", "query": "dynamic.rs"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared["workspace_id"], "main");
+        let summary = manager
+            .dispatch(
+                "workspace",
+                &json!({"action": "summary", "workspace_id": "main"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(summary["root"].as_str().unwrap()),
+            std::fs::canonicalize(dynamic.path()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_sessions_keep_independent_active_repositories() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("first.rs"), "fn first() {}\n").unwrap();
+        std::fs::write(second.path().join("second.rs"), "fn second() {}\n").unwrap();
+
+        let config = json!({
+            "workspaces": [],
+            "workspace": {
+                "allowedRoots": [first.path().parent().unwrap()]
+            },
+            "skills": {"enabled": false, "roots": [], "explicitOnly": true},
+            "policy": {
+                "maxFileBytes": 1000000,
+                "maxContextChars": 50000,
+                "maxSearchResults": 100,
+                "maxTaskOutputChars": 30000,
+                "shellEnabled": false,
+                "allowedCommands": ["cargo"]
+            },
+            "tasks": {},
+            "cache_root": cache.path()
+        });
+
+        let first_manager = Arc::new(WorkspaceManager::default());
+        first_manager.dispatch("initialize", &config).await.unwrap();
+        first_manager
+            .dispatch(
+                "workspace",
+                &json!({"action": "open", "path": first.path()}),
+            )
+            .await
+            .unwrap();
+
+        let second_manager = Arc::new(WorkspaceManager::default());
+        second_manager
+            .dispatch("initialize", &config)
+            .await
+            .unwrap();
+        second_manager
+            .dispatch(
+                "workspace",
+                &json!({"action": "open", "path": second.path()}),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState {
+            manager: Arc::new(WorkspaceManager::default()),
+            config,
+            server: ServerConfig {
+                host: default_host(),
+                port: default_port(),
+                auth_mode: "none".to_owned(),
+                token_file: default_token(),
+            },
+            token: None,
+            sessions: Arc::new(RwLock::new(HashMap::from([
+                (
+                    "first".to_owned(),
+                    SessionState {
+                        last_active: Instant::now(),
+                        manager: first_manager,
+                    },
+                ),
+                (
+                    "second".to_owned(),
+                    SessionState {
+                        last_active: Instant::now(),
+                        manager: second_manager,
+                    },
+                ),
+            ]))),
+        };
+
+        let first_session = touch_session(&state, "first").await.unwrap();
+        let second_session = touch_session(&state, "second").await.unwrap();
+        let first_summary = first_session
+            .dispatch("workspace", &json!({"action": "summary"}))
+            .await
+            .unwrap();
+        let second_summary = second_session
+            .dispatch("workspace", &json!({"action": "summary"}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::path::PathBuf::from(first_summary["root"].as_str().unwrap()),
+            std::fs::canonicalize(first.path()).unwrap()
+        );
+        assert_eq!(
+            std::path::PathBuf::from(second_summary["root"].as_str().unwrap()),
+            std::fs::canonicalize(second.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn workspace_catalog_exposes_ids_without_repository_paths() {
+        let catalog = workspace_catalog(&json!({
+            "workspaces": [
+                {"id": "one", "name": "First", "path": "C:/private/one"},
+                {"id": "two", "name": "Second", "path": "C:/private/two"}
+            ]
+        }));
+
+        assert_eq!(catalog["count"], 2);
+        assert_eq!(catalog["workspaces"][0]["id"], "one");
+        assert!(!catalog.to_string().contains("C:/private"));
+    }
+
+    #[test]
+    fn relative_token_path_is_resolved_from_config_directory() {
+        let config = Path::new("C:/path/to/codeweave/config.json");
+        let resolved = config_relative_path(config, ".mcp-token");
+        assert_eq!(resolved, PathBuf::from("C:/path/to/codeweave/.mcp-token"));
+    }
+}
