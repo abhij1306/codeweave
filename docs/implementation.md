@@ -8,7 +8,9 @@ CodeWeave runs on the machine that contains the repositories an AI client is all
 AI client -> MCP transport -> CodeWeave -> approved repositories and commands
 ```
 
-Use stdio when a local client can launch the executable directly. Use HTTP when a client requires a URL.
+Use stdio when a local client can launch the executable directly. Use HTTP when a client requires a URL. Stdio does not use HTTP authentication and therefore does not load or create the configured bearer-token file.
+
+`server.authMode` accepts only `bearer` or `none`. The bearer token is an internal HTTP origin credential for CodeWeave's `/mcp` endpoint; it is not an LLM token, model feature, or credential that should be entered into an AI client.
 
 ## HTTP deployment
 

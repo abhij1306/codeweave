@@ -1,4 +1,5 @@
 use crate::model::{required_str, AppError, AppResult, DaemonConfig, WorkspaceConfig};
+use crate::security::validate_relative;
 use crate::workspace::WorkspaceActor;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -6,7 +7,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -25,6 +26,36 @@ where
     tokio::task::spawn_blocking(operation)
         .await
         .map_err(AppError::internal)?
+}
+
+fn validate_skill_name(name: &str) -> AppResult<()> {
+    if name.is_empty()
+        || name.contains('\0')
+        || name.contains(':')
+        || name.ends_with('.')
+        || name.ends_with(' ')
+    {
+        return Err(AppError::invalid("Invalid skill name"));
+    }
+
+    let path = validate_relative(name)?;
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(AppError::invalid("Invalid skill name"));
+    }
+
+    let base = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || base.strip_prefix("COM").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        })
+        || base.strip_prefix("LPT").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        });
+    if reserved {
+        return Err(AppError::invalid("Invalid skill name"));
+    }
+    Ok(())
 }
 
 impl WorkspaceManager {
@@ -181,7 +212,18 @@ impl WorkspaceManager {
                 add_elapsed(&mut summary, started.elapsed().as_millis(), false);
                 Ok(summary)
             }
-            "summary" => self.actor(params)?.summary(),
+            "summary" => {
+                let actor = self.actor(params)?;
+                if params
+                    .get("_summary_ids")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    actor.summary_ids()
+                } else {
+                    actor.summary()
+                }
+            }
             "refresh" => self.actor(params)?.refresh(
                 params
                     .get("force")
@@ -410,9 +452,7 @@ impl WorkspaceManager {
             ));
         }
         let name = required_str(params, "skill_name")?;
-        if name.contains('/') || name.contains('\\') || matches!(name, "." | "..") {
-            return Err(AppError::invalid("Invalid skill name"));
-        }
+        validate_skill_name(name)?;
         for root in &config.skills.roots {
             let path = Path::new(root).join(name).join("SKILL.md");
             if path.is_file() {
@@ -625,5 +665,52 @@ mod tests {
             .initialize(&daemon_config(root.path(), cache.path(), 512_000))
             .unwrap();
         assert!(manager.actors.read().is_empty());
+    }
+
+    #[test]
+    fn summary_ids_flag_uses_lightweight_summary() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let manager = WorkspaceManager::default();
+        manager
+            .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
+            .unwrap();
+
+        let summary = manager
+            .workspace(&json!({"action": "summary", "_summary_ids": true}))
+            .unwrap();
+
+        assert!(summary.get("workspace_id").is_some());
+        assert!(summary.get("snapshot_id").is_some());
+        assert!(summary.get("generation").is_some());
+        assert!(summary.get("root").is_none());
+        assert!(summary.get("mutations").is_none());
+    }
+
+    #[test]
+    fn skill_names_must_be_single_safe_path_components() {
+        assert!(validate_skill_name("rust-review").is_ok());
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "nested/skill",
+            "nested\\skill",
+            "C:",
+            "name:stream",
+            "CON",
+            "nul.txt",
+            "COM1",
+            "LPT9.md",
+            "trailing.",
+            "trailing ",
+        ] {
+            assert!(
+                validate_skill_name(invalid).is_err(),
+                "accepted invalid skill name {invalid:?}"
+            );
+        }
     }
 }

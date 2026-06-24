@@ -59,38 +59,6 @@ pub fn resolve_existing(root: &Path, relative: &str) -> AppResult<PathBuf> {
     Ok(resolved)
 }
 
-pub fn resolve_for_write(root: &Path, relative: &str) -> AppResult<PathBuf> {
-    let relative = validate_relative(relative)?;
-    let joined = root.join(relative);
-    let parent = joined
-        .parent()
-        .ok_or_else(|| AppError::invalid("Target has no parent directory"))?;
-    let existing_parent = nearest_existing(parent)?;
-    let canonical_parent = existing_parent.canonicalize()?;
-    if !canonical_parent.starts_with(root) {
-        return Err(AppError::new(
-            "OUTSIDE_ROOT",
-            "Target parent is outside workspace",
-        ));
-    }
-    Ok(joined)
-}
-
-fn nearest_existing(path: &Path) -> AppResult<PathBuf> {
-    let mut current = path.to_path_buf();
-    loop {
-        if current.exists() {
-            return Ok(current);
-        }
-        if !current.pop() {
-            return Err(AppError::new(
-                "PATH_NOT_FOUND",
-                "No existing parent directory",
-            ));
-        }
-    }
-}
-
 pub fn relative_string(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)

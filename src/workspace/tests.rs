@@ -269,6 +269,38 @@ fn oversized_journal_rotates_at_open() {
 }
 
 #[test]
+fn interrupted_journal_rotation_recovers_previous_archive() {
+    let cache = tempdir().unwrap();
+    let journal = cache.path().join("mutations.jsonl");
+    let archive = cache.path().join("mutations.previous.jsonl");
+    let backup = cache.path().join("mutations.previous.backup.jsonl");
+    fs::write(&journal, b"current").unwrap();
+    fs::write(&backup, b"previous").unwrap();
+
+    rotate_journal_if_needed(&journal).unwrap();
+
+    assert_eq!(fs::read(&archive).unwrap(), b"previous");
+    assert!(!backup.exists());
+    assert_eq!(fs::read(&journal).unwrap(), b"current");
+}
+
+#[test]
+fn journal_rotation_replaces_archive_without_discarding_live_journal_first() {
+    let cache = tempdir().unwrap();
+    let journal = cache.path().join("mutations.jsonl");
+    let archive = cache.path().join("mutations.previous.jsonl");
+    let backup = cache.path().join("mutations.previous.backup.jsonl");
+    fs::write(&archive, b"older").unwrap();
+    fs::write(&journal, vec![b'x'; (MAX_JOURNAL_BYTES + 1) as usize]).unwrap();
+
+    rotate_journal_if_needed(&journal).unwrap();
+
+    assert!(!journal.exists());
+    assert_eq!(fs::metadata(&archive).unwrap().len(), MAX_JOURNAL_BYTES + 1);
+    assert!(!backup.exists());
+}
+
+#[test]
 fn changed_paths_are_filtered_and_capped() {
     let mut paths: HashSet<String> = (0..150)
         .map(|index| format!("src/file_{index}.rs"))

@@ -20,6 +20,7 @@ use axum::{
 };
 use clap::{Parser, ValueEnum};
 use manager::WorkspaceManager;
+use parking_lot::Mutex as ParkingMutex;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::{
@@ -39,6 +40,7 @@ use uuid::Uuid;
 const SERVER_NAME: &str = "codeweave-rust";
 const PROTOCOL_VERSION: &str = "2025-03-26";
 const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
+const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Transport {
@@ -84,9 +86,18 @@ fn default_token() -> String {
     ".mcp-token".into()
 }
 
+fn validate_auth_mode(auth_mode: &str) -> Result<()> {
+    match auth_mode {
+        "bearer" | "none" => Ok(()),
+        unsupported => anyhow::bail!(
+            "unsupported server.authMode '{unsupported}'; expected 'bearer' or 'none'"
+        ),
+    }
+}
+
 #[derive(Clone)]
 struct SessionState {
-    last_active: Instant,
+    last_active: Arc<ParkingMutex<Instant>>,
     manager: Arc<WorkspaceManager>,
 }
 
@@ -97,6 +108,7 @@ struct AppState {
     server: ServerConfig,
     token: Option<Arc<Vec<u8>>>,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
+    last_session_cleanup: Arc<ParkingMutex<Instant>>,
 }
 
 fn load_config(path: &Path) -> Result<(ServerConfig, Value)> {
@@ -155,11 +167,42 @@ fn request_session_id(headers: &HeaderMap) -> Option<&str> {
 
 async fn touch_session(state: &AppState, session_id: &str) -> Option<Arc<WorkspaceManager>> {
     let now = Instant::now();
-    let mut sessions = state.sessions.write().await;
-    sessions.retain(|_, session| now.duration_since(session.last_active) < SESSION_TTL);
-    let session = sessions.get_mut(session_id)?;
-    session.last_active = now;
-    Some(session.manager.clone())
+    let session = {
+        let sessions = state.sessions.read().await;
+        sessions.get(session_id).cloned()
+    }?;
+
+    let expired = {
+        let mut last_active = session.last_active.lock();
+        let expired = now.duration_since(*last_active) >= SESSION_TTL;
+        if !expired {
+            *last_active = now;
+        }
+        expired
+    };
+    if expired {
+        state.sessions.write().await.remove(session_id);
+        return None;
+    }
+
+    let cleanup_due = {
+        let mut last_cleanup = state.last_session_cleanup.lock();
+        if now.duration_since(*last_cleanup) >= SESSION_CLEANUP_INTERVAL {
+            *last_cleanup = now;
+            true
+        } else {
+            false
+        }
+    };
+    if cleanup_due {
+        state
+            .sessions
+            .write()
+            .await
+            .retain(|_, candidate| now.duration_since(*candidate.last_active.lock()) < SESSION_TTL);
+    }
+
+    Some(session.manager)
 }
 
 fn session_error(status: StatusCode, message: &str) -> axum::response::Response {
@@ -596,7 +639,7 @@ async fn prepare(
             }
         }
     } else if is_code_mutation(method) && !params.contains_key("snapshot_id") {
-        let mut summary_request = json!({"action": "summary"});
+        let mut summary_request = json!({"action": "summary", "_summary_ids": true});
         if let Some(workspace_id) = params.get("workspace_id") {
             summary_request["workspace_id"] = workspace_id.clone();
         }
@@ -823,7 +866,7 @@ async fn mcp(
                 state.sessions.write().await.insert(
                     session_id.clone(),
                     SessionState {
-                        last_active: Instant::now(),
+                        last_active: Arc::new(ParkingMutex::new(Instant::now())),
                         manager,
                     },
                 );
@@ -952,7 +995,8 @@ fn load_or_create_bearer_token(path: &Path) -> Result<String> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let (server, config) = load_config(&cli.config)?;
-    let token = if server.auth_mode == "bearer" {
+    validate_auth_mode(&server.auth_mode)?;
+    let token = if matches!(cli.transport, Transport::Http) && server.auth_mode == "bearer" {
         let token_path = config_relative_path(&cli.config, &server.token_file);
         let token_value = load_or_create_bearer_token(&token_path)?;
         Some(Arc::new(token_value.into_bytes()))
@@ -970,6 +1014,7 @@ async fn main() -> Result<()> {
         server,
         token,
         sessions: Arc::new(RwLock::new(HashMap::new())),
+        last_session_cleanup: Arc::new(ParkingMutex::new(Instant::now())),
     };
     match cli.transport {
         Transport::Http => run_http(state, &cli).await,
@@ -1281,18 +1326,19 @@ mod tests {
                 (
                     "first".to_owned(),
                     SessionState {
-                        last_active: Instant::now(),
+                        last_active: Arc::new(ParkingMutex::new(Instant::now())),
                         manager: first_manager,
                     },
                 ),
                 (
                     "second".to_owned(),
                     SessionState {
-                        last_active: Instant::now(),
+                        last_active: Arc::new(ParkingMutex::new(Instant::now())),
                         manager: second_manager,
                     },
                 ),
             ]))),
+            last_session_cleanup: Arc::new(ParkingMutex::new(Instant::now())),
         };
 
         let first_session = touch_session(&state, "first").await.unwrap();
@@ -1314,6 +1360,35 @@ mod tests {
             std::path::PathBuf::from(second_summary["root"].as_str().unwrap()),
             std::fs::canonicalize(second.path()).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn expired_session_is_removed_without_scanning_on_every_touch() {
+        let manager = Arc::new(WorkspaceManager::default());
+        let state = AppState {
+            manager: manager.clone(),
+            config: json!({}),
+            server: ServerConfig {
+                host: default_host(),
+                port: default_port(),
+                auth_mode: "none".to_owned(),
+                token_file: default_token(),
+            },
+            token: None,
+            sessions: Arc::new(RwLock::new(HashMap::from([(
+                "expired".to_owned(),
+                SessionState {
+                    last_active: Arc::new(ParkingMutex::new(
+                        Instant::now() - SESSION_TTL - Duration::from_secs(1),
+                    )),
+                    manager,
+                },
+            )]))),
+            last_session_cleanup: Arc::new(ParkingMutex::new(Instant::now())),
+        };
+
+        assert!(touch_session(&state, "expired").await.is_none());
+        assert!(!state.sessions.read().await.contains_key("expired"));
     }
 
     #[test]

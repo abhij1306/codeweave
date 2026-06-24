@@ -47,7 +47,9 @@ cargo build --release
 
 Edit `config.json` and replace the example workspace paths. Keep `allowedRoots` as narrow as practical.
 
-When `server.authMode` is `bearer`, CodeWeave automatically creates the configured token file on first startup if it does not exist. With the example configuration, this creates `.mcp-token` beside `config.json`. The file is already excluded by `.gitignore`.
+`server.authMode` accepts only `bearer` or `none`. For HTTP transport with `bearer` enabled, CodeWeave automatically creates the configured token file on first startup if it does not exist. With the example configuration, this creates `.mcp-token` beside `config.json`. The file is already excluded by `.gitignore`.
+
+This is an **HTTP origin bearer token**, not an LLM credential or MCP capability. It protects CodeWeave's local `/mcp` HTTP endpoint and is normally injected by a trusted tunnel or reverse proxy. Stdio transport does not read or create this token file.
 
 To generate it manually instead:
 

@@ -3,7 +3,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 pub(super) const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_JOURNAL_RECORDS: usize = 2_000;
@@ -22,18 +23,72 @@ pub struct MutationRecord {
     pub generation: u64,
 }
 
+fn archive_paths(path: &Path) -> (PathBuf, PathBuf) {
+    (
+        path.with_file_name("mutations.previous.jsonl"),
+        path.with_file_name("mutations.previous.backup.jsonl"),
+    )
+}
+
+fn recover_interrupted_rotation(archive: &Path, backup: &Path) -> io::Result<()> {
+    if !backup.exists() {
+        return Ok(());
+    }
+    if archive.exists() {
+        if let Err(error) = fs::remove_file(backup) {
+            eprintln!(
+                "journal rotation backup cleanup failed for {}: {error}",
+                backup.display()
+            );
+        }
+        Ok(())
+    } else {
+        fs::rename(backup, archive)
+    }
+}
+
 pub(super) fn rotate_journal_if_needed(path: &Path) -> AppResult<()> {
+    let (archive, backup) = archive_paths(path);
+    recover_interrupted_rotation(&archive, &backup)?;
+
     let Ok(metadata) = fs::metadata(path) else {
         return Ok(());
     };
     if metadata.len() <= MAX_JOURNAL_BYTES {
         return Ok(());
     }
-    let archive = path.with_file_name("mutations.previous.jsonl");
-    if archive.exists() {
-        fs::remove_file(&archive)?;
+
+    let displaced_archive = if archive.exists() {
+        fs::rename(&archive, &backup)?;
+        true
+    } else {
+        false
+    };
+
+    if let Err(rotation_error) = fs::rename(path, &archive) {
+        if displaced_archive {
+            if let Err(recovery_error) = fs::rename(&backup, &archive) {
+                return Err(io::Error::new(
+                    rotation_error.kind(),
+                    format!(
+                        "journal rotation failed: {rotation_error}; archive recovery failed: {recovery_error}; previous archive retained at {}",
+                        backup.display()
+                    ),
+                )
+                .into());
+            }
+        }
+        return Err(rotation_error.into());
     }
-    fs::rename(path, archive)?;
+
+    if displaced_archive {
+        if let Err(error) = fs::remove_file(&backup) {
+            eprintln!(
+                "journal rotation backup cleanup failed for {}: {error}",
+                backup.display()
+            );
+        }
+    }
     Ok(())
 }
 

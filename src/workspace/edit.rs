@@ -1,4 +1,4 @@
-use super::io_helpers::{atomic_write, render_diff, restore_one};
+use super::io_helpers::{atomic_write, read_optional, remove_if_exists, render_diff, restore_one};
 use super::journal::{trim_journal, MutationRecord};
 use super::util::{
     changes_without_independent_preconditions, line_offset, line_range_bytes,
@@ -7,13 +7,12 @@ use super::util::{
 use super::WorkspaceActor;
 use crate::index::{content_hash, decode_handle, CodeIndex};
 use crate::model::{bool_value, required_str, string_list, usize_value, AppError, AppResult};
-use crate::security::{resolve_for_write, validate_relative};
+use crate::security::validate_relative;
 use crate::symbols::{extract_symbols, parse_has_error};
 use crate::tasks::StartRequest;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{atomic::Ordering, Arc};
@@ -200,7 +199,7 @@ impl WorkspaceActor {
         planned.sort_by(|a, b| a.path.cmp(&b.path));
         for item in &planned {
             if let Some(after) = &item.after {
-                let absolute = resolve_for_write(&self.root, &item.path)?;
+                let absolute = self.root.join(&item.path);
                 if parse_has_error(&absolute, after) == Some(true) {
                     return Err(AppError::details(
                         "SYNTAX_ERROR",
@@ -405,7 +404,7 @@ impl WorkspaceActor {
                 let insert = required_str(change, "content")?;
                 let current = before
                     .ok_or_else(|| AppError::new("PATH_NOT_FOUND", "Insert path does not exist"))?;
-                let absolute = resolve_for_write(&self.root, &path)?;
+                let absolute = self.root.join(&path);
                 let symbol = extract_symbols(&absolute, &current)
                     .into_iter()
                     .find(|item| item.name == symbol_name)
@@ -483,14 +482,9 @@ impl WorkspaceActor {
 
     fn recheck_preconditions(&self, plan: &[PlannedFile]) -> AppResult<()> {
         for item in plan {
-            let absolute = self.root.join(&item.path);
-            let actual = if absolute.exists() {
-                Some(fs::read_to_string(&absolute).map_err(|e| {
-                    AppError::details("READ_FAILED", e.to_string(), json!({"path": item.path}))
-                })?)
-            } else {
-                None
-            };
+            let actual = read_optional(&self.root, &item.path).map_err(|error| {
+                AppError::details("READ_FAILED", error.to_string(), json!({"path": item.path}))
+            })?;
             let actual_hash = actual.as_ref().map(|value| content_hash(value));
             let expected_hash = item.before.as_ref().map(|value| content_hash(value));
             if actual_hash != expected_hash {
@@ -511,19 +505,13 @@ impl WorkspaceActor {
     ) -> AppResult<Vec<MutationRecord>> {
         let mut completed: Vec<PlannedFile> = Vec::new();
         for item in plan {
-            let absolute = resolve_for_write(&self.root, &item.path)?;
+            let absolute = self.root.join(&item.path);
             self.internal_writes
                 .lock()
                 .insert(absolute.clone(), Instant::now());
             let result = match &item.after {
-                Some(content) => atomic_write(&absolute, content),
-                None => {
-                    if absolute.exists() {
-                        fs::remove_file(&absolute)
-                    } else {
-                        Ok(())
-                    }
-                }
+                Some(content) => atomic_write(&self.root, &item.path, content),
+                None => remove_if_exists(&self.root, &item.path),
             };
             if let Err(error) = result {
                 self.internal_writes.lock().remove(&absolute);
@@ -587,14 +575,9 @@ impl WorkspaceActor {
 
     pub(super) fn recheck_applied_state(&self, plan: &[PlannedFile]) -> AppResult<()> {
         for item in plan {
-            let absolute = self.root.join(&item.path);
-            let actual = if absolute.exists() {
-                Some(fs::read_to_string(&absolute).map_err(|error| {
-                    AppError::details("READ_FAILED", error.to_string(), json!({"path": item.path}))
-                })?)
-            } else {
-                None
-            };
+            let actual = read_optional(&self.root, &item.path).map_err(|error| {
+                AppError::details("READ_FAILED", error.to_string(), json!({"path": item.path}))
+            })?;
             let actual_hash = actual.as_ref().map(|value| content_hash(value));
             let expected_hash = item.after.as_ref().map(|value| content_hash(value));
             if actual_hash != expected_hash {
