@@ -31,6 +31,8 @@ where
 fn validate_skill_name(name: &str) -> AppResult<()> {
     if name.is_empty()
         || name.contains('\0')
+        || name.contains('/')
+        || name.contains('\\')
         || name.contains(':')
         || name.ends_with('.')
         || name.ends_with(' ')
