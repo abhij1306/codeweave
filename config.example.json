@@ -7,8 +7,12 @@
   },
   "workspace": {
     "defaultPath": "/path/to/projects/example",
-    "allowedRoots": ["/path/to/projects"],
-    "artifactPaths": ["artifacts"]
+    "allowedRoots": [
+      "/path/to/projects"
+    ],
+    "artifactPaths": [
+      "artifacts"
+    ]
   },
   "skills": {
     "enabled": false,
@@ -21,10 +25,41 @@
     "maxSearchResults": 100,
     "maxTaskOutputChars": 30000,
     "shellEnabled": false,
-    "allowedCommands": ["git", "rg", "node", "npm", "npx", "pnpm", "python", "pytest", "cargo"]
+    "allowedCommands": [
+      "git",
+      "rg",
+      "node",
+      "npm",
+      "npx",
+      "pnpm",
+      "python",
+      "pytest",
+      "cargo"
+    ]
   },
   "tasks": {
-    "test": { "command": ["cargo", "test"], "timeoutMs": 120000 },
-    "check": { "command": ["cargo", "check"], "timeoutMs": 120000 }
+    "test": {
+      "command": [
+        ".venv\\Scripts\\python.exe",
+        "-m",
+        "pytest",
+        "tests",
+        "-q",
+        "--tb=short"
+      ],
+      "cwd": "backend",
+      "timeoutMs": 300000
+    },
+    "check": {
+      "command": [
+        ".venv\\Scripts\\python.exe",
+        "-m",
+        "ruff",
+        "check",
+        "app"
+      ],
+      "cwd": "backend",
+      "timeoutMs": 120000
+    }
   }
 }
