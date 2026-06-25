@@ -1,5 +1,6 @@
 mod index;
 mod manager;
+mod mcp_transport;
 mod model;
 mod repository;
 mod security;
@@ -11,36 +12,21 @@ use anyhow::{Context, Result};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse,
-    },
-    routing::get,
-    Json, Router,
+    response::IntoResponse,
+    Json,
 };
 use clap::{Parser, ValueEnum};
 use manager::WorkspaceManager;
-use parking_lot::Mutex as ParkingMutex;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::RwLock,
-};
-use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use uuid::Uuid;
 
 const SERVER_NAME: &str = "codeweave-rust";
-const PROTOCOL_VERSION: &str = "2025-03-26";
-const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
-const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Transport {
@@ -96,19 +82,11 @@ fn validate_auth_mode(auth_mode: &str) -> Result<()> {
 }
 
 #[derive(Clone)]
-struct SessionState {
-    last_active: Arc<ParkingMutex<Instant>>,
-    manager: Arc<WorkspaceManager>,
-}
-
-#[derive(Clone)]
 struct AppState {
     manager: Arc<WorkspaceManager>,
     config: Value,
     server: ServerConfig,
     token: Option<Arc<Vec<u8>>>,
-    sessions: Arc<RwLock<HashMap<String, SessionState>>>,
-    last_session_cleanup: Arc<ParkingMutex<Instant>>,
 }
 
 fn load_config(path: &Path) -> Result<(ServerConfig, Value)> {
@@ -158,76 +136,6 @@ fn authorized(headers: &HeaderMap, state: &AppState) -> bool {
     supplied.len() == expected.len() && bool::from(supplied.ct_eq(expected.as_slice()))
 }
 
-fn request_session_id(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get("mcp-session-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-}
-
-async fn touch_session(state: &AppState, session_id: &str) -> Option<Arc<WorkspaceManager>> {
-    touch_session_at(state, session_id, Instant::now()).await
-}
-
-async fn touch_session_at(
-    state: &AppState,
-    session_id: &str,
-    now: Instant,
-) -> Option<Arc<WorkspaceManager>> {
-    let session = {
-        let sessions = state.sessions.read().await;
-        sessions.get(session_id).cloned()
-    }?;
-
-    let expired = {
-        let mut last_active = session.last_active.lock();
-        let expired = now
-            .checked_duration_since(*last_active)
-            .is_some_and(|elapsed| elapsed >= SESSION_TTL);
-        if !expired {
-            *last_active = now;
-        }
-        expired
-    };
-    if expired {
-        state.sessions.write().await.remove(session_id);
-        return None;
-    }
-
-    let cleanup_due = {
-        let mut last_cleanup = state.last_session_cleanup.lock();
-        if now
-            .checked_duration_since(*last_cleanup)
-            .is_some_and(|elapsed| elapsed >= SESSION_CLEANUP_INTERVAL)
-        {
-            *last_cleanup = now;
-            true
-        } else {
-            false
-        }
-    };
-    if cleanup_due {
-        state.sessions.write().await.retain(|_, candidate| {
-            now.checked_duration_since(*candidate.last_active.lock())
-                .is_none_or(|elapsed| elapsed < SESSION_TTL)
-        });
-    }
-
-    Some(session.manager)
-}
-
-fn session_error(status: StatusCode, message: &str) -> axum::response::Response {
-    (
-        status,
-        Json(json!({
-            "jsonrpc": "2.0",
-            "error": { "code": -32001, "message": message },
-            "id": Value::Null
-        })),
-    )
-        .into_response()
-}
-
 fn tools() -> Value {
     let read = json!({
         "readOnlyHint": true,
@@ -259,7 +167,6 @@ fn tools() -> Value {
           "properties":{
             "action":{"default":"open","type":"string","enum":["open","summary","refresh","changes","skills","skill"]},
             "path":{"type":"string","description":"Absolute repository path to make active. Must be within configured allowed roots."},
-            "workspace_id":{"type":"string"},
             "skill_name":{"type":"string","description":"Skill directory name. Use only after an explicit user request to use that skill."},
             "force":{"type":"boolean"}
           },
@@ -276,8 +183,7 @@ fn tools() -> Value {
           "type":"object",
           "properties":{
             "terms":{"minItems":1,"maxItems":12,"type":"array","items":{"type":"string","minLength":1,"maxLength":80}},
-            "paths":{"type":"array","items":{"type":"string"}},
-            "workspace_id":{"type":"string"}
+            "paths":{"type":"array","items":{"type":"string"}}
           },
           "required":["terms"],
           "$schema":"http://json-schema.org/draft-07/schema#"
@@ -296,8 +202,7 @@ fn tools() -> Value {
             "start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
             "end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
             "items":{"type":"array","items":{"type":"object","propertyNames":{"type":"string"},"additionalProperties":{}}},
-            "max_chars":{"type":"integer","minimum":1,"maximum":200000},
-            "workspace_id":{"type":"string"}
+            "max_chars":{"type":"integer","minimum":1,"maximum":200000}
           },
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
@@ -316,8 +221,7 @@ fn tools() -> Value {
             "paths":{"type":"array","items":{"type":"string"}},
             "max_results":{"type":"integer","minimum":1,"maximum":200},
             "context_lines":{"type":"integer","minimum":0,"maximum":20},
-            "case_sensitive":{"type":"boolean"},
-            "workspace_id":{"type":"string"}
+            "case_sensitive":{"type":"boolean"}
           },
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
@@ -336,8 +240,7 @@ fn tools() -> Value {
             "overwrite":{"type":"boolean","default":true},
             "expected_hash":{"type":"string"},
             "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"},
-            "workspace_id":{"type":"string"}
+            "rollback_on_failure":{"type":"boolean"}
           },
           "required":["path","content"],
           "additionalProperties":false,
@@ -360,8 +263,7 @@ fn tools() -> Value {
             "expected_hash":{"type":"string"},
             "handle":{"type":"string"},
             "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"},
-            "workspace_id":{"type":"string"}
+            "rollback_on_failure":{"type":"boolean"}
           },
           "required":["path","old_text","new_text"],
           "additionalProperties":false,
@@ -383,8 +285,7 @@ fn tools() -> Value {
             "position":{"type":"string","enum":["before","after","inside_start","inside_end"]},
             "expected_hash":{"type":"string"},
             "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"},
-            "workspace_id":{"type":"string"}
+            "rollback_on_failure":{"type":"boolean"}
           },
           "required":["path","content","anchor_symbol","position"],
           "additionalProperties":false,
@@ -403,8 +304,7 @@ fn tools() -> Value {
             "path":{"type":"string"},
             "expected_hash":{"type":"string"},
             "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"},
-            "workspace_id":{"type":"string"}
+            "rollback_on_failure":{"type":"boolean"}
           },
           "required":["path"],
           "additionalProperties":false,
@@ -424,8 +324,7 @@ fn tools() -> Value {
             "to":{"type":"string"},
             "expected_hash":{"type":"string"},
             "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"},
-            "workspace_id":{"type":"string"}
+            "rollback_on_failure":{"type":"boolean"}
           },
           "required":["path","to"],
           "additionalProperties":false,
@@ -446,8 +345,7 @@ fn tools() -> Value {
             "ref":{"type":"string"},
             "message":{"type":"string"},
             "max_chars":{"type":"integer","minimum":1,"maximum":200000},
-            "confirm":{"type":"boolean"},
-            "workspace_id":{"type":"string"}
+            "confirm":{"type":"boolean"}
           },
           "required":["action"],
           "$schema":"http://json-schema.org/draft-07/schema#"
@@ -466,35 +364,12 @@ fn tools() -> Value {
             "command":{"type":"array","items":{"type":"string"}},
             "profile":{"type":"string"},
             "cwd":{"type":"string"},
-            "task_id":{"type":"string"},
-            "workspace_id":{"type":"string"}
+            "task_id":{"type":"string"}
           },
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
       }
     ])
-}
-
-fn workspace_catalog(config: &Value) -> Value {
-    let workspaces = config
-        .get("workspaces")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    let id = item.get("id")?.as_str()?;
-                    let name = item.get("name").and_then(Value::as_str).unwrap_or(id);
-                    Some(json!({"id": id, "name": name}))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    json!({
-        "workspaces": workspaces,
-        "count": workspaces.len(),
-        "instruction": "Pass workspace_id to open or to any code tool when more than one workspace is configured."
-    })
 }
 
 fn object(value: Value) -> Map<String, Value> {
@@ -550,27 +425,11 @@ fn split_command_line(input: &str) -> std::result::Result<Vec<String>, model::Ap
 fn is_code_mutation(method: &str) -> bool {
     matches!(
         method,
-        "code_edit" | "code_write" | "code_replace" | "code_insert" | "code_delete" | "code_rename"
+        "code_write" | "code_replace" | "code_insert" | "code_delete" | "code_rename"
     )
 }
 
 fn normalize_code_mutation(method: &str, params: &mut Map<String, Value>) {
-    if method == "code_edit" {
-        if !params.contains_key("changes") {
-            if let Some(edits) = params.remove("edits") {
-                params.insert("changes".into(), edits);
-            } else if let (Some(path), Some(content)) =
-                (params.remove("path"), params.remove("content"))
-            {
-                params.insert(
-                    "changes".into(),
-                    json!([{"kind":"create","path":path,"content":content,"overwrite":true}]),
-                );
-            }
-        }
-        return;
-    }
-
     let (kind, fields): (&str, &[&str]) = match method {
         "code_write" => ("create", &["path", "content", "overwrite", "expected_hash"]),
         "code_replace" => (
@@ -613,8 +472,8 @@ fn normalize_code_mutation(method: &str, params: &mut Map<String, Value>) {
 }
 
 async fn prepare(
-    manager: &Arc<WorkspaceManager>,
-    config: &Value,
+    _manager: &Arc<WorkspaceManager>,
+    _config: &Value,
     method: &str,
     input: Value,
 ) -> Result<Value, model::AppError> {
@@ -633,38 +492,10 @@ async fn prepare(
             );
         }
     }
-    let default_id = config
-        .get("workspaces")
-        .and_then(Value::as_array)
-        .filter(|v| v.len() == 1)
-        .and_then(|v| v[0].get("id"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    if method == "workspace"
-        && params
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("open")
-            == "open"
-    {
-        if !params.contains_key("workspace") {
-            if let Some(id) = params
-                .remove("workspace_id")
-                .or_else(|| default_id.clone().map(Value::String))
-            {
-                params.insert("workspace".into(), id);
-            }
-        }
-    } else if is_code_mutation(method) && !params.contains_key("snapshot_id") {
-        let mut summary_request = json!({"action": "summary", "_summary_ids": true});
-        if let Some(workspace_id) = params.get("workspace_id") {
-            summary_request["workspace_id"] = workspace_id.clone();
-        }
-        let summary = manager.dispatch("workspace", &summary_request).await?;
-        if let Some(snapshot) = summary.get("snapshot_id") {
-            params.insert("snapshot_id".into(), snapshot.clone());
-        }
-    }
+    // A CodeWeave process owns exactly one active repository. Legacy workspace_id
+    // arguments are accepted but ignored so they can never reopen or redirect a tool call.
+    params.remove("workspace_id");
+    params.remove("workspace");
     if method == "code_fetch" && !params.contains_key("items") {
         if let Some(ranges) = params
             .remove("ranges")
@@ -750,75 +581,6 @@ fn tool_failure(error: model::AppError) -> Value {
     })
 }
 
-async fn handle_rpc(
-    state: &AppState,
-    manager: &Arc<WorkspaceManager>,
-    request: Value,
-) -> Option<Value> {
-    let id = request.get("id").cloned()?;
-    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-    let result = match method {
-        "initialize" => Ok(
-            json!({"protocolVersion":PROTOCOL_VERSION,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":SERVER_NAME,"version":env!("CARGO_PKG_VERSION")},"instructions":"Use code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, the single-operation code_write/code_replace/code_insert/code_delete/code_rename tools for changes, run for builds/tests, and git for repository operations."}),
-        ),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools":tools()})),
-        "tools/call" => {
-            let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            if ![
-                "workspace",
-                "code_context",
-                "code_fetch",
-                "code_search",
-                "code_write",
-                "code_replace",
-                "code_insert",
-                "code_delete",
-                "code_rename",
-                "git",
-                "run",
-            ]
-            .contains(&name)
-            {
-                Ok(tool_failure(model::AppError::new(
-                    "METHOD_NOT_FOUND",
-                    format!("Unknown tool: {name}"),
-                )))
-            } else {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
-                let result = if name == "workspace" && action == "list" {
-                    Ok(workspace_catalog(&state.config))
-                } else {
-                    match prepare(manager, &state.config, name, args).await {
-                        Ok(prepared) => manager.dispatch(name, &prepared).await,
-                        Err(error) => Err(error),
-                    }
-                };
-                Ok(match result {
-                    Ok(value) => tool_result(value),
-                    Err(error) => tool_failure(error),
-                })
-            }
-        }
-        _ => Err(model::AppError::new(
-            "METHOD_NOT_FOUND",
-            format!("Unknown MCP method: {method}"),
-        )),
-    };
-    Some(match result {
-        Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
-        Err(error) => {
-            let body = error.0;
-            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":body.message,"data":{"code":body.code,"details":body.details}}})
-        }
-    })
-}
-
 async fn live(State(state): State<AppState>) -> Json<Value> {
     Json(
         json!({"ok":true,"name":SERVER_NAME,"version":env!("CARGO_PKG_VERSION"),"transport":"http","auth":state.server.auth_mode}),
@@ -838,148 +600,6 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response(),
     }
-}
-
-async fn mcp(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    if !authorized(&headers, &state) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"unauthorized"})),
-        )
-            .into_response();
-    }
-
-    let initializing = body.get("method").and_then(Value::as_str) == Some("initialize");
-    let manager = if initializing {
-        state.manager.clone()
-    } else {
-        let Some(session_id) = request_session_id(&headers) else {
-            return session_error(StatusCode::BAD_REQUEST, "Missing MCP session id");
-        };
-        let Some(manager) = touch_session(&state, session_id).await else {
-            return session_error(StatusCode::NOT_FOUND, "Unknown MCP session");
-        };
-        manager
-    };
-
-    let response = handle_rpc(&state, &manager, body).await;
-    match response {
-        Some(value) => {
-            let mut response = (StatusCode::OK, Json(value)).into_response();
-            if initializing {
-                let session_id = Uuid::new_v4().to_string();
-                let manager = Arc::new(WorkspaceManager::default());
-                if let Err(error) = manager.dispatch("initialize", &state.config).await {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": error.0})),
-                    )
-                        .into_response();
-                }
-                state.sessions.write().await.insert(
-                    session_id.clone(),
-                    SessionState {
-                        last_active: Arc::new(ParkingMutex::new(Instant::now())),
-                        manager,
-                    },
-                );
-                response
-                    .headers_mut()
-                    .insert("mcp-session-id", session_id.parse().unwrap());
-            }
-            response
-        }
-        None => StatusCode::ACCEPTED.into_response(),
-    }
-}
-
-async fn mcp_get(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&headers, &state) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"unauthorized"})),
-        )
-            .into_response();
-    }
-    let Some(session_id) = request_session_id(&headers) else {
-        return session_error(StatusCode::BAD_REQUEST, "Missing MCP session id");
-    };
-    if touch_session(&state, session_id).await.is_none() {
-        return session_error(StatusCode::NOT_FOUND, "Unknown MCP session");
-    }
-
-    let stream = futures_util::stream::pending::<Result<Event, std::convert::Infallible>>();
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
-}
-
-async fn mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if !authorized(&headers, &state) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"unauthorized"})),
-        )
-            .into_response();
-    }
-    let Some(session_id) = request_session_id(&headers) else {
-        return session_error(StatusCode::BAD_REQUEST, "Missing MCP session id");
-    };
-    let removed = state.sessions.write().await.remove(session_id).is_some();
-    if !removed {
-        return session_error(StatusCode::NOT_FOUND, "Unknown MCP session");
-    }
-    StatusCode::OK.into_response()
-}
-
-async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
-    if let Some(host) = &cli.host {
-        state.server.host = host.clone();
-    }
-    if let Some(port) = cli.port {
-        state.server.port = port;
-    }
-    if state.server.auth_mode == "none" && !is_loopback(&state.server.host) {
-        anyhow::bail!("refusing unauthenticated HTTP on non-loopback host")
-    }
-    let app = Router::new()
-        .route("/live", get(live))
-        .route("/health", get(health))
-        .route("/mcp", get(mcp_get).post(mcp).delete(mcp_delete))
-        .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
-    let address = format!("{}:{}", state.server.host, state.server.port);
-    let listener = tokio::net::TcpListener::bind(&address).await?;
-    eprintln!("{SERVER_NAME} listening on http://{address}/mcp");
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-async fn run_stdio(state: AppState) -> Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if let Some(response) = handle_rpc(&state, &state.manager, request).await {
-            stdout
-                .write_all(serde_json::to_string(&response)?.as_bytes())
-                .await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
-        }
-    }
-    Ok(())
 }
 
 fn load_or_create_bearer_token(path: &Path) -> Result<String> {
@@ -1030,12 +650,10 @@ async fn main() -> Result<()> {
         config,
         server,
         token,
-        sessions: Arc::new(RwLock::new(HashMap::new())),
-        last_session_cleanup: Arc::new(ParkingMutex::new(Instant::now())),
     };
     match cli.transport {
-        Transport::Http => run_http(state, &cli).await,
-        Transport::Stdio => run_stdio(state).await,
+        Transport::Http => mcp_transport::run_http(state, &cli).await,
+        Transport::Stdio => mcp_transport::run_stdio(state).await,
     }
 }
 
@@ -1142,17 +760,6 @@ mod tests {
         assert_eq!(fetch["items"][0]["kind"], "path");
         assert_eq!(fetch["items"][0]["start_line"], 2);
         assert_eq!(fetch["items"][0]["end_line"], 4);
-
-        let edit = prepare(
-            &manager,
-            &config,
-            "code_edit",
-            json!({"snapshot_id": "snap_test", "edits": [{"kind": "delete", "path": "old.txt"}]}),
-        )
-        .await
-        .unwrap();
-        assert!(edit.get("edits").is_none());
-        assert_eq!(edit["changes"][0]["kind"], "delete");
 
         let replace = prepare(
             &manager,
@@ -1266,7 +873,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(prepared["workspace_id"], "main");
+        assert!(prepared.get("workspace_id").is_none());
         let summary = manager
             .dispatch(
                 "workspace",
@@ -1278,148 +885,6 @@ mod tests {
             std::path::PathBuf::from(summary["root"].as_str().unwrap()),
             std::fs::canonicalize(dynamic.path()).unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn http_sessions_keep_independent_active_repositories() {
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        std::fs::write(first.path().join("first.rs"), "fn first() {}\n").unwrap();
-        std::fs::write(second.path().join("second.rs"), "fn second() {}\n").unwrap();
-
-        let config = json!({
-            "workspaces": [],
-            "workspace": {
-                "allowedRoots": [first.path().parent().unwrap()]
-            },
-            "skills": {"enabled": false, "roots": [], "explicitOnly": true},
-            "policy": {
-                "maxFileBytes": 1000000,
-                "maxContextChars": 50000,
-                "maxSearchResults": 100,
-                "maxTaskOutputChars": 30000,
-                "shellEnabled": false,
-                "allowedCommands": ["cargo"]
-            },
-            "tasks": {},
-            "cache_root": cache.path()
-        });
-
-        let first_manager = Arc::new(WorkspaceManager::default());
-        first_manager.dispatch("initialize", &config).await.unwrap();
-        first_manager
-            .dispatch(
-                "workspace",
-                &json!({"action": "open", "path": first.path()}),
-            )
-            .await
-            .unwrap();
-
-        let second_manager = Arc::new(WorkspaceManager::default());
-        second_manager
-            .dispatch("initialize", &config)
-            .await
-            .unwrap();
-        second_manager
-            .dispatch(
-                "workspace",
-                &json!({"action": "open", "path": second.path()}),
-            )
-            .await
-            .unwrap();
-
-        let state = AppState {
-            manager: Arc::new(WorkspaceManager::default()),
-            config,
-            server: ServerConfig {
-                host: default_host(),
-                port: default_port(),
-                auth_mode: "none".to_owned(),
-                token_file: default_token(),
-            },
-            token: None,
-            sessions: Arc::new(RwLock::new(HashMap::from([
-                (
-                    "first".to_owned(),
-                    SessionState {
-                        last_active: Arc::new(ParkingMutex::new(Instant::now())),
-                        manager: first_manager,
-                    },
-                ),
-                (
-                    "second".to_owned(),
-                    SessionState {
-                        last_active: Arc::new(ParkingMutex::new(Instant::now())),
-                        manager: second_manager,
-                    },
-                ),
-            ]))),
-            last_session_cleanup: Arc::new(ParkingMutex::new(Instant::now())),
-        };
-
-        let first_session = touch_session(&state, "first").await.unwrap();
-        let second_session = touch_session(&state, "second").await.unwrap();
-        let first_summary = first_session
-            .dispatch("workspace", &json!({"action": "summary"}))
-            .await
-            .unwrap();
-        let second_summary = second_session
-            .dispatch("workspace", &json!({"action": "summary"}))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            std::path::PathBuf::from(first_summary["root"].as_str().unwrap()),
-            std::fs::canonicalize(first.path()).unwrap()
-        );
-        assert_eq!(
-            std::path::PathBuf::from(second_summary["root"].as_str().unwrap()),
-            std::fs::canonicalize(second.path()).unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn expired_session_is_removed_without_scanning_on_every_touch() {
-        let manager = Arc::new(WorkspaceManager::default());
-        let last_active = Instant::now();
-        let now = last_active + SESSION_TTL + Duration::from_secs(1);
-        let state = AppState {
-            manager: manager.clone(),
-            config: json!({}),
-            server: ServerConfig {
-                host: default_host(),
-                port: default_port(),
-                auth_mode: "none".to_owned(),
-                token_file: default_token(),
-            },
-            token: None,
-            sessions: Arc::new(RwLock::new(HashMap::from([(
-                "expired".to_owned(),
-                SessionState {
-                    last_active: Arc::new(ParkingMutex::new(last_active)),
-                    manager,
-                },
-            )]))),
-            last_session_cleanup: Arc::new(ParkingMutex::new(last_active)),
-        };
-
-        assert!(touch_session_at(&state, "expired", now).await.is_none());
-        assert!(!state.sessions.read().await.contains_key("expired"));
-    }
-
-    #[test]
-    fn workspace_catalog_exposes_ids_without_repository_paths() {
-        let catalog = workspace_catalog(&json!({
-            "workspaces": [
-                {"id": "one", "name": "First", "path": "C:/private/one"},
-                {"id": "two", "name": "Second", "path": "C:/private/two"}
-            ]
-        }));
-
-        assert_eq!(catalog["count"], 2);
-        assert_eq!(catalog["workspaces"][0]["id"], "one");
-        assert!(!catalog.to_string().contains("C:/private"));
     }
 
     #[test]

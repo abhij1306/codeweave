@@ -4,6 +4,7 @@ use crate::workspace::WorkspaceActor;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
+#[cfg(test)]
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -14,8 +15,7 @@ use std::time::Instant;
 #[derive(Default)]
 pub struct WorkspaceManager {
     config: RwLock<Option<DaemonConfig>>,
-    actors: RwLock<HashMap<String, Arc<WorkspaceActor>>>,
-    opening: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    active: RwLock<Option<Arc<WorkspaceActor>>>,
     lifecycle: Mutex<()>,
 }
 
@@ -77,28 +77,36 @@ impl WorkspaceManager {
                 run_blocking(move || manager.workspace(&params)).await
             }
             "code_context" => {
-                let actor = self.actor(params)?;
+                let actor = self.active_actor()?;
                 let params = params.clone();
                 run_blocking(move || actor.code_context(&params)).await
             }
             "code_search" => {
-                let actor = self.actor(params)?;
+                let actor = self.active_actor()?;
                 let params = params.clone();
                 run_blocking(move || actor.code_search(&params)).await
             }
             "code_fetch" => {
-                let actor = self.actor(params)?;
+                let actor = self.active_actor()?;
                 let params = params.clone();
                 run_blocking(move || actor.code_fetch(&params)).await
             }
-            "code_edit" | "code_write" | "code_replace" | "code_insert" | "code_delete"
-            | "code_rename" => self.actor(params)?.code_edit(params).await,
+            "code_write" | "code_replace" | "code_insert" | "code_delete" | "code_rename" => {
+                let actor = self.active_actor()?;
+                let mut prepared = params.clone();
+                if prepared.get("snapshot_id").is_none() {
+                    if let Some(snapshot) = actor.summary_ids()?.get("snapshot_id") {
+                        prepared["snapshot_id"] = snapshot.clone();
+                    }
+                }
+                actor.code_edit(&prepared).await
+            }
             "git" => {
-                let actor = self.actor(params)?;
+                let actor = self.active_actor()?;
                 let params = params.clone();
                 run_blocking(move || actor.git(&params)).await
             }
-            "run" => self.actor(params)?.run(params).await,
+            "run" => self.active_actor()?.run(params).await,
             _ => Err(AppError::details(
                 "METHOD_NOT_FOUND",
                 "Unknown daemon method",
@@ -136,10 +144,9 @@ impl WorkspaceManager {
         }
         let _lifecycle = self.lifecycle.lock();
         let mut current_config = self.config.write();
-        let mut actors = self.actors.write();
+        let mut active = self.active.write();
         *current_config = Some(config.clone());
-        actors.clear();
-        self.opening.lock().clear();
+        *active = None;
         Ok(
             json!({"ok": true, "version": env!("CARGO_PKG_VERSION"), "configured_workspaces": config.workspaces.iter().map(|w| json!({"id": w.id, "name": w.name})).collect::<Vec<_>>() }),
         )
@@ -149,7 +156,7 @@ impl WorkspaceManager {
         let config = self.config.read();
         Ok(json!({
             "ok": true, "version": env!("CARGO_PKG_VERSION"), "initialized": config.is_some(),
-            "open_workspaces": self.actors.read().keys().cloned().collect::<Vec<_>>(),
+            "active_workspace": self.active.read().as_ref().map(|actor| actor.id.clone()),
             "configured_workspaces": config.as_ref().map(|c| c.workspaces.len()).unwrap_or(0),
             "single_repository_mode": true
         }))
@@ -176,46 +183,52 @@ impl WorkspaceManager {
                 let started = Instant::now();
                 let config = self.config()?;
                 let requested_path = params.get("path").and_then(Value::as_str);
-                let requested = params.get("workspace").and_then(Value::as_str);
                 let workspace = if let Some(path) = requested_path {
                     self.dynamic_workspace(&config, path)?
                 } else if let Some(path) = config.workspace.default_path.as_deref() {
                     self.dynamic_workspace(&config, path)?
+                } else if config.workspaces.len() == 1 {
+                    config.workspaces[0].clone()
                 } else {
-                    match requested {
-                        Some(value) => config.workspaces.iter().find(|item| item.id == value || item.name.eq_ignore_ascii_case(value)),
-                        None if config.workspaces.len() == 1 => config.workspaces.first(),
-                        None => return Err(AppError::details("WORKSPACE_REQUIRED", "Pass path or configure workspace.defaultPath", json!({"available": config.workspaces.iter().map(|w| json!({"id": w.id, "name": w.name})).collect::<Vec<_>>()}))),
-                    }
-                    .ok_or_else(|| AppError::details("WORKSPACE_NOT_CONFIGURED", "Workspace is not configured", json!({"workspace": requested})))?
-                    .clone()
+                    return Err(AppError::details(
+                        "WORKSPACE_REQUIRED",
+                        "Pass an absolute path or configure workspace.defaultPath",
+                        json!({"suggested_action": "workspace(action='open', path='...')"}),
+                    ));
                 };
 
-                if let Some(actor) = self.actors.read().values().next().cloned() {
-                    if actor.root_path() == Path::new(&workspace.path) {
+                let canonical_workspace = self.dynamic_workspace(&config, &workspace.path)?;
+                if let Some(actor) = self.active.read().clone() {
+                    if actor.root_path() == Path::new(&canonical_workspace.path) {
                         let mut summary = summarize(&actor)?;
                         add_elapsed(&mut summary, started.elapsed().as_millis(), true);
                         return Ok(summary);
                     }
+                    let running_tasks = actor.running_task_count();
+                    if running_tasks > 0 {
+                        return Err(AppError::details(
+                            "WORKSPACE_BUSY",
+                            "Cannot switch repositories while tasks are running",
+                            json!({"running_tasks": running_tasks, "suggested_action": "Wait for or cancel active tasks before switching repositories"}),
+                        ));
+                    }
                 }
 
                 let _lifecycle = self.lifecycle.lock();
-                self.actors.write().clear();
                 let actor = Arc::new(WorkspaceActor::open(
-                    &workspace,
+                    &canonical_workspace,
                     config.policy.clone(),
                     config.tasks.clone(),
                     PathBuf::from(config.cache_root),
                 )?);
-                self.actors
-                    .write()
-                    .insert(workspace.id.clone(), actor.clone());
+                let previous = self.active.write().replace(actor.clone());
+                drop(previous);
                 let mut summary = summarize(&actor)?;
                 add_elapsed(&mut summary, started.elapsed().as_millis(), false);
                 Ok(summary)
             }
             "summary" => {
-                let actor = self.actor(params)?;
+                let actor = self.active_actor()?;
                 if params
                     .get("_summary_ids")
                     .and_then(Value::as_bool)
@@ -226,13 +239,13 @@ impl WorkspaceManager {
                     actor.summary()
                 }
             }
-            "refresh" => self.actor(params)?.refresh(
+            "refresh" => self.active_actor()?.refresh(
                 params
                     .get("force")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             ),
-            "changes" => self.actor(params)?.changes(params),
+            "changes" => self.active_actor()?.changes(params),
             "skills" => self.list_skills(),
             "skill" => self.read_skill(params),
             action => Err(AppError::details(
@@ -243,61 +256,24 @@ impl WorkspaceManager {
         }
     }
 
-    fn actor(&self, params: &Value) -> AppResult<Arc<WorkspaceActor>> {
-        let requested_id = params.get("workspace_id").and_then(Value::as_str);
-        {
-            let actors = self.actors.read();
-            if let Some(id) = requested_id {
-                if let Some(actor) = actors.get(id) {
-                    return Ok(actor.clone());
-                }
-                if id == "main" && actors.len() == 1 {
-                    return Ok(actors.values().next().expect("single actor").clone());
-                }
-            } else if actors.len() == 1 {
-                return Ok(actors.values().next().expect("single actor").clone());
-            }
+    fn active_actor(&self) -> AppResult<Arc<WorkspaceActor>> {
+        if let Some(actor) = self.active.read().clone() {
+            return Ok(actor);
         }
 
         let config = self.config()?;
-        if let Some(id) = requested_id {
-            if id != "main" {
-                if let Some(workspace) = self.dynamic_workspace_by_id(&config, id)? {
-                    self.workspace(&json!({
-                        "action": "open",
-                        "path": workspace.path,
-                        "_summary_ids": true
-                    }))?;
-                    let actors = self.actors.read();
-                    if let Some(actor) = actors.get(id) {
-                        return Ok(actor.clone());
-                    }
-                }
-            }
-        }
-        let can_open_default =
-            config.workspace.default_path.is_some() || config.workspaces.len() == 1;
-        if can_open_default {
+        if config.workspace.default_path.is_some() || config.workspaces.len() == 1 {
             self.workspace(&json!({"action": "open", "_summary_ids": true}))?;
-            let actors = self.actors.read();
-            if let Some(id) = requested_id {
-                if let Some(actor) = actors.get(id) {
-                    return Ok(actor.clone());
-                }
-                if id == "main" && actors.len() == 1 {
-                    return Ok(actors.values().next().expect("single actor").clone());
-                }
-            } else if actors.len() == 1 {
-                return Ok(actors.values().next().expect("single actor").clone());
+            if let Some(actor) = self.active.read().clone() {
+                return Ok(actor);
             }
         }
 
         Err(AppError::details(
             "WORKSPACE_NOT_OPEN",
-            "No repository is active and no unambiguous default repository can be opened",
+            "No repository is active. Open one explicitly or configure workspace.defaultPath.",
             json!({
-                "workspace_id": requested_id,
-                "suggested_action": "workspace(action='open', path='...')"
+                "suggested_action": "workspace(action='open', path='C:/absolute/path/to/project')"
             }),
         ))
     }
@@ -361,51 +337,7 @@ impl WorkspaceManager {
             path: canonical_text,
             artifact_paths: config.workspace.artifact_paths.clone(),
         };
-        self.remember_dynamic_workspace(config, &workspace)?;
         Ok(workspace)
-    }
-
-    fn dynamic_workspace_by_id(
-        &self,
-        config: &DaemonConfig,
-        workspace_id: &str,
-    ) -> AppResult<Option<WorkspaceConfig>> {
-        if !workspace_id.starts_with("repo-") {
-            return Ok(None);
-        }
-        let registry_path = PathBuf::from(&config.cache_root).join("dynamic-workspaces.json");
-        let registry: HashMap<String, String> = match fs::read_to_string(&registry_path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let Some(path) = registry.get(workspace_id) else {
-            return Ok(None);
-        };
-        let workspace = self.dynamic_workspace(config, path)?;
-        if workspace.id != workspace_id {
-            return Ok(None);
-        }
-        Ok(Some(workspace))
-    }
-
-    fn remember_dynamic_workspace(
-        &self,
-        config: &DaemonConfig,
-        workspace: &WorkspaceConfig,
-    ) -> AppResult<()> {
-        let cache_root = PathBuf::from(&config.cache_root);
-        fs::create_dir_all(&cache_root)?;
-        let registry_path = cache_root.join("dynamic-workspaces.json");
-        let mut registry: HashMap<String, String> = fs::read_to_string(&registry_path)
-            .ok()
-            .and_then(|content| serde_json::from_str(&content).ok())
-            .unwrap_or_default();
-        registry.insert(workspace.id.clone(), workspace.path.clone());
-        let temporary = cache_root.join("dynamic-workspaces.json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(&registry)?)?;
-        fs::rename(temporary, registry_path)?;
-        Ok(())
     }
 
     fn list_skills(&self) -> AppResult<Value> {
@@ -557,13 +489,13 @@ mod tests {
         .unwrap();
         manager.initialize(&config).unwrap();
 
-        assert!(manager.actors.read().is_empty());
-        let actor = manager.actor(&json!({"workspace_id": "main"})).unwrap();
+        assert!(manager.active.read().is_none());
+        let actor = manager.active_actor().unwrap();
         assert_eq!(
             actor.root_path(),
             std::fs::canonicalize(root.path()).unwrap()
         );
-        assert_eq!(manager.actors.read().len(), 1);
+        assert!(manager.active.read().is_some());
     }
 
     #[test]
@@ -602,13 +534,12 @@ mod tests {
         manager
             .workspace(&json!({"action": "open", "path": first}))
             .unwrap();
-        assert_eq!(manager.actors.read().len(), 1);
+        assert!(manager.active.read().is_some());
         manager
             .workspace(&json!({"action": "open", "path": second}))
             .unwrap();
-        assert_eq!(manager.actors.read().len(), 1);
-        let actors = manager.actors.read();
-        let actor = actors.values().next().unwrap();
+        assert!(manager.active.read().is_some());
+        let actor = manager.active.read().clone().unwrap();
         assert!(actor.id.starts_with("repo-"));
         assert_eq!(actor.root_path(), std::fs::canonicalize(second).unwrap());
         assert_eq!(std::fs::read_dir(cache.join("repos")).unwrap().count(), 2);
@@ -618,7 +549,8 @@ mod tests {
     fn dynamic_open_rejects_paths_outside_allowed_roots() {
         let allowed = tempdir().unwrap();
         let outside = tempdir().unwrap();
-        std::fs::write(outside.path().join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(allowed.path().join("main.rs"), "fn allowed() {}\n").unwrap();
+        std::fs::write(outside.path().join("main.rs"), "fn outside() {}\n").unwrap();
         let manager = WorkspaceManager::default();
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
@@ -642,10 +574,17 @@ mod tests {
         })
         .unwrap();
         manager.initialize(&config).unwrap();
+        manager
+            .workspace(&json!({"action": "open", "path": allowed.path()}))
+            .unwrap();
         let error = manager
             .workspace(&json!({"action": "open", "path": outside.path()}))
             .unwrap_err();
         assert_eq!(error.0.code, "WORKSPACE_OUTSIDE_ALLOWED_ROOTS");
+        assert_eq!(
+            manager.active.read().as_ref().unwrap().root_path(),
+            std::fs::canonicalize(allowed.path()).unwrap()
+        );
     }
 
     #[test]
@@ -661,12 +600,12 @@ mod tests {
         manager
             .workspace(&json!({"action": "open", "workspace": "main"}))
             .unwrap();
-        assert_eq!(manager.actors.read().len(), 1);
+        assert!(manager.active.read().is_some());
 
         manager
             .initialize(&daemon_config(root.path(), cache.path(), 512_000))
             .unwrap();
-        assert!(manager.actors.read().is_empty());
+        assert!(manager.active.read().is_none());
     }
 
     #[test]

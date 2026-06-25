@@ -67,6 +67,10 @@ impl WorkspaceActor {
         &self.root
     }
 
+    pub fn running_task_count(&self) -> usize {
+        self.tasks.running_count()
+    }
+
     pub fn open(
         config: &WorkspaceConfig,
         policy: PolicyConfig,
@@ -361,14 +365,14 @@ impl WorkspaceActor {
         let profile_validation_available = !task_profiles.is_empty();
         let raw_commands_available = !self.policy.allowed_commands.is_empty();
         let validation_guidance = if profile_validation_available {
-            "code_edit.validate accepts configured task profile names only. Use run(profile='<name>') for standalone profile execution."
+            "Write-tool validate fields accept configured task profile names only. Use run(profile='<name>') for standalone profile execution."
         } else {
-            "No validation profiles are configured. Omit code_edit.validate and call run(action='start', command=[...]) with a policy-allowed command after applying the edit."
+            "No validation profiles are configured. Omit validate on write tools and call run(action='start', command=[...]) with a policy-allowed command after applying the edit."
         };
         let warnings = if profile_validation_available {
             Vec::<String>::new()
         } else {
-            vec!["No task profiles are configured; profile-based code_edit validation is unavailable, but policy-allowed raw commands remain available through run(command=[...]).".to_owned()]
+            vec!["No task profiles are configured; profile-based write validation is unavailable, but policy-allowed raw commands remain available through run(command=[...]).".to_owned()]
         };
         Ok(json!({
             "workspace_id": self.id, "name": self.name, "root": self.root, "generation": self.generation(), "snapshot_id": self.snapshot(),
@@ -397,7 +401,7 @@ impl WorkspaceActor {
                     "observed_external": external_truncated
                 }
             },
-            "tool_guidance": format!("Reuse workspace_id. Context and edits read cached state; call workspace refresh only after suspected missed external changes. {validation_guidance}")
+            "tool_guidance": format!("This server process has one active repository. Context and edits read cached state; call workspace refresh only after suspected missed external changes. {validation_guidance}")
         }))
     }
 

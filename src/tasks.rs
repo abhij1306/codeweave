@@ -120,6 +120,14 @@ impl TaskSupervisor {
         names
     }
 
+    pub fn running_count(&self) -> usize {
+        self.tasks
+            .lock()
+            .values()
+            .filter(|record| record.lock().ended_at.is_none())
+            .count()
+    }
+
     pub fn validate_profiles(&self, requested: &[String]) -> AppResult<()> {
         let available = self.profile_names();
         let missing: Vec<String> = requested

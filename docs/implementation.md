@@ -26,9 +26,9 @@ Do not expose an unauthenticated CodeWeave endpoint to a public network.
 
 ## Workspace lifecycle
 
-CodeWeave keeps one active repository per MCP manager session. Opening a different approved path drops the previous in-memory actor and watcher, then opens the requested repository. Persistent indexes are separated by canonical path under `.codeweave-cache`.
+CodeWeave keeps one active repository per server process. Opening a different approved path first builds the replacement actor and only swaps it in after opening succeeds, so a failed switch leaves the current repository usable. Persistent indexes remain separated by canonical path under `.codeweave-cache`.
 
-Dynamic repository IDs are derived from canonical paths and recorded in the cache so later calls can resolve the correct repository without confusing it with another workspace.
+Repository switching is explicit through `workspace(action="open", path="...")`. A switch is rejected while tasks are running in the active repository because task status and cancellation belong to that repository actor.
 
 ## Editing model
 
