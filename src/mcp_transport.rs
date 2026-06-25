@@ -133,20 +133,26 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
         anyhow::bail!("refusing unauthenticated HTTP on non-loopback host")
     }
 
-    let allowed_hosts = vec![
+    let mut allowed_hosts = vec![
         state.server.host.clone(),
         format!("{}:{}", state.server.host, state.server.port),
         "localhost".to_owned(),
+        format!("localhost:{}", state.server.port),
         "127.0.0.1".to_owned(),
+        format!("127.0.0.1:{}", state.server.port),
         "::1".to_owned(),
     ];
+    allowed_hosts.extend(state.server.allowed_hosts.iter().cloned());
+    allowed_hosts.sort();
+    allowed_hosts.dedup();
+
     let mut config = StreamableHttpServerConfig::default();
     config.stateful_mode = true;
 
     // Hosted clients such as Perplexity expect a complete JSON-RPC response body.
     config.json_response = true;
-
     config.allowed_hosts = allowed_hosts;
+    config.allowed_origins = state.server.allowed_origins.clone();
     let service: StreamableHttpService<CodeWeaveMcp, LocalSessionManager> =
         StreamableHttpService::new(
             {

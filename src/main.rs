@@ -58,6 +58,10 @@ struct ServerConfig {
     auth_mode: String,
     #[serde(default = "default_token")]
     token_file: String,
+    #[serde(default)]
+    allowed_hosts: Vec<String>,
+    #[serde(default)]
+    allowed_origins: Vec<String>,
 }
 fn default_host() -> String {
     "127.0.0.1".into()

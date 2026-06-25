@@ -3,7 +3,9 @@
     "host": "127.0.0.1",
     "port": 8820,
     "authMode": "bearer",
-    "tokenFile": ".mcp-token"
+    "tokenFile": ".mcp-token",
+    "allowedHosts": [],
+    "allowedOrigins": []
   },
   "workspace": {
     "defaultPath": "/path/to/projects/example",
