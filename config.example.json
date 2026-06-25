@@ -4,6 +4,8 @@
     "port": 8820,
     "authMode": "bearer",
     "tokenFile": ".mcp-token",
+    "statefulMode": false,
+    "jsonResponse": true,
     "allowedHosts": [],
     "allowedOrigins": []
   },

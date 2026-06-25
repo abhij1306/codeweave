@@ -62,6 +62,10 @@ struct ServerConfig {
     allowed_hosts: Vec<String>,
     #[serde(default)]
     allowed_origins: Vec<String>,
+    #[serde(default = "default_stateful_mode")]
+    stateful_mode: bool,
+    #[serde(default = "default_json_response")]
+    json_response: bool,
 }
 fn default_host() -> String {
     "127.0.0.1".into()
@@ -74,6 +78,12 @@ fn default_auth() -> String {
 }
 fn default_token() -> String {
     ".mcp-token".into()
+}
+fn default_stateful_mode() -> bool {
+    false
+}
+fn default_json_response() -> bool {
+    true
 }
 
 fn validate_auth_mode(auth_mode: &str) -> Result<()> {

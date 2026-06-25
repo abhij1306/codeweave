@@ -175,7 +175,9 @@ Detailed guides:
     "host": "127.0.0.1",
     "port": 8820,
     "authMode": "bearer",
-    "tokenFile": ".mcp-token"
+    "tokenFile": ".mcp-token",
+    "statefulMode": false,
+    "jsonResponse": true
   },
   "workspace": {
     "defaultPath": "/path/to/projects/example",
@@ -201,6 +203,8 @@ Detailed guides:
   }
 }
 ```
+
+`server.statefulMode` defaults to `false` and `server.jsonResponse` defaults to `true`, so Streamable HTTP uses direct POST responses without a persistent GET/SSE stream. Enable stateful mode only for MCP clients that require server-initiated messages or session-level SSE.
 
 `workspace.allowedRoots` is a security boundary. CodeWeave canonicalizes requested repository paths and rejects paths outside those roots, including junction and symlink escapes.
 

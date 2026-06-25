@@ -147,10 +147,8 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
     allowed_hosts.dedup();
 
     let mut config = StreamableHttpServerConfig::default();
-    config.stateful_mode = true;
-
-    // Hosted clients such as Perplexity expect a complete JSON-RPC response body.
-    config.json_response = true;
+    config.stateful_mode = state.server.stateful_mode;
+    config.json_response = state.server.json_response;
     config.allowed_hosts = allowed_hosts;
     config.allowed_origins = state.server.allowed_origins.clone();
     let service: StreamableHttpService<CodeWeaveMcp, LocalSessionManager> =

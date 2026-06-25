@@ -211,6 +211,7 @@ impl WorkspaceActor {
         let now = Instant::now();
         let mut relevant = HashSet::new();
         let mut external_candidates = HashSet::new();
+        let mut candidates = Vec::new();
         let mut git_event = false;
         {
             let mut internal = self.internal_writes.lock();
@@ -237,11 +238,18 @@ impl WorkspaceActor {
                 {
                     continue;
                 }
-                if !internal.contains_key(&path) {
-                    external_candidates.insert(relative);
-                }
-                relevant.insert(path);
+                let was_internal = internal.contains_key(&path);
+                candidates.push((path, relative, was_internal));
             }
+        }
+
+        for (path, relative, was_internal) in candidates {
+            if was_internal {
+                self.internal_writes.lock().remove(&path);
+                continue;
+            }
+            external_candidates.insert(relative);
+            relevant.insert(path);
         }
 
         let changed = if relevant.is_empty() {

@@ -13,6 +13,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
@@ -67,6 +68,7 @@ fn cleanup_orphan_logs(log_root: &Path, task_retention_hours: i64) {
 #[derive(Debug, Clone)]
 pub struct TaskSupervisor {
     tasks: Arc<Mutex<HashMap<String, Arc<Mutex<TaskRecord>>>>>,
+    run_permit: Arc<Semaphore>,
     cache_root: PathBuf,
     policy: PolicyConfig,
     profiles: HashMap<String, TaskProfile>,
@@ -74,7 +76,7 @@ pub struct TaskSupervisor {
 }
 
 const MAX_RETAINED_TASKS: usize = 256;
-const MAX_RUNNING_TASKS: usize = 32;
+
 const MAX_TASK_LOG_BYTES: usize = 16 * 1024 * 1024;
 const TASK_RETENTION_HOURS: i64 = 1;
 
@@ -107,6 +109,7 @@ impl TaskSupervisor {
         cleanup_orphan_logs(&log_root, retention_hours);
         Ok(Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            run_permit: Arc::new(Semaphore::new(1)),
             cache_root,
             policy,
             profiles,
@@ -226,19 +229,21 @@ impl TaskSupervisor {
                 command[0] = resolved.to_string_lossy().into_owned();
             }
         }
-        let running_tasks = self
-            .tasks
-            .lock()
-            .values()
-            .filter(|record| record.lock().ended_at.is_none())
-            .count();
-        if running_tasks >= MAX_RUNNING_TASKS {
-            return Err(AppError::details(
-                "TASK_LIMIT_REACHED",
-                "Too many tasks are already running",
-                json!({"running": running_tasks, "limit": MAX_RUNNING_TASKS}),
-            ));
-        }
+        let run_permit = self
+            .run_permit
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                AppError::details(
+                    "RUN_BUSY",
+                    "Another command is already running",
+                    json!({
+                        "retryable": true,
+                        "active_run_limit": 1,
+                        "suggested_action": "Wait for the active command to finish or cancel it before starting another command."
+                    }),
+                )
+            })?;
         let task_id = format!("task_{}", Uuid::new_v4().simple());
         let log_path = self
             .cache_root
@@ -278,12 +283,14 @@ impl TaskSupervisor {
         };
         if request.background {
             tokio::spawn(async move {
+                let _run_permit = run_permit;
                 let _ = runner.await;
             });
             Ok(
                 json!({"task_id": task_id, "status": "queued", "background": true, "log_handle": format!("task-log:{task_id}")}),
             )
         } else {
+            let _run_permit = run_permit;
             runner.await?;
             self.status(&task_id)
         }
