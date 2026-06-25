@@ -3,7 +3,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RepoStatus {
@@ -41,8 +41,8 @@ pub trait RepositoryBackend: Send + Sync {
 pub struct CliGitBackend;
 
 impl CliGitBackend {
-    fn run(&self, root: &Path, args: &[String], max_chars: usize) -> AppResult<String> {
-        let output = Command::new("git")
+    fn run_raw(&self, root: &Path, args: &[String]) -> AppResult<Output> {
+        Command::new("git")
             .current_dir(root)
             .arg("--no-pager")
             .args(args)
@@ -50,9 +50,13 @@ impl CliGitBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .map_err(|e| {
-                AppError::details("GIT_UNAVAILABLE", e.to_string(), json!({"args": args}))
-            })?;
+            .map_err(|error| {
+                AppError::details("GIT_UNAVAILABLE", error.to_string(), json!({"args": args}))
+            })
+    }
+
+    fn run(&self, root: &Path, args: &[String], max_chars: usize) -> AppResult<String> {
+        let output = self.run_raw(root, args)?;
         let mut text = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {
@@ -75,77 +79,108 @@ impl CliGitBackend {
         }
         Ok(text)
     }
+}
 
-    fn is_repo(&self, root: &Path) -> AppResult<bool> {
-        let status = Command::new("git")
-            .current_dir(root)
-            .args(["rev-parse", "--is-inside-work-tree"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|error| {
-                AppError::details(
-                    "GIT_UNAVAILABLE",
-                    error.to_string(),
-                    json!({"command": "git rev-parse --is-inside-work-tree"}),
-                )
-            })?;
-        Ok(status.success())
+fn normalized_path(path: &str) -> Option<String> {
+    let path = path.replace('\\', "/");
+    (!path.is_empty()).then_some(path)
+}
+
+fn porcelain_path(record: &str, field_count: usize) -> Option<String> {
+    record
+        .splitn(field_count, ' ')
+        .nth(field_count - 1)
+        .and_then(normalized_path)
+}
+
+fn parse_porcelain_v2(raw: &str) -> RepoStatus {
+    let records: Vec<_> = raw
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .collect();
+    let mut status = RepoStatus {
+        is_git: true,
+        ..RepoStatus::default()
+    };
+    let mut dirty = HashSet::new();
+    let mut index = 0usize;
+
+    while index < records.len() {
+        let record = records[index];
+        if let Some(oid) = record.strip_prefix("# branch.oid ") {
+            if oid != "(initial)" {
+                status.head = oid.to_owned();
+            }
+        } else if let Some(branch) = record.strip_prefix("# branch.head ") {
+            if branch != "(detached)" {
+                status.branch = branch.to_owned();
+            }
+        } else {
+            match record.as_bytes().first().copied() {
+                Some(b'1') => {
+                    if let Some(path) = porcelain_path(record, 9) {
+                        dirty.insert(path);
+                    }
+                }
+                Some(b'2') => {
+                    if let Some(path) = porcelain_path(record, 10) {
+                        dirty.insert(path);
+                    }
+                    if let Some(original) = records
+                        .get(index + 1)
+                        .and_then(|path| normalized_path(path))
+                    {
+                        dirty.insert(original);
+                        index += 1;
+                    }
+                }
+                Some(b'u') => {
+                    if let Some(path) = porcelain_path(record, 11) {
+                        dirty.insert(path);
+                    }
+                }
+                Some(b'?') => {
+                    if let Some(path) = record.strip_prefix("? ").and_then(normalized_path) {
+                        dirty.insert(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+        index += 1;
     }
+
+    status.dirty_files = dirty.into_iter().collect();
+    status.dirty_files.sort();
+    status
 }
 
 impl RepositoryBackend for CliGitBackend {
     fn status(&self, root: &Path) -> AppResult<RepoStatus> {
-        if !self.is_repo(root)? {
-            return Ok(RepoStatus::default());
+        let args = [
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--branch",
+            "--untracked-files=all",
+        ];
+        let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let output = self.run_raw(root, &args)?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            if stderr.contains("not a git repository") {
+                return Ok(RepoStatus::default());
+            }
+            return Err(AppError::details(
+                "GIT_FAILED",
+                stderr.trim().to_owned(),
+                json!({"args": args, "exit_code": output.status.code()}),
+            ));
         }
-        let head = self
-            .run(root, &["rev-parse".into(), "HEAD".into()], 1_000)?
-            .trim()
-            .to_owned();
-        let branch = self
-            .run(root, &["branch".into(), "--show-current".into()], 1_000)?
-            .trim()
-            .to_owned();
-        let raw = self.run(
-            root,
-            &[
-                "status".into(),
-                "--porcelain=v1".into(),
-                "-z".into(),
-                "--untracked-files=all".into(),
-            ],
-            2_000_000,
-        )?;
-        let mut dirty = HashSet::new();
-        let mut records = raw.split('\0').filter(|part| !part.is_empty());
-        while let Some(record) = records.next() {
-            if record.len() < 4 {
-                continue;
-            }
-            let status = &record[..2];
-            let path = record[3..].replace('\\', "/");
-            if !path.is_empty() {
-                dirty.insert(path);
-            }
-            if status.contains('R') || status.contains('C') {
-                if let Some(destination) = records.next() {
-                    let destination = destination.replace('\\', "/");
-                    if !destination.is_empty() {
-                        dirty.insert(destination);
-                    }
-                }
-            }
+        if !stderr.trim().is_empty() {
+            eprintln!("git warning for {:?}: {}", args, stderr.trim());
         }
-        let mut dirty_files: Vec<_> = dirty.into_iter().collect();
-        dirty_files.sort();
-        Ok(RepoStatus {
-            is_git: true,
-            head,
-            branch,
-            dirty_files,
-        })
+        Ok(parse_porcelain_v2(&String::from_utf8_lossy(&output.stdout)))
     }
 
     fn diff(
@@ -240,5 +275,50 @@ impl RepositoryBackend for CliGitBackend {
         args.extend(paths.iter().cloned());
         self.run(root, &args, 20_000)?;
         Ok(format!("Restored {} path(s)", paths.len()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_porcelain_v2_branch_and_dirty_paths() {
+        let raw = concat!(
+            "# branch.oid abc123\0",
+            "# branch.head feature/status\0",
+            "1 .M N... 100644 100644 100644 aaa bbb src/changed file.rs\0",
+            "2 R. N... 100644 100644 100644 aaa bbb R100 src/new name.rs\0",
+            "src/old name.rs\0",
+            "u UU N... 100644 100644 100644 100644 aaa bbb ccc src/conflict.rs\0",
+            "? src/untracked file.rs\0",
+        );
+
+        let status = parse_porcelain_v2(raw);
+
+        assert!(status.is_git);
+        assert_eq!(status.head, "abc123");
+        assert_eq!(status.branch, "feature/status");
+        assert_eq!(
+            status.dirty_files,
+            vec![
+                "src/changed file.rs",
+                "src/conflict.rs",
+                "src/new name.rs",
+                "src/old name.rs",
+                "src/untracked file.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_unborn_detached_status_without_fake_values() {
+        let status =
+            parse_porcelain_v2("# branch.oid (initial)\0# branch.head (detached)\0? new.rs\0");
+
+        assert!(status.is_git);
+        assert!(status.head.is_empty());
+        assert!(status.branch.is_empty());
+        assert_eq!(status.dirty_files, vec!["new.rs"]);
     }
 }

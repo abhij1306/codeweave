@@ -61,6 +61,28 @@ fn fetch_batches_return_successes_and_item_errors() {
 }
 
 #[test]
+fn fetch_accepts_direct_path_parameters() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("direct.rs"), "one\ntwo\nthree\n").unwrap();
+    let actor = test_actor(root.path());
+
+    let result = actor
+        .code_fetch(&json!({
+            "path": "direct.rs",
+            "start_line": 2,
+            "end_line": 3,
+            "max_chars": 5_000
+        }))
+        .unwrap();
+
+    assert_eq!(result["result_count"], 1);
+    assert_eq!(result["error_count"], 0);
+    assert_eq!(result["results"][0]["path"], "direct.rs");
+    assert_eq!(result["results"][0]["content"], "two\nthree");
+    assert_eq!(result["truncated"], false);
+}
+
+#[test]
 fn search_accepts_multiple_queries() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("alpha.rs"), "fn alpha() {}\n").unwrap();

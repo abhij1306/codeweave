@@ -285,6 +285,7 @@ fn tools() -> Value {
             "start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
             "end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
             "items":{"type":"array","items":{"type":"object","propertyNames":{"type":"string"},"additionalProperties":{}}},
+            "max_chars":{"type":"integer","minimum":1,"maximum":200000},
             "workspace_id":{"type":"string"}
           },
           "$schema":"http://json-schema.org/draft-07/schema#"
@@ -301,6 +302,10 @@ fn tools() -> Value {
           "properties":{
             "query":{"default":"","type":"string"},
             "mode":{"type":"string","enum":["literal","regex","filename","symbol","references","outline","repo_map"]},
+            "paths":{"type":"array","items":{"type":"string"}},
+            "max_results":{"type":"integer","minimum":1,"maximum":200},
+            "context_lines":{"type":"integer","minimum":0,"maximum":20},
+            "case_sensitive":{"type":"boolean"},
             "workspace_id":{"type":"string"}
           },
           "$schema":"http://json-schema.org/draft-07/schema#"
@@ -429,6 +434,7 @@ fn tools() -> Value {
             "paths":{"type":"array","items":{"type":"string"}},
             "ref":{"type":"string"},
             "message":{"type":"string"},
+            "max_chars":{"type":"integer","minimum":1,"maximum":200000},
             "confirm":{"type":"boolean"},
             "workspace_id":{"type":"string"}
           },

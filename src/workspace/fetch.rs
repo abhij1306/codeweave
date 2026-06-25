@@ -23,10 +23,20 @@ impl WorkspaceActor {
                 return Err(stale_snapshot(expected, &current));
             }
         }
-        let items = params
-            .get("items")
-            .and_then(Value::as_array)
-            .ok_or_else(|| AppError::invalid("items must be an array"))?;
+        let items: Vec<Value> = if let Some(path) = params.get("path").and_then(Value::as_str) {
+            vec![json!({
+                "kind": "path",
+                "value": path,
+                "start_line": params.get("start_line"),
+                "end_line": params.get("end_line")
+            })]
+        } else {
+            params
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| AppError::invalid("Provide 'path' or an 'items' array"))?
+        };
         let max_chars = usize_value(params, "max_chars", 30_000).min(200_000);
         let mut remaining = max_chars;
         let mut results = Vec::new();

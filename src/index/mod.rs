@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-const INDEX_SCHEMA: &str = "codeweave-index-v2";
+const INDEX_SCHEMA: &str = "codeweave-index-v3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -25,6 +25,8 @@ pub struct FileEntry {
     pub content: String,
     #[serde(skip, default)]
     pub search_content: String,
+    #[serde(default)]
+    indexed_terms: Vec<String>,
     pub hash: String,
     pub language: String,
     pub document_type: String,
@@ -194,7 +196,8 @@ impl CodeIndex {
         Ok((index, cache_hit))
     }
 
-    fn insert_entry(&mut self, entry: FileEntry) {
+    fn insert_entry(&mut self, mut entry: FileEntry) {
+        normalize_entry(&mut entry);
         if let Some(previous) = self.files.remove(&entry.path) {
             self.remove_from_token_index(&previous);
             self.remove_from_symbol_index(&previous);
@@ -214,9 +217,9 @@ impl CodeIndex {
     }
 
     fn add_to_token_index(&mut self, file: &FileEntry) {
-        for term in indexed_terms(file) {
+        for term in &file.indexed_terms {
             self.token_index
-                .entry(term)
+                .entry(term.clone())
                 .or_default()
                 .insert(file.path.clone());
         }
@@ -224,8 +227,8 @@ impl CodeIndex {
 
     fn remove_from_token_index(&mut self, file: &FileEntry) {
         let mut empty = Vec::new();
-        for term in indexed_terms(file) {
-            if let Some(paths) = self.token_index.get_mut(&term) {
+        for term in &file.indexed_terms {
+            if let Some(paths) = self.token_index.get_mut(term) {
                 paths.remove(&file.path);
                 if paths.is_empty() {
                     empty.push(term);
@@ -233,7 +236,7 @@ impl CodeIndex {
             }
         }
         for term in empty {
-            self.token_index.remove(&term);
+            self.token_index.remove(term);
         }
     }
 
@@ -1069,11 +1072,13 @@ fn read_entry(
     let hash = content_hash(&content);
     let symbols = extract_symbols(path, &content);
     let search_content = content.to_ascii_lowercase();
+    let indexed_terms = build_indexed_terms(&search_content, &path_lower, &symbols);
     Ok(Some(FileEntry {
         path: relative,
         path_lower,
         content,
         search_content,
+        indexed_terms,
         hash,
         language,
         document_type,
@@ -1254,15 +1259,28 @@ fn compact_reason_codes(mut reasons: Vec<String>) -> Vec<String> {
     compact
 }
 
-fn indexed_terms(file: &FileEntry) -> Vec<String> {
-    let mut terms = query_terms(&file.search_content);
-    terms.extend(query_terms(&file.path_lower));
-    for symbol in &file.symbols {
+fn build_indexed_terms(search_content: &str, path_lower: &str, symbols: &[Symbol]) -> Vec<String> {
+    let mut terms = query_terms(search_content);
+    terms.extend(query_terms(path_lower));
+    for symbol in symbols {
         terms.extend(query_terms(&symbol.name));
     }
     terms.sort();
     terms.dedup();
     terms
+}
+
+fn normalize_entry(entry: &mut FileEntry) {
+    if entry.search_content.is_empty() {
+        entry.search_content = entry.content.to_ascii_lowercase();
+    }
+    if entry.path_lower.is_empty() {
+        entry.path_lower = entry.path.to_ascii_lowercase();
+    }
+    if entry.indexed_terms.is_empty() {
+        entry.indexed_terms =
+            build_indexed_terms(&entry.search_content, &entry.path_lower, &entry.symbols);
+    }
 }
 fn fit_excerpt(
     content: &str,
@@ -1348,6 +1366,11 @@ mod tests {
             path_lower: path.to_ascii_lowercase(),
             content: content.to_owned(),
             search_content: content.to_ascii_lowercase(),
+            indexed_terms: build_indexed_terms(
+                content,
+                path,
+                &extract_symbols(Path::new(path), content),
+            ),
             hash: content_hash(content),
             language: language_name(Path::new(path)).to_owned(),
             document_type: classify_document(path),
@@ -1378,6 +1401,41 @@ mod tests {
     #[test]
     fn hashes_are_stable() {
         assert_eq!(content_hash("x"), content_hash("x"));
+    }
+
+    #[test]
+    fn warm_cache_reuses_persisted_indexed_terms() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("lib.rs");
+        fs::write(&source, "pub fn warm_cache_symbol() {}\n").unwrap();
+        let cache_file = cache_dir.path().join("index.json");
+
+        let (first, first_hit) =
+            CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &cache_file).unwrap();
+        assert!(!first_hit);
+        assert_eq!(
+            first
+                .candidate_files(&["warm_cache_symbol".to_owned()])
+                .len(),
+            1
+        );
+
+        let cached: CachedIndex = serde_json::from_slice(&fs::read(&cache_file).unwrap()).unwrap();
+        assert!(cached.files[0]
+            .indexed_terms
+            .iter()
+            .any(|term| term == "warm_cache_symbol"));
+
+        let (second, second_hit) =
+            CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &cache_file).unwrap();
+        assert!(second_hit);
+        assert_eq!(
+            second
+                .candidate_files(&["warm_cache_symbol".to_owned()])
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1426,6 +1484,7 @@ mod tests {
                 path_lower: "src/workspace.rs".to_owned(),
                 content: content.to_owned(),
                 search_content: content.to_ascii_lowercase(),
+                indexed_terms: Vec::new(),
                 hash,
                 language: "rust".to_owned(),
                 document_type: "source".to_owned(),
@@ -1469,6 +1528,7 @@ mod tests {
                     path_lower: path.to_ascii_lowercase(),
                     content: content.to_owned(),
                     search_content: content.to_ascii_lowercase(),
+                    indexed_terms: Vec::new(),
                     hash: content_hash(content),
                     language: "rust".to_owned(),
                     document_type: "source".to_owned(),
@@ -1515,6 +1575,7 @@ mod tests {
                     path_lower: path.to_ascii_lowercase(),
                     content: content.to_owned(),
                     search_content: content.to_ascii_lowercase(),
+                    indexed_terms: Vec::new(),
                     hash: content_hash(content),
                     language: "rust".to_owned(),
                     document_type: "source".to_owned(),
