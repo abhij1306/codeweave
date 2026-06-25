@@ -166,7 +166,14 @@ fn request_session_id(headers: &HeaderMap) -> Option<&str> {
 }
 
 async fn touch_session(state: &AppState, session_id: &str) -> Option<Arc<WorkspaceManager>> {
-    let now = Instant::now();
+    touch_session_at(state, session_id, Instant::now()).await
+}
+
+async fn touch_session_at(
+    state: &AppState,
+    session_id: &str,
+    now: Instant,
+) -> Option<Arc<WorkspaceManager>> {
     let session = {
         let sessions = state.sessions.read().await;
         sessions.get(session_id).cloned()
@@ -174,7 +181,9 @@ async fn touch_session(state: &AppState, session_id: &str) -> Option<Arc<Workspa
 
     let expired = {
         let mut last_active = session.last_active.lock();
-        let expired = now.duration_since(*last_active) >= SESSION_TTL;
+        let expired = now
+            .checked_duration_since(*last_active)
+            .is_some_and(|elapsed| elapsed >= SESSION_TTL);
         if !expired {
             *last_active = now;
         }
@@ -187,7 +196,10 @@ async fn touch_session(state: &AppState, session_id: &str) -> Option<Arc<Workspa
 
     let cleanup_due = {
         let mut last_cleanup = state.last_session_cleanup.lock();
-        if now.duration_since(*last_cleanup) >= SESSION_CLEANUP_INTERVAL {
+        if now
+            .checked_duration_since(*last_cleanup)
+            .is_some_and(|elapsed| elapsed >= SESSION_CLEANUP_INTERVAL)
+        {
             *last_cleanup = now;
             true
         } else {
@@ -195,11 +207,10 @@ async fn touch_session(state: &AppState, session_id: &str) -> Option<Arc<Workspa
         }
     };
     if cleanup_due {
-        state
-            .sessions
-            .write()
-            .await
-            .retain(|_, candidate| now.duration_since(*candidate.last_active.lock()) < SESSION_TTL);
+        state.sessions.write().await.retain(|_, candidate| {
+            now.checked_duration_since(*candidate.last_active.lock())
+                .is_none_or(|elapsed| elapsed < SESSION_TTL)
+        });
     }
 
     Some(session.manager)
@@ -1371,6 +1382,8 @@ mod tests {
     #[tokio::test]
     async fn expired_session_is_removed_without_scanning_on_every_touch() {
         let manager = Arc::new(WorkspaceManager::default());
+        let last_active = Instant::now();
+        let now = last_active + SESSION_TTL + Duration::from_secs(1);
         let state = AppState {
             manager: manager.clone(),
             config: json!({}),
@@ -1384,16 +1397,14 @@ mod tests {
             sessions: Arc::new(RwLock::new(HashMap::from([(
                 "expired".to_owned(),
                 SessionState {
-                    last_active: Arc::new(ParkingMutex::new(
-                        Instant::now() - SESSION_TTL - Duration::from_secs(1),
-                    )),
+                    last_active: Arc::new(ParkingMutex::new(last_active)),
                     manager,
                 },
             )]))),
-            last_session_cleanup: Arc::new(ParkingMutex::new(Instant::now())),
+            last_session_cleanup: Arc::new(ParkingMutex::new(last_active)),
         };
 
-        assert!(touch_session(&state, "expired").await.is_none());
+        assert!(touch_session_at(&state, "expired", now).await.is_none());
         assert!(!state.sessions.read().await.contains_key("expired"));
     }
 
