@@ -201,7 +201,7 @@ fn tools() -> Value {
             "path":{"type":"string"},
             "start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
             "end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
-            "items":{"type":"array","items":{"type":"object","propertyNames":{"type":"string"},"additionalProperties":{}}},
+            "items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["path","handle","symbol","task_log","continuation"]},"value":{"type":"string","minLength":1},"start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},"end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64}},"required":["kind","value"],"additionalProperties":false}},
             "max_chars":{"type":"integer","minimum":1,"maximum":200000}
           },
           "$schema":"http://json-schema.org/draft-07/schema#"
@@ -698,6 +698,13 @@ mod tests {
             json!(["action"])
         );
         assert!(items.iter().all(|item| item["name"] != "code_edit"));
+        let fetch_item = &tool(&all, "code_fetch")["inputSchema"]["properties"]["items"]["items"];
+        assert_eq!(fetch_item["required"], json!(["kind", "value"]));
+        assert_eq!(
+            fetch_item["properties"]["kind"]["enum"],
+            json!(["path", "handle", "symbol", "task_log", "continuation"])
+        );
+        assert_eq!(fetch_item["additionalProperties"], false);
         assert_eq!(
             tool(&all, "code_write")["inputSchema"]["required"],
             json!(["path", "content"])
