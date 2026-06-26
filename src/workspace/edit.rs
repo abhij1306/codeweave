@@ -647,10 +647,22 @@ impl WorkspaceActor {
             .iter()
             .map(|item| self.root.join(&item.path))
             .collect();
-        if !paths.is_empty() {
-            self.pending_paths.lock().extend(paths);
-            self.needs_reconcile.store(true, Ordering::Release);
-        }
+        let rollback_refresh_error = if paths.is_empty() {
+            None
+        } else {
+            match self
+                .index
+                .write()
+                .refresh_paths(&self.root, &paths, self.policy.max_file_bytes)
+            {
+                Ok(_) => None,
+                Err(error) => {
+                    self.pending_paths.lock().extend(paths);
+                    self.needs_reconcile.store(true, Ordering::Release);
+                    Some(error.0)
+                }
+            }
+        };
 
         let manual_recovery_required = !rollback_failures.is_empty();
         AppError::details(
@@ -664,7 +676,8 @@ impl WorkspaceActor {
                 "completed_before_failure": completed.iter().map(|item| &item.path).collect::<Vec<_>>(),
                 "restored_paths": restored_paths,
                 "rollback_failures": rollback_failures,
-                "manual_recovery_required": manual_recovery_required
+                "manual_recovery_required": manual_recovery_required,
+                "rollback_refresh_error": rollback_refresh_error
             }),
         )
     }

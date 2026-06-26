@@ -187,6 +187,25 @@ fn open_ended_line_fetch_reports_clamped_end_line() {
 }
 
 #[test]
+fn out_of_bounds_line_fetch_clamps_start_before_end() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("short.txt"), "one\ntwo\n").unwrap();
+    let actor = test_actor(root.path());
+
+    let result = actor
+        .code_fetch(&json!({
+            "path": "short.txt",
+            "start_line": 999,
+            "max_chars": 5_000
+        }))
+        .unwrap();
+
+    assert_eq!(result["results"][0]["start_line"], 2);
+    assert_eq!(result["results"][0]["end_line"], 2);
+    assert_eq!(result["results"][0]["content"], "two");
+}
+
+#[test]
 fn ranged_fetch_continuation_stays_within_the_original_range() {
     let root = tempdir().unwrap();
     fs::write(
@@ -319,13 +338,23 @@ fn journal_failure_rolls_back_applied_files_before_returning_error() {
 
     assert_eq!(error.0.code, "JOURNAL_COMMIT_FAILED");
     assert_eq!(
+        error
+            .0
+            .details
+            .as_ref()
+            .unwrap()
+            .get("rollback_refresh_error"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(
         fs::read_to_string(root.path().join("value.txt")).unwrap(),
         original
     );
+    let fetched = actor
+        .code_fetch(&json!({"path": "value.txt", "max_chars": 5_000}))
+        .unwrap();
+    assert_eq!(fetched["results"][0]["content"], original);
     assert_eq!(actor.generation(), generation);
-    assert!(actor
-        .needs_reconcile
-        .load(std::sync::atomic::Ordering::Acquire));
 }
 
 #[test]

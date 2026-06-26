@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -141,7 +141,13 @@ pub struct StartRequest {
 }
 
 fn command_uses_path(value: &str) -> bool {
-    Path::new(value).is_absolute() || value.contains('/') || value.contains('\\')
+    let path = Path::new(value);
+    path.is_absolute()
+        || value.contains('/')
+        || value.contains('\\')
+        || path
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_)))
 }
 
 fn normalized_command_name(value: &str) -> String {
@@ -1040,6 +1046,12 @@ mod tests {
     fn command_allowlist_normalizes_uppercase_exe_suffix() {
         assert_eq!(normalized_command_name("CARGO.EXE"), "cargo");
         assert_eq!(normalized_command_name("C:/Tools/CARGO.EXE"), "cargo");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn command_uses_path_recognizes_drive_relative_windows_paths() {
+        assert!(command_uses_path("C:cargo.exe"));
     }
 
     #[tokio::test]

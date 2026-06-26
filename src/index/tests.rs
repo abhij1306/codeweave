@@ -144,24 +144,8 @@ fn symbol_index_replaces_stale_definitions() {
 #[test]
 fn context_does_not_echo_instruction_shaped_query() {
     let content = "fn open_workspace() {}\n// workspace opening snapshot refresh ownership\n";
-    let hash = content_hash(content);
     let mut index = CodeIndex::default();
-    index.files.insert(
-        "src/workspace.rs".to_owned(),
-        FileEntry {
-            path: "src/workspace.rs".to_owned(),
-            path_lower: "src/workspace.rs".to_owned(),
-            content: content.to_owned(),
-            search_content: content.to_ascii_lowercase(),
-            indexed_terms: Vec::new(),
-            hash,
-            language: "rust".to_owned(),
-            document_type: "source".to_owned(),
-            symbols: extract_symbols(Path::new("src/workspace.rs"), content),
-            size: content.len() as u64,
-            modified_ns: 0,
-        },
-    );
+    index.insert_entry(test_entry("src/workspace.rs", content));
 
     let output = index
         .context(ContextParams {
@@ -189,22 +173,7 @@ fn context_prefers_symbol_owner_over_wrapper() {
         ("src/main.rs", "fn main() { open_workspace(); }\n"),
         ("src/workspace.rs", "pub fn open_workspace() {}\n"),
     ] {
-        index.files.insert(
-            path.to_owned(),
-            FileEntry {
-                path: path.to_owned(),
-                path_lower: path.to_ascii_lowercase(),
-                content: content.to_owned(),
-                search_content: content.to_ascii_lowercase(),
-                indexed_terms: Vec::new(),
-                hash: content_hash(content),
-                language: "rust".to_owned(),
-                document_type: "source".to_owned(),
-                symbols: extract_symbols(Path::new(path), content),
-                size: content.len() as u64,
-                modified_ns: 0,
-            },
-        );
+        index.insert_entry(test_entry(path, content));
     }
 
     let result = index
@@ -236,22 +205,7 @@ fn reference_search_is_explicit_and_excludes_the_declaration() {
         ("src/workspace.rs", "pub fn open_workspace() {}\n"),
         ("src/main.rs", "fn main() { open_workspace(); }\n"),
     ] {
-        index.files.insert(
-            path.to_owned(),
-            FileEntry {
-                path: path.to_owned(),
-                path_lower: path.to_ascii_lowercase(),
-                content: content.to_owned(),
-                search_content: content.to_ascii_lowercase(),
-                indexed_terms: Vec::new(),
-                hash: content_hash(content),
-                language: "rust".to_owned(),
-                document_type: "source".to_owned(),
-                symbols: extract_symbols(Path::new(path), content),
-                size: content.len() as u64,
-                modified_ns: 0,
-            },
-        );
+        index.insert_entry(test_entry(path, content));
     }
     let result = index
         .search(SearchParams {
@@ -268,6 +222,26 @@ fn reference_search_is_explicit_and_excludes_the_declaration() {
     assert_eq!(result["mode"], "references");
     assert_eq!(result["definitions"][0]["path"], "src/workspace.rs");
     assert_eq!(result["results"][0]["path"], "src/main.rs");
+}
+
+#[test]
+fn document_classification_uses_path_segments_not_substrings() {
+    assert_eq!(classify_document("src/testament.rs"), "source");
+    assert_eq!(classify_document("src/fixtures_parser.rs"), "source");
+    assert_eq!(classify_document("tests/unit/test_output.py"), "test");
+    assert_eq!(classify_document("src/value_test.rs"), "test");
+    assert_eq!(classify_document("fixtures/http_response.json"), "artifact");
+    assert_eq!(
+        classify_document("recordings/login.recording.json"),
+        "artifact"
+    );
+    assert_eq!(
+        classify_document("runtime/session.json"),
+        "runtime_evidence"
+    );
+    assert_eq!(classify_document("evidence/session.txt"), "source");
+    assert_eq!(classify_document("runtime/session.txt"), "source");
+    assert_eq!(classify_document("logs/server.log"), "log");
 }
 
 #[test]
@@ -336,6 +310,68 @@ fn regex_search_honors_case_sensitivity() {
     assert_eq!(insensitive["result_count"], 2);
     assert_eq!(sensitive["result_count"], 1);
     assert_eq!(sensitive["results"][0]["line"], 3);
+}
+
+#[test]
+fn filename_search_supports_glob_wildcards() {
+    let mut index = CodeIndex::default();
+    index.insert_entry(test_entry(
+        "backend/app/core/records/output_safety.py",
+        "def sanitize_output():\n    pass\n",
+    ));
+    index.insert_entry(test_entry(
+        "backend/app/core/other.py",
+        "def other():\n    pass\n",
+    ));
+
+    let result = index
+        .search(SearchParams {
+            workspace_id: "main",
+            snapshot_id: "snap_test",
+            mode: "filename",
+            query: "*output*safety*",
+            path_filters: &[],
+            case_sensitive: false,
+            max_results: 10,
+            context_lines: 0,
+        })
+        .unwrap();
+
+    assert_eq!(result["match_semantics"], "glob");
+    assert_eq!(result["result_count"], 1);
+    assert_eq!(
+        result["results"][0]["path"],
+        "backend/app/core/records/output_safety.py"
+    );
+}
+
+#[test]
+fn repo_map_honors_path_filters_as_strict_scope() {
+    let mut index = CodeIndex::default();
+    index.insert_entry(test_entry("backend/app/main.py", "def main():\n    pass\n"));
+    index.insert_entry(test_entry(
+        "backend/tests/test_main.py",
+        "def test_main():\n    pass\n",
+    ));
+    index.insert_entry(test_entry("README.md", "backend app docs\n"));
+
+    let result = index
+        .search(SearchParams {
+            workspace_id: "main",
+            snapshot_id: "snap_test",
+            mode: "repo_map",
+            query: "",
+            path_filters: &["backend/app".to_owned()],
+            case_sensitive: false,
+            max_results: 10,
+            context_lines: 0,
+        })
+        .unwrap();
+
+    assert_eq!(result["scope_applied"], true);
+    assert_eq!(result["file_count"], 1);
+    assert_eq!(result["total_file_count"], 3);
+    assert_eq!(result["directories"][0]["path"], "backend/app");
 }
 
 #[test]

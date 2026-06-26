@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const INDEX_SCHEMA: &str = "codeweave-index-v3";
+const INDEX_SCHEMA: &str = "codeweave-index-v4";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -452,23 +452,12 @@ impl CodeIndex {
                 })
             }
             "filename" => {
-                let needle = if case_sensitive {
-                    query.to_owned()
-                } else {
-                    query.to_ascii_lowercase()
-                };
+                let matcher = FilenameMatcher::new(query, case_sensitive)?;
                 let mut paths: Vec<_> = self
                     .files
                     .values()
                     .filter(|file| path_filters.allows(&file.path))
-                    .filter(|file| {
-                        let hay = if case_sensitive {
-                            &file.path
-                        } else {
-                            &file.path_lower
-                        };
-                        hay.contains(&needle)
-                    })
+                    .filter(|file| matcher.matches(file))
                     .map(|file| json!({"path": file.path}))
                     .collect();
                 paths.sort_by_key(|value| {
@@ -482,6 +471,7 @@ impl CodeIndex {
                 paths.truncate(max_results);
                 Ok(json!({
                     "mode": mode,
+                    "match_semantics": matcher.semantics(),
                     "snapshot_id": snapshot_id,
                     "result_count": paths.len(),
                     "truncated": total > paths.len(),
@@ -521,7 +511,7 @@ impl CodeIndex {
                     json!({"mode": mode, "path": file.path, "hash": file.hash, "symbols": file.symbols}),
                 )
             }
-            "repo_map" => Ok(self.repo_map(snapshot_id, max_results)),
+            "repo_map" => Ok(self.repo_map(snapshot_id, max_results, &path_filters)),
             _ => Err(AppError::details(
                 "INVALID_MODE",
                 "Unknown search mode",
@@ -970,9 +960,19 @@ impl CodeIndex {
         results
     }
 
-    fn repo_map(&self, snapshot_id: &str, limit: usize) -> serde_json::Value {
+    fn repo_map(
+        &self,
+        snapshot_id: &str,
+        limit: usize,
+        path_filters: &PathFilterSet<'_>,
+    ) -> serde_json::Value {
         let mut directories: BTreeMap<String, (usize, HashSet<String>)> = BTreeMap::new();
+        let mut scoped_file_count = 0usize;
         for file in self.files.values() {
+            if !path_filters.allows(&file.path) {
+                continue;
+            }
+            scoped_file_count += 1;
             let directory = file
                 .path
                 .rsplit_once('/')
@@ -994,8 +994,87 @@ impl CodeIndex {
                 json!({"path": path, "files": files, "languages": languages})
             })
             .collect();
-        json!({"mode": "repo_map", "snapshot_id": snapshot_id, "directories": entries, "file_count": self.file_count()})
+        json!({
+            "mode": "repo_map",
+            "snapshot_id": snapshot_id,
+            "directories": entries,
+            "file_count": scoped_file_count,
+            "total_file_count": self.file_count(),
+            "scope_applied": path_filters.len() > 0
+        })
     }
+}
+
+enum FilenameMatcher {
+    Substring {
+        needle: String,
+        case_sensitive: bool,
+    },
+    Glob {
+        regex: Regex,
+    },
+}
+
+impl FilenameMatcher {
+    fn new(query: &str, case_sensitive: bool) -> AppResult<Self> {
+        if has_glob_wildcards(query) {
+            let pattern = glob_pattern_to_regex(query);
+            let regex = RegexBuilder::new(&pattern)
+                .case_insensitive(!case_sensitive)
+                .build()
+                .map_err(AppError::internal)?;
+            return Ok(Self::Glob { regex });
+        }
+        Ok(Self::Substring {
+            needle: if case_sensitive {
+                query.to_owned()
+            } else {
+                query.to_ascii_lowercase()
+            },
+            case_sensitive,
+        })
+    }
+
+    fn matches(&self, file: &FileEntry) -> bool {
+        match self {
+            Self::Substring {
+                needle,
+                case_sensitive,
+            } => {
+                let hay = if *case_sensitive {
+                    &file.path
+                } else {
+                    &file.path_lower
+                };
+                hay.contains(needle)
+            }
+            Self::Glob { regex } => regex.is_match(&file.path),
+        }
+    }
+
+    fn semantics(&self) -> &'static str {
+        match self {
+            Self::Substring { .. } => "substring",
+            Self::Glob { .. } => "glob",
+        }
+    }
+}
+
+fn has_glob_wildcards(query: &str) -> bool {
+    query.contains('*') || query.contains('?')
+}
+
+fn glob_pattern_to_regex(pattern: &str) -> String {
+    let mut regex = String::from("^");
+    for ch in pattern.chars() {
+        match ch {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            _ => regex.push_str(&regex::escape(&ch.to_string())),
+        }
+    }
+    regex.push('$');
+    regex
 }
 
 fn scan_directory(

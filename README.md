@@ -102,7 +102,7 @@ PowerShell:
 .\start-ngrok.ps1 -Config .\config.json
 ```
 
-The helper reads the configured port and token file, creates a temporary ngrok Traffic Policy, injects `Authorization: Bearer <token>` into forwarded requests, and removes the temporary policy when ngrok stops.
+The helper reads the configured port and token file, creates a temporary ngrok Traffic Policy, injects `Authorization: Bearer <token>` into forwarded requests, and removes the temporary policy when ngrok stops. For random ngrok URLs, keep `server.allowedHosts` set to `["*"]`; CodeWeave still requires the injected bearer token, and this avoids 403 responses from MCP Host validation when the public ngrok hostname changes.
 
 For a reserved ngrok domain:
 
@@ -177,7 +177,8 @@ Detailed guides:
     "authMode": "bearer",
     "tokenFile": ".mcp-token",
     "statefulMode": true,
-    "jsonResponse": false
+    "jsonResponse": false,
+    "allowedHosts": ["*"]
   },
   "workspace": {
     "defaultPath": "/path/to/projects/example",
@@ -213,7 +214,7 @@ Detailed guides:
 }
 ```
 
-Task profiles can set `background: true` for long builds, browser smoke tests, and acceptance suites. Explicit `run` calls can override `background` and `timeout_ms`. Profile `outputFilter` values are:
+Task profiles can set `background: true` and `timeoutMs` for long builds, browser smoke tests, and acceptance suites. Direct `run` requests can override `background` and `timeout_ms`; task profile configuration uses `timeoutMs`. Profile `outputFilter` values are:
 
 - `{ "type": "raw" }` - successful tasks show the head; failed, cancelled, and timed-out tasks show the tail.
 - `{ "type": "failedTail", "chars": 30000 }` - use a specific failure-tail budget.
@@ -223,7 +224,9 @@ Task profiles can set `background: true` for long builds, browser smoke tests, a
 
 Task output is written incrementally. While a background task is running, call `run` with `action: "status"` for its live tail or `action: "output"` with `stream: "combined"`, `"stdout"`, or `"stderr"`. Reuse the returned continuation token to page through the selected stream. Timeouts and cancellation retain partial logs. On Windows, task processes are assigned to a kill-on-close Job Object so descendant processes such as `rustc`, Node, and Chromium are cleaned up with the task.
 
-`server.statefulMode` defaults to `true` so independent chats or LLM clients receive isolated active-workspace state through the MCP session id. `server.jsonResponse` defaults to `false` and only applies when `statefulMode` is disabled. Stateless HTTP remains supported for legacy direct JSON responses, but all stateless requests share one fallback workspace key.
+`server.statefulMode` defaults to `true` so independent chats or LLM clients receive isolated active-workspace state through the MCP session id. Stateful streamable HTTP uses long-lived SSE requests; ngrok's p50/p90 dashboard can include those request durations, so it may show high values even when tool responses report low `elapsed_ms`. `server.jsonResponse` defaults to `false` and only applies when `statefulMode` is disabled. Stateless HTTP remains supported for legacy direct JSON responses, but all stateless requests share one fallback workspace key.
+
+`server.allowedHosts` extends rmcp's Host-header validation. Set it to exact public hostnames for fixed domains, or to `["*"]` for trusted local tunnels such as random ngrok URLs where bearer auth is injected before requests reach CodeWeave.
 
 `workspace.allowedRoots` is a security boundary. CodeWeave canonicalizes requested repository paths and rejects paths outside those roots, including junction and symlink escapes.
 

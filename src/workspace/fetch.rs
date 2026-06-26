@@ -285,8 +285,8 @@ impl WorkspaceActor {
                 start_line,
                 end_line,
             } => {
-                let start_line = start_line.max(1);
                 let line_count = file.content.lines().count().max(1);
+                let start_line = start_line.max(1).min(line_count);
                 let end_line = end_line.max(start_line).min(line_count);
                 (
                     Cow::Owned(slice_lines(&file.content, start_line, end_line)),

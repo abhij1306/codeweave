@@ -252,18 +252,7 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
         anyhow::bail!("refusing unauthenticated HTTP on non-loopback host")
     }
 
-    let mut allowed_hosts = vec![
-        state.server.host.clone(),
-        format!("{}:{}", state.server.host, state.server.port),
-        "localhost".to_owned(),
-        format!("localhost:{}", state.server.port),
-        "127.0.0.1".to_owned(),
-        format!("127.0.0.1:{}", state.server.port),
-        "::1".to_owned(),
-    ];
-    allowed_hosts.extend(state.server.allowed_hosts.iter().cloned());
-    allowed_hosts.sort();
-    allowed_hosts.dedup();
+    let allowed_hosts = configured_allowed_hosts(&state.server);
 
     let mut config = StreamableHttpServerConfig::default();
     config.stateful_mode = state.server.stateful_mode;
@@ -298,6 +287,41 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
     eprintln!("{SERVER_NAME} listening on http://{address}/mcp");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn configured_allowed_hosts(server: &crate::ServerConfig) -> Vec<String> {
+    if server.allowed_hosts.iter().any(|host| host.trim() == "*") {
+        return Vec::new();
+    }
+    let mut allowed_hosts = Vec::new();
+    extend_host_authorities(&mut allowed_hosts, &server.host, server.port);
+    extend_host_authorities(&mut allowed_hosts, "localhost", server.port);
+    extend_host_authorities(&mut allowed_hosts, "127.0.0.1", server.port);
+    extend_host_authorities(&mut allowed_hosts, "::1", server.port);
+    allowed_hosts.extend(server.allowed_hosts.iter().cloned());
+    allowed_hosts.sort();
+    allowed_hosts.dedup();
+    allowed_hosts
+}
+
+fn extend_host_authorities(hosts: &mut Vec<String>, host: &str, port: u16) {
+    let host = host.trim();
+    if host.is_empty() {
+        return;
+    }
+    if is_ipv6_literal(host) {
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        hosts.push(format!("[{bare}]"));
+        hosts.push(format!("[{bare}]:{port}"));
+    } else {
+        hosts.push(host.to_owned());
+        hosts.push(format!("{host}:{port}"));
+    }
+}
+
+fn is_ipv6_literal(host: &str) -> bool {
+    let value = host.trim_start_matches('[').trim_end_matches(']');
+    value.contains(':')
 }
 
 pub(crate) async fn run_stdio(state: AppState) -> Result<()> {
@@ -351,5 +375,64 @@ mod tests {
 
         assert_eq!(session.as_str(), "stateless");
         assert!(session.is_stateless());
+    }
+
+    #[test]
+    fn wildcard_allowed_host_disables_rmcp_host_guard_for_trusted_tunnels() {
+        let server = crate::ServerConfig {
+            host: "127.0.0.1".to_owned(),
+            port: 8813,
+            auth_mode: "bearer".to_owned(),
+            token_file: ".mcp-token".to_owned(),
+            allowed_hosts: vec!["*".to_owned()],
+            allowed_origins: Vec::new(),
+            stateful_mode: true,
+            json_response: false,
+        };
+
+        assert!(configured_allowed_hosts(&server).is_empty());
+    }
+
+    #[test]
+    fn configured_allowed_hosts_keeps_loopback_defaults() {
+        let server = crate::ServerConfig {
+            host: "127.0.0.1".to_owned(),
+            port: 8813,
+            auth_mode: "bearer".to_owned(),
+            token_file: ".mcp-token".to_owned(),
+            allowed_hosts: vec!["example.ngrok-free.dev".to_owned()],
+            allowed_origins: Vec::new(),
+            stateful_mode: true,
+            json_response: false,
+        };
+
+        let hosts = configured_allowed_hosts(&server);
+
+        assert!(hosts.contains(&"127.0.0.1:8813".to_owned()));
+        assert!(hosts.contains(&"example.ngrok-free.dev".to_owned()));
+    }
+
+    #[test]
+    fn configured_allowed_hosts_brackets_ipv6_loopback_authorities() {
+        let server = crate::ServerConfig {
+            host: "::1".to_owned(),
+            port: 8813,
+            auth_mode: "bearer".to_owned(),
+            token_file: ".mcp-token".to_owned(),
+            allowed_hosts: Vec::new(),
+            allowed_origins: Vec::new(),
+            stateful_mode: true,
+            json_response: false,
+        };
+
+        let hosts = configured_allowed_hosts(&server);
+
+        assert!(hosts.contains(&"[::1]".to_owned()));
+        assert!(hosts.contains(&"[::1]:8813".to_owned()));
+        assert!(!hosts.contains(&"::1:8813".to_owned()));
+        let authority = axum::http::uri::Authority::try_from("[::1]:8813").unwrap();
+        assert_eq!(authority.host(), "[::1]");
+        assert_eq!(authority.host().trim_matches(['[', ']']), "::1");
+        assert_eq!(authority.port_u16(), Some(8813));
     }
 }

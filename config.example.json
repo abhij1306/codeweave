@@ -6,7 +6,9 @@
     "tokenFile": ".mcp-token",
     "statefulMode": true,
     "jsonResponse": false,
-    "allowedHosts": [],
+    "allowedHosts": [
+      "*"
+    ],
     "allowedOrigins": []
   },
   "workspace": {

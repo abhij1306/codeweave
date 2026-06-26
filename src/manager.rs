@@ -235,11 +235,25 @@ impl WorkspaceManager {
         self.actor_lru.lock().clear();
         self.open_locks.lock().clear();
         self.latency.lock().clear();
+        let prewarmed = self.prewarm_default_workspace(&config)?;
         Ok(json!({
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
-            "configured_workspaces": config.workspaces.iter().map(|w| json!({"id": w.id, "name": w.name})).collect::<Vec<_>>()
+            "configured_workspaces": config.workspaces.iter().map(|w| json!({"id": w.id, "name": w.name})).collect::<Vec<_>>(),
+            "default_workspace_prewarmed": prewarmed.is_some(),
+            "prewarm": prewarmed
         }))
+    }
+
+    fn prewarm_default_workspace(&self, config: &DaemonConfig) -> AppResult<Option<Value>> {
+        if config.workspace.default_path.is_none() && config.workspaces.len() != 1 {
+            return Ok(None);
+        }
+        self.open_workspace(
+            &SessionKey::stateless(),
+            &json!({"action": "open", "_summary_ids": true}),
+        )
+        .map(Some)
     }
 
     fn health(&self) -> AppResult<Value> {
@@ -784,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn code_tools_lazily_open_the_configured_default_repository() {
+    fn code_tools_reuse_prewarmed_default_repository() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
@@ -812,13 +826,16 @@ mod tests {
         .unwrap();
         manager.initialize(&config).unwrap();
 
-        assert!(manager.sessions.read().is_empty());
+        assert!(manager
+            .sessions
+            .read()
+            .contains_key(&SessionKey::stateless()));
         let actor = manager.active_actor(&SessionKey::stdio()).unwrap();
         assert_eq!(
             actor.root_path(),
             std::fs::canonicalize(root.path()).unwrap()
         );
-        assert_eq!(manager.sessions.read().len(), 1);
+        assert_eq!(manager.actors.read().len(), 1);
     }
 
     #[test]
@@ -1567,7 +1584,27 @@ mod tests {
         manager
             .initialize(&daemon_config(root.path(), cache.path(), 512_000))
             .unwrap();
-        assert!(manager.actors.read().is_empty());
+        assert_eq!(manager.actors.read().len(), 1);
+        assert!(manager
+            .sessions
+            .read()
+            .contains_key(&SessionKey::stateless()));
+    }
+
+    #[test]
+    fn initialize_prewarms_default_workspace_actor() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let manager = WorkspaceManager::default();
+
+        let result = manager
+            .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
+            .unwrap();
+
+        assert_eq!(result["default_workspace_prewarmed"], true);
+        assert!(result["prewarm"]["phase_ms"]["actor_open"].is_number());
+        assert_eq!(manager.actors.read().len(), 1);
     }
 
     #[test]

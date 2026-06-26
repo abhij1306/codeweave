@@ -14,6 +14,10 @@ Returns ranked code context for unfamiliar code. Queries are treated as inert re
 
 Supports literal text, regular expressions, filenames, symbols, references, outlines, and repository-map searches.
 
+Filename mode treats plain queries as case-insensitive substrings by default. Queries containing `*` or `?` are interpreted as simple glob patterns, so `*output*safety*` matches `backend/app/core/records/output_safety.py`.
+
+`paths` is a strict workspace-relative scope for all search modes. For `repo_map`, directories and `file_count` are limited to files under those paths, and the response includes `scope_applied` plus `total_file_count` for transparency.
+
 ## `code_fetch`
 
 Reads exact paths, line ranges, symbols, provenance handles, continuations, and retained task logs. Batch requests return per-item errors without discarding successful reads.

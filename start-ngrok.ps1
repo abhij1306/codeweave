@@ -60,7 +60,6 @@ on_http_request:
           headers:
             authorization: "Bearer $Token"
             origin: "http://127.0.0.1:$Port"
-            host: "127.0.0.1:$Port"
 "@ | Set-Content -Path $PolicyPath -Encoding utf8
 
 $Arguments = @(
@@ -78,6 +77,21 @@ Write-Host "Starting CodeWeave ngrok tunnel" -ForegroundColor Cyan
 Write-Host "Local MCP:  http://127.0.0.1:$Port/mcp"
 Write-Host "Inspector:  http://127.0.0.1:4040"
 Write-Host "Auth header: injected internally by ngrok"
+$AllowedHosts = @($Settings.server.allowedHosts) | ForEach-Object { "$_".Trim() }
+$NgrokHost = $Domain.Trim() -replace '^https?://', ''
+$NgrokHost = $NgrokHost.TrimEnd('/')
+$HostAllowed = $AllowedHosts -contains "*"
+if (-not $HostAllowed -and -not [string]::IsNullOrWhiteSpace($NgrokHost)) {
+    $HostAllowed = ($AllowedHosts -contains $NgrokHost) -or ($AllowedHosts -contains "${NgrokHost}:443")
+}
+if (-not $HostAllowed) {
+    if ([string]::IsNullOrWhiteSpace($NgrokHost)) {
+        Write-Warning "Random ngrok URLs can return 403 unless server.allowedHosts is [""*""]. Restart CodeWeave after changing the config."
+    }
+    else {
+        Write-Warning "If MCP requests return 403, add ""$NgrokHost"" to server.allowedHosts or use [""*""] for trusted tunnel hosts, then restart CodeWeave."
+    }
+}
 Write-Host "Use the HTTPS forwarding URL shown below and append /mcp." -ForegroundColor Green
 
 try {

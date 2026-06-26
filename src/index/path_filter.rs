@@ -48,10 +48,10 @@ impl<'a> PathFilterSet<'a> {
         let name = path_lower.rsplit('/').next().unwrap_or(path_lower.as_str());
         query_lower.contains(&path_lower)
             || query_lower.contains(name)
-            || self
-                .lowercase
-                .iter()
-                .any(|filter| path_lower.starts_with(filter) || path_lower.contains(filter))
+            || self.lowercase.iter().any(|filter| {
+                let filter_name = filter.rsplit('/').next().unwrap_or(filter.as_str());
+                filter == &path_lower || filter_name == name
+            })
     }
 }
 
@@ -78,5 +78,14 @@ mod tests {
         assert!(set.allows("src"));
         assert!(!set.allows("tests/src/main.rs"));
         assert!(!set.allows("src-old/main.rs"));
+    }
+
+    #[test]
+    fn explicit_request_does_not_treat_ancestor_filter_as_specific_file() {
+        let filters = vec!["src".to_owned()];
+        let set = PathFilterSet::new(&filters);
+
+        assert!(!set.explicitly_requests("src/package-lock.json", "dependency lock"));
+        assert!(set.explicitly_requests("src/package-lock.json", "package-lock.json"));
     }
 }

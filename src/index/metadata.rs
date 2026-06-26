@@ -34,27 +34,46 @@ pub(super) fn evidence_allowed(document_type: &str, evidence: &[String]) -> bool
 
 pub(super) fn classify_document(path: &str) -> String {
     let lower = path.to_ascii_lowercase();
-    if lower.ends_with("agents.md") || lower.ends_with("claude.md") {
+    let segments: Vec<&str> = lower.split('/').collect();
+    let basename = segments.last().copied().unwrap_or(lower.as_str());
+    if basename == "agents.md" || basename == "claude.md" {
         return "instruction".to_owned();
     }
-    if lower.contains("/test")
-        || lower.contains("/tests/")
-        || lower.contains("/__tests__/")
-        || lower.ends_with(".test.ts")
-        || lower.ends_with(".spec.ts")
-        || lower.starts_with("test_")
+    if segments
+        .iter()
+        .any(|segment| matches!(*segment, "test" | "tests" | "__tests__"))
+        || basename.starts_with("test_")
+        || basename.ends_with("_test.rs")
+        || basename.ends_with(".test.ts")
+        || basename.ends_with(".spec.ts")
+        || basename.ends_with(".test.tsx")
+        || basename.ends_with(".spec.tsx")
+        || basename.ends_with(".test.js")
+        || basename.ends_with(".spec.js")
+        || basename.ends_with(".test.jsx")
+        || basename.ends_with(".spec.jsx")
     {
         return "test".to_owned();
     }
-    if lower.contains("evidence")
-        || lower.contains("runtime") && (lower.ends_with(".json") || lower.ends_with(".log"))
+    if (segments.contains(&"evidence") || segments.contains(&"runtime"))
+        && (basename.ends_with(".json") || basename.ends_with(".log"))
     {
         return "runtime_evidence".to_owned();
     }
-    if lower.contains("artifact") || lower.contains("fixtures") || lower.contains("recording") {
+    if segments.iter().any(|segment| {
+        matches!(
+            *segment,
+            "artifact" | "artifacts" | "fixture" | "fixtures" | "recording" | "recordings"
+        )
+    }) || basename.ends_with(".recording.json")
+        || basename.ends_with(".fixture.json")
+        || basename.ends_with(".fixtures.json")
+        || basename.ends_with(".artifact.json")
+        || basename.ends_with(".artifacts.json")
+    {
         return "artifact".to_owned();
     }
-    if lower.ends_with(".log") {
+    if basename.ends_with(".log") {
         return "log".to_owned();
     }
     "source".to_owned()

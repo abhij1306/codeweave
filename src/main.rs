@@ -225,7 +225,7 @@ fn tools() -> Value {
       {
         "name":"code_search",
         "title":"Deterministic Code Search",
-        "description":"Search the project by text, regex, filename, symbol, references, outline, or repository map. Literal text search is the default.",
+        "description":"Search the project by text, regex, filename, symbol, references, outline, or repository map. Filename mode accepts plain substrings or * and ? wildcards. repo_map paths are strict subtree scopes. Literal text search is the default.",
         "annotations":read.clone(),
         "execution":execution.clone(),
         "inputSchema":{
@@ -233,7 +233,7 @@ fn tools() -> Value {
           "properties":{
             "query":{"default":"","type":"string"},
             "mode":{"type":"string","enum":["literal","regex","filename","symbol","references","outline","repo_map"]},
-            "paths":{"type":"array","items":{"type":"string"}},
+            "paths":{"type":"array","items":{"type":"string"},"description":"Strict workspace-relative path scope. repo_map returns only directories under these paths."},
             "max_results":{"type":"integer","minimum":1,"maximum":200},
             "context_lines":{"type":"integer","minimum":0,"maximum":20},
             "case_sensitive":{"type":"boolean"}
