@@ -1,7 +1,7 @@
 {
   "server": {
     "host": "127.0.0.1",
-    "port": 8820,
+    "port": 8813,
     "authMode": "bearer",
     "tokenFile": ".mcp-token",
     "statefulMode": false,
@@ -52,7 +52,12 @@
         "--tb=short"
       ],
       "cwd": "backend",
-      "timeoutMs": 300000
+      "timeoutMs": 300000,
+      "background": false,
+      "outputFilter": {
+        "type": "failedTail",
+        "chars": 30000
+      }
     },
     "check": {
       "command": [

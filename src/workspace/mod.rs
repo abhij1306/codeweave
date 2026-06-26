@@ -700,7 +700,7 @@ impl WorkspaceActor {
                             command,
                             cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
                             shell: bool_value(params, "shell", false),
-                            background: bool_value(params, "background", false),
+                            background: params.get("background").and_then(Value::as_bool),
                             timeout_ms: params.get("timeout_ms").and_then(Value::as_u64),
                         },
                     )
@@ -726,8 +726,14 @@ impl WorkspaceActor {
                     .get("continuation")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                let stream = params
+                    .get("stream")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 tokio::task::spawn_blocking(move || {
-                    actor.tasks.output(&task_id, continuation.as_deref())
+                    actor
+                        .tasks
+                        .output_stream(&task_id, continuation.as_deref(), stream.as_deref())
                 })
                 .await
                 .map_err(AppError::internal)??

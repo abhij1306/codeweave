@@ -75,7 +75,7 @@ impl WorkspaceActor {
                         command: None,
                         cwd: None,
                         shell: false,
-                        background: false,
+                        background: Some(false),
                         timeout_ms: None,
                     },
                 )

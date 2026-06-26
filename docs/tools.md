@@ -68,3 +68,7 @@ Supports status, diff, log, show, blame, stage, commit, and confirmed restore. I
 ## `run`
 
 Runs a configured profile or an allow-listed executable. Foreground and retained background tasks are supported, including status, output, and cancellation.
+
+Profiles may set `background`, `timeoutMs`, and an `outputFilter`. Available filters are `raw`, `failedTail`, `tailLines`, `cargoJson`, and `jsonSummary`. Cargo profiles using `cargoJson` should add `--message-format=json` to the command.
+
+Background tasks write combined, stdout, and stderr logs incrementally. Use `action: "status"` for the live tail, or `action: "output"` with `stream: "combined"`, `"stdout"`, or `"stderr"`. Page through output by passing the returned `continuation` token. Partial output is retained after cancellation and timeout.

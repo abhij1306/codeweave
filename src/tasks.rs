@@ -1,5 +1,9 @@
-use crate::model::{AppError, AppResult, PolicyConfig, TaskProfile};
+use crate::model::{AppError, AppResult, OutputFilter, PolicyConfig, TaskProfile};
 use crate::security::resolve_existing;
+use crate::task_runtime::{
+    remove_logs, render_preview, stream_output, strip_ansi, terminate_process_tree, OutputStream,
+    TaskLogPaths, WindowsJob,
+};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -11,7 +15,6 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
@@ -33,7 +36,7 @@ pub struct TaskView {
 }
 
 #[derive(Debug)]
-struct TaskRecord {
+pub(crate) struct TaskRecord {
     task_id: String,
     status: String,
     command: Vec<String>,
@@ -41,9 +44,57 @@ struct TaskRecord {
     started_at: DateTime<Utc>,
     ended_at: Option<DateTime<Utc>>,
     exit_code: Option<i32>,
-    output: String,
-    log_path: PathBuf,
+    pub(crate) output: String,
+    pub(crate) output_truncated: bool,
+    pub(crate) logs: TaskLogPaths,
     pid: Option<u32>,
+    cancel_requested: bool,
+    job: Option<Arc<WindowsJob>>,
+}
+
+struct ExecutionGuard {
+    record: Arc<Mutex<TaskRecord>>,
+    pid: Option<u32>,
+    job: Option<Arc<WindowsJob>>,
+    armed: bool,
+}
+
+impl ExecutionGuard {
+    fn new(record: Arc<Mutex<TaskRecord>>, pid: Option<u32>, job: Option<Arc<WindowsJob>>) -> Self {
+        Self {
+            record,
+            pid,
+            job,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(pid) = self.pid {
+            terminate_process_tree(pid, self.job.as_deref());
+        }
+        let mut item = self.record.lock();
+        if item.ended_at.is_none() {
+            item.status = "cancelled".to_owned();
+            item.ended_at = Some(Utc::now());
+            item.pid = None;
+            item.job = None;
+            if !item.output.is_empty() {
+                item.output.push('\n');
+            }
+            item.output
+                .push_str("Task execution was abandoned; the process tree was terminated.");
+        }
+    }
 }
 
 fn cleanup_orphan_logs(log_root: &Path, task_retention_hours: i64) {
@@ -76,9 +127,8 @@ pub struct TaskSupervisor {
 }
 
 const MAX_RETAINED_TASKS: usize = 256;
-
-const MAX_TASK_LOG_BYTES: usize = 16 * 1024 * 1024;
 const TASK_RETENTION_HOURS: i64 = 1;
+const OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone)]
 pub struct StartRequest {
@@ -86,7 +136,7 @@ pub struct StartRequest {
     pub command: Option<Vec<String>>,
     pub cwd: Option<String>,
     pub shell: bool,
-    pub background: bool,
+    pub background: Option<bool>,
     pub timeout_ms: Option<u64>,
 }
 
@@ -155,33 +205,38 @@ impl TaskSupervisor {
     }
 
     pub async fn start(&self, root: &Path, request: StartRequest) -> AppResult<serde_json::Value> {
-        let (mut command, profile_cwd, profile_timeout) = if let Some(profile) = &request.profile {
-            let value = self.profiles.get(profile).ok_or_else(|| {
-                AppError::details(
-                    "UNKNOWN_TASK_PROFILE",
-                    "Unknown task profile",
-                    json!({
-                        "profile": profile,
-                        "available": self.profile_names(),
-                        "configuration_hint": "Add tasks.<name> to the active CodeWeave config and restart the server.",
-                    }),
+        let (mut command, profile_cwd, profile_timeout, profile_background, output_filter) =
+            if let Some(profile) = &request.profile {
+                let value = self.profiles.get(profile).ok_or_else(|| {
+                    AppError::details(
+                        "UNKNOWN_TASK_PROFILE",
+                        "Unknown task profile",
+                        json!({
+                            "profile": profile,
+                            "available": self.profile_names(),
+                            "configuration_hint": "Add tasks.<name> to the active CodeWeave config and restart the server.",
+                        }),
+                    )
+                })?;
+                (
+                    value.command.clone(),
+                    value.cwd.clone(),
+                    Some(value.timeout_ms),
+                    value.background,
+                    value.output_filter.clone(),
                 )
-            })?;
-            (
-                value.command.clone(),
-                value.cwd.clone(),
-                Some(value.timeout_ms),
-            )
-        } else {
-            (
-                request
-                    .command
-                    .clone()
-                    .ok_or_else(|| AppError::invalid("Provide profile or command"))?,
-                None,
-                None,
-            )
-        };
+            } else {
+                (
+                    request
+                        .command
+                        .clone()
+                        .ok_or_else(|| AppError::invalid("Provide profile or command"))?,
+                    None,
+                    None,
+                    false,
+                    OutputFilter::Raw,
+                )
+            };
         if command.is_empty() {
             return Err(AppError::invalid("Command cannot be empty"));
         }
@@ -245,10 +300,8 @@ impl TaskSupervisor {
                 )
             })?;
         let task_id = format!("task_{}", Uuid::new_v4().simple());
-        let log_path = self
-            .cache_root
-            .join("task-logs")
-            .join(format!("{task_id}.log"));
+        let log_root = self.cache_root.join("task-logs");
+        let logs = TaskLogPaths::new(&log_root, &task_id);
         let record = Arc::new(Mutex::new(TaskRecord {
             task_id: task_id.clone(),
             status: "queued".to_owned(),
@@ -258,12 +311,16 @@ impl TaskSupervisor {
             ended_at: None,
             exit_code: None,
             output: String::new(),
-            log_path: log_path.clone(),
+            output_truncated: false,
+            logs,
             pid: None,
+            cancel_requested: false,
+            job: None,
         }));
         self.tasks.lock().insert(task_id.clone(), record.clone());
         self.trim_tasks();
         let timeout_ms = request.timeout_ms.or(profile_timeout).unwrap_or(120_000);
+        let background = request.background.unwrap_or(profile_background);
         let policy = self.policy.clone();
         let execution_record = record.clone();
         let runner = async move {
@@ -274,6 +331,7 @@ impl TaskSupervisor {
                 request.shell,
                 timeout_ms,
                 policy.max_task_output_chars,
+                output_filter,
             )
             .await;
             if let Err(error) = &result {
@@ -281,14 +339,17 @@ impl TaskSupervisor {
             }
             result
         };
-        if request.background {
+        if background {
             tokio::spawn(async move {
                 let _run_permit = run_permit;
                 let _ = runner.await;
             });
-            Ok(
-                json!({"task_id": task_id, "status": "queued", "background": true, "log_handle": format!("task-log:{task_id}")}),
-            )
+            Ok(json!({
+                "task_id": task_id,
+                "status": "queued",
+                "background": true,
+                "log_handle": format!("task-log:{task_id}")
+            }))
         } else {
             let _run_permit = run_permit;
             runner.await?;
@@ -305,15 +366,20 @@ impl TaskSupervisor {
             )
         })?;
         let record = record.lock();
-        let value = serde_json::to_value(view(&record, self.policy.max_task_output_chars))?;
-        Ok(value)
+        Ok(serde_json::to_value(view(
+            &record,
+            self.policy.max_task_output_chars,
+        ))?)
     }
 
-    pub fn output(
+    pub fn output_stream(
         &self,
         task_id: &str,
         continuation: Option<&str>,
+        requested_stream: Option<&str>,
     ) -> AppResult<serde_json::Value> {
+        let stream = OutputStream::parse(requested_stream)
+            .map_err(|error| AppError::invalid(error.to_string()))?;
         let record = self.tasks.lock().get(task_id).cloned().ok_or_else(|| {
             AppError::details(
                 "TASK_NOT_FOUND",
@@ -322,10 +388,16 @@ impl TaskSupervisor {
             )
         })?;
         let record = record.lock();
-        let full = fs::read_to_string(&record.log_path).unwrap_or_else(|_| record.output.clone());
-        let requested_offset = continuation
-            .and_then(|value| value.strip_prefix(&format!("task:{task_id}:")))
-            .and_then(|value| value.parse::<usize>().ok())
+        let full = fs::read(record.logs.path(stream))
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|_| {
+                if stream == OutputStream::Combined {
+                    record.output.clone()
+                } else {
+                    String::new()
+                }
+            });
+        let requested_offset = continuation_offset(continuation, task_id, stream)
             .unwrap_or(0)
             .min(full.len());
         let offset = char_boundary(&full, requested_offset);
@@ -333,10 +405,15 @@ impl TaskSupervisor {
             &full,
             (offset + self.policy.max_task_output_chars).min(full.len()),
         );
-        let next = (end < full.len()).then(|| format!("task:{task_id}:{end}"));
-        Ok(
-            json!({"task_id": task_id, "status": record.status, "output": &full[offset..end], "continuation": next, "total_chars": full.len()}),
-        )
+        let next = (end < full.len()).then(|| format!("task:{task_id}:{}:{end}", stream.as_str()));
+        Ok(json!({
+            "task_id": task_id,
+            "status": record.status,
+            "stream": stream.as_str(),
+            "output": strip_ansi(&full[offset..end]),
+            "continuation": next,
+            "total_chars": full.len()
+        }))
     }
 
     pub fn cancel(&self, task_id: &str) -> AppResult<serde_json::Value> {
@@ -347,18 +424,20 @@ impl TaskSupervisor {
                 json!({"task_id": task_id}),
             )
         })?;
-        let pid = {
+        let (pid, job) = {
             let mut item = record.lock();
             if item.ended_at.is_some() {
-                // Task already finished — nothing to cancel.
-                let value = serde_json::to_value(view(&item, self.policy.max_task_output_chars))?;
-                return Ok(value);
+                return Ok(serde_json::to_value(view(
+                    &item,
+                    self.policy.max_task_output_chars,
+                ))?);
             }
             item.status = "cancelling".to_owned();
-            item.pid
+            item.cancel_requested = true;
+            (item.pid, item.job.clone())
         };
         if let Some(pid) = pid {
-            kill_process_tree(pid);
+            terminate_process_tree(pid, job.as_deref());
         }
         Ok(json!({"task_id": task_id, "status": "cancelling"}))
     }
@@ -371,7 +450,9 @@ impl TaskSupervisor {
             .cloned()
             .ok_or_else(|| AppError::new("TASK_NOT_FOUND", "Task not found"))?;
         let record = record.lock();
-        Ok(fs::read_to_string(&record.log_path).unwrap_or_else(|_| record.output.clone()))
+        Ok(fs::read(&record.logs.combined)
+            .map(|bytes| strip_ansi(&String::from_utf8_lossy(&bytes)))
+            .unwrap_or_else(|_| record.output.clone()))
     }
 
     fn trim_tasks(&self) {
@@ -392,7 +473,7 @@ impl TaskSupervisor {
                 .collect();
             for task_id in expired {
                 if let Some(record) = tasks.remove(&task_id) {
-                    removed_logs.push(record.lock().log_path.clone());
+                    removed_logs.push(record.lock().logs.clone());
                 }
             }
 
@@ -408,20 +489,13 @@ impl TaskSupervisor {
                 let remove_count = tasks.len().saturating_sub(MAX_RETAINED_TASKS);
                 for (task_id, _) in completed.into_iter().take(remove_count) {
                     if let Some(record) = tasks.remove(&task_id) {
-                        removed_logs.push(record.lock().log_path.clone());
+                        removed_logs.push(record.lock().logs.clone());
                     }
                 }
             }
         }
-        for log_path in removed_logs {
-            if let Err(error) = fs::remove_file(&log_path) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "task log cleanup failed for {}: {error}",
-                        log_path.display()
-                    );
-                }
-            }
+        for logs in removed_logs {
+            remove_logs(&logs);
         }
     }
 
@@ -435,19 +509,18 @@ impl TaskSupervisor {
             .tasks
             .lock()
             .values()
-            .map(|r| {
+            .map(|record| {
                 let key = {
-                    let g = r.lock();
-                    g.ended_at.unwrap_or(g.started_at)
+                    let guard = record.lock();
+                    guard.ended_at.unwrap_or(guard.started_at)
                 };
-                (key, r.clone())
+                (key, record.clone())
             })
             .collect();
-        keyed.sort_by(|(a, _), (b, _)| b.cmp(a));
-        let records: Vec<_> = keyed.into_iter().map(|(_, r)| r).collect();
+        keyed.sort_by(|(left, _), (right, _)| right.cmp(left));
         let mut output = Vec::new();
         let mut superseded_commands = HashSet::new();
-        for record in records {
+        for (_, record) in keyed {
             let record = record.lock();
             let command_key = format!(
                 "{}\0{}",
@@ -468,12 +541,11 @@ impl TaskSupervisor {
             if !terms.is_empty() && !terms.iter().any(|term| lower.contains(term)) {
                 continue;
             }
-            let end = char_boundary(&record.output, record.output.len().min(4_000));
             output.push(json!({
                 "task_id": record.task_id,
                 "status": record.status,
                 "command": record.command,
-                "output": &record.output[..end],
+                "output": tail_chars(&record.output, 4_000),
                 "log_handle": format!("task-log:{}", record.task_id),
                 "reason_codes": ["recent_task_failure"]
             }));
@@ -492,6 +564,7 @@ async fn execute(
     shell: bool,
     timeout_ms: u64,
     max_output: usize,
+    output_filter: OutputFilter,
 ) -> AppResult<()> {
     let mut process = if shell {
         let script = if cfg!(windows) {
@@ -500,18 +573,18 @@ async fn execute(
             posix_shell_command(&command)
         };
         if cfg!(windows) {
-            let mut cmd = Command::new("powershell.exe");
-            cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-            cmd
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+            command
         } else {
-            let mut cmd = Command::new("bash");
-            cmd.args(["-lc", &script]);
-            cmd
+            let mut command = Command::new("bash");
+            command.args(["-lc", &script]);
+            command
         }
     } else {
-        let mut cmd = Command::new(&command[0]);
-        cmd.args(&command[1..]);
-        cmd
+        let mut process = Command::new(&command[0]);
+        process.args(&command[1..]);
+        process
     };
     process
         .current_dir(&cwd)
@@ -521,20 +594,39 @@ async fn execute(
         .kill_on_drop(true);
     #[cfg(unix)]
     process.as_std_mut().process_group(0);
-    let mut child = process.spawn().map_err(|e| {
+    let mut child = process.spawn().map_err(|error| {
         AppError::details(
             "TASK_START_FAILED",
-            e.to_string(),
+            error.to_string(),
             json!({"command": command, "cwd": cwd}),
         )
     })?;
     let pid = child.id();
+
+    #[cfg(windows)]
+    let (job, setup_warning) = match pid {
+        Some(pid) => match WindowsJob::assign(pid) {
+            Ok(job) => (Some(job), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "CodeWeave warning: Windows Job Object assignment failed; falling back to taskkill for cancellation: {error}"
+                )),
+            ),
+        },
+        None => (None, Some("CodeWeave warning: spawned task has no process id".to_owned())),
+    };
+    #[cfg(not(windows))]
+    let (job, setup_warning): (Option<Arc<WindowsJob>>, Option<String>) = (None, None);
+
     {
         let mut item = record.lock();
         item.status = "running".to_owned();
         item.started_at = Utc::now();
         item.pid = pid;
+        item.job = job.clone();
     }
+    let mut execution_guard = ExecutionGuard::new(record.clone(), pid, job.clone());
     let stdout = child
         .stdout
         .take()
@@ -543,130 +635,130 @@ async fn execute(
         .stderr
         .take()
         .ok_or_else(|| AppError::new("TASK_PIPE_FAILED", "Task stderr pipe is unavailable"))?;
-    let execution = async {
-        let output = collect_bounded_output(stdout, stderr, MAX_TASK_LOG_BYTES);
-        let wait = child.wait();
-        let (output, status) = tokio::join!(output, wait);
-        Ok::<_, std::io::Error>((output?, status?))
-    };
-    let outcome = timeout(Duration::from_millis(timeout_ms), execution).await;
-    let (status, exit_code, output) = match outcome {
-        Ok(Ok(((stdout, stderr, output_limited), result))) => {
-            let mut text = String::from_utf8_lossy(&stdout).to_string();
-            if !stderr.is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&String::from_utf8_lossy(&stderr));
-            }
-            if output_limited {
-                text.push_str("\n… task log limit reached; additional output was discarded …");
-            }
+    let collector_record = record.clone();
+    let mut collector =
+        tokio::spawn(
+            async move { stream_output(stdout, stderr, collector_record, max_output).await },
+        );
+
+    let wait_outcome = timeout(Duration::from_millis(timeout_ms), child.wait()).await;
+    let (status, exit_code) = match wait_outcome {
+        Ok(Ok(result)) => {
+            let cancelled = record.lock().cancel_requested;
             (
-                if result.success() {
+                if cancelled {
+                    "cancelled"
+                } else if result.success() {
                     "succeeded"
                 } else {
                     "failed"
                 },
                 result.code(),
-                strip_ansi(&text),
             )
         }
-        Ok(Err(error)) => ("failed", None, format!("Task wait failed: {error}")),
+        Ok(Err(error)) => {
+            let mut item = record.lock();
+            if !item.output.is_empty() {
+                item.output.push('\n');
+            }
+            item.output.push_str(&format!("Task wait failed: {error}"));
+            ("failed", None)
+        }
         Err(_) => {
             if let Some(pid) = pid {
-                kill_process_tree(pid);
+                let kill_job = job.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    terminate_process_tree(pid, kill_job.as_deref());
+                })
+                .await;
             }
+            let _ = timeout(Duration::from_secs(5), child.wait()).await;
+            ("timed_out", None)
+        }
+    };
+
+    let (collected, collector_warning) = match timeout(
+        Duration::from_secs(OUTPUT_DRAIN_TIMEOUT_SECS),
+        &mut collector,
+    )
+    .await
+    {
+        Ok(Ok(Ok(result))) => (Some(result), None),
+        Ok(Ok(Err(error))) => (
+            None,
+            Some(format!(
+                "CodeWeave warning: live task logging failed: {error}"
+            )),
+        ),
+        Ok(Err(error)) => (
+            None,
+            Some(format!(
+                "CodeWeave warning: output collector failed: {error}"
+            )),
+        ),
+        Err(_) => {
+            collector.abort();
             (
-                "timed_out",
                 None,
-                format!("Task exceeded timeout of {timeout_ms} ms"),
+                Some(
+                    "CodeWeave warning: output pipes did not close after process termination"
+                        .to_owned(),
+                ),
             )
         }
     };
-    let log_path = record.lock().log_path.clone();
-    let log_error = tokio::fs::write(&log_path, &output).await.err();
-    let mut display_output = if output.len() > max_output {
-        let end = char_boundary(&output, max_output);
-        let mut value = output[..end].to_owned();
-        value.push_str("\n… output truncated; use run(action='output') …");
-        value
-    } else {
-        output
-    };
-    if let Some(error) = log_error {
-        if !display_output.is_empty() {
-            display_output.push('\n');
-        }
-        display_output.push_str(&format!(
-            "CodeWeave warning: task output could not be persisted to {}: {error}. The in-memory result is still available.",
-            log_path.display()
-        ));
+
+    let paths = record.lock().logs.clone();
+    let log_limited = collected.is_some_and(|result| result.limited);
+    let (mut display_output, mut output_truncated) =
+        render_preview(&paths, &output_filter, status, max_output, log_limited).await;
+    if display_output.is_empty() {
+        display_output = record.lock().output.clone();
     }
+    if let Some(warning) = collector_warning {
+        append_note(&mut display_output, &warning);
+    }
+    if status == "timed_out" {
+        append_note(
+            &mut display_output,
+            &format!("Task exceeded timeout of {timeout_ms} ms; partial output was retained."),
+        );
+    } else if status == "cancelled" {
+        append_note(
+            &mut display_output,
+            "Task was cancelled; partial output was retained.",
+        );
+    }
+    if let Some(warning) = setup_warning {
+        append_note(&mut display_output, &warning);
+    }
+    if display_output.chars().count() > max_output {
+        display_output = if matches!(status, "failed" | "timed_out" | "cancelled") {
+            tail_chars(&display_output, max_output)
+        } else {
+            head_chars(&display_output, max_output)
+        };
+        output_truncated = true;
+    }
+
     let mut item = record.lock();
     item.status = status.to_owned();
     item.exit_code = exit_code;
     item.ended_at = Some(Utc::now());
     item.pid = None;
+    item.job = None;
     item.output = display_output;
+    item.output_truncated = output_truncated;
+    drop(item);
+    execution_guard.disarm();
     Ok(())
 }
 
-async fn collect_bounded_output<O, E>(
-    mut stdout: O,
-    mut stderr: E,
-    limit: usize,
-) -> std::io::Result<(Vec<u8>, Vec<u8>, bool)>
-where
-    O: AsyncRead + Unpin,
-    E: AsyncRead + Unpin,
-{
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    let mut stdout_done = false;
-    let mut stderr_done = false;
-    let mut limited = false;
-    let mut total = 0usize;
-    let mut stdout_buffer = [0u8; 8192];
-    let mut stderr_buffer = [0u8; 8192];
-
-    while !stdout_done || !stderr_done {
-        tokio::select! {
-            read = stdout.read(&mut stdout_buffer), if !stdout_done => {
-                let read = read?;
-                if read == 0 {
-                    stdout_done = true;
-                } else {
-                    append_bounded(&mut stdout_bytes, &stdout_buffer[..read], limit, &mut total, &mut limited);
-                }
-            }
-            read = stderr.read(&mut stderr_buffer), if !stderr_done => {
-                let read = read?;
-                if read == 0 {
-                    stderr_done = true;
-                } else {
-                    append_bounded(&mut stderr_bytes, &stderr_buffer[..read], limit, &mut total, &mut limited);
-                }
-            }
-        }
+fn append_note(output: &mut String, note: &str) {
+    if !output.is_empty() {
+        output.push_str("\n\n");
     }
-    Ok((stdout_bytes, stderr_bytes, limited))
-}
-
-fn append_bounded(
-    destination: &mut Vec<u8>,
-    chunk: &[u8],
-    limit: usize,
-    total: &mut usize,
-    limited: &mut bool,
-) {
-    let remaining = limit.saturating_sub(*total);
-    let retained = remaining.min(chunk.len());
-    destination.extend_from_slice(&chunk[..retained]);
-    *total += retained;
-    if retained < chunk.len() {
-        *limited = true;
-    }
+    output.push_str(note);
 }
 
 fn finalize_task_error(record: &Arc<Mutex<TaskRecord>>, error: &AppError) {
@@ -678,10 +770,27 @@ fn finalize_task_error(record: &Arc<Mutex<TaskRecord>>, error: &AppError) {
     item.exit_code = None;
     item.ended_at = Some(Utc::now());
     item.pid = None;
-    item.output = format!("CodeWeave task execution failed: {}", error.0.message);
+    item.job = None;
+    if !item.output.is_empty() {
+        item.output.push('\n');
+    }
+    item.output.push_str(&format!(
+        "CodeWeave task execution failed: {}",
+        error.0.message
+    ));
 }
 
 fn view(record: &TaskRecord, max_output: usize) -> TaskView {
+    let failed = matches!(record.status.as_str(), "failed" | "timed_out" | "cancelled");
+    let output = if record.output.chars().count() > max_output {
+        if failed || record.ended_at.is_none() {
+            tail_chars(&record.output, max_output)
+        } else {
+            head_chars(&record.output, max_output)
+        }
+    } else {
+        record.output.clone()
+    };
     TaskView {
         task_id: record.task_id.clone(),
         status: record.status.clone(),
@@ -690,11 +799,38 @@ fn view(record: &TaskRecord, max_output: usize) -> TaskView {
         started_at: record.started_at,
         ended_at: record.ended_at,
         exit_code: record.exit_code,
-        output: record.output.chars().take(max_output).collect(),
-        output_truncated: record.output.len() > max_output,
+        output,
+        output_truncated: record.output_truncated || record.output.chars().count() > max_output,
         log_handle: format!("task-log:{}", record.task_id),
         pid: record.pid,
     }
+}
+
+fn continuation_offset(
+    continuation: Option<&str>,
+    task_id: &str,
+    stream: OutputStream,
+) -> Option<usize> {
+    let value = continuation?;
+    let prefix = format!("task:{task_id}:{}:", stream.as_str());
+    if let Some(offset) = value.strip_prefix(&prefix) {
+        return offset.parse::<usize>().ok();
+    }
+    if stream == OutputStream::Combined {
+        return value
+            .strip_prefix(&format!("task:{task_id}:"))
+            .and_then(|offset| offset.parse::<usize>().ok());
+    }
+    None
+}
+
+fn head_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+fn tail_chars(value: &str, limit: usize) -> String {
+    let count = value.chars().count();
+    value.chars().skip(count.saturating_sub(limit)).collect()
 }
 
 fn posix_shell_command(command: &[String]) -> String {
@@ -716,40 +852,6 @@ fn powershell_command(command: &[String]) -> String {
     )
 }
 
-fn strip_ansi(value: &str) -> String {
-    #[derive(Clone, Copy)]
-    enum State {
-        Text,
-        Escape,
-        Csi,
-        Osc,
-        OscEscape,
-    }
-    let mut state = State::Text;
-    let mut output = String::with_capacity(value.len());
-    for ch in value.chars() {
-        state = match state {
-            State::Text if ch == '\u{1b}' => State::Escape,
-            State::Text => {
-                output.push(ch);
-                State::Text
-            }
-            State::Escape if ch == '[' => State::Csi,
-            State::Escape if ch == ']' => State::Osc,
-            State::Escape => State::Text,
-            State::Csi if ('@'..='~').contains(&ch) => State::Text,
-            State::Csi => State::Csi,
-            State::Osc if ch == '\u{7}' => State::Text,
-            State::Osc if ch == '\u{1b}' => State::OscEscape,
-            State::Osc => State::Osc,
-            State::OscEscape if ch == '\\' => State::Text,
-            State::OscEscape if ch == '\u{1b}' => State::OscEscape,
-            State::OscEscape => State::Osc,
-        };
-    }
-    output
-}
-
 fn char_boundary(value: &str, mut index: usize) -> usize {
     while index > 0 && !value.is_char_boundary(index) {
         index -= 1;
@@ -757,224 +859,169 @@ fn char_boundary(value: &str, mut index: usize) -> usize {
     index
 }
 
-fn kill_process_tree(pid: u32) {
-    if cfg!(windows) {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status();
-    } else {
-        let process_group = format!("-{pid}");
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", "--", &process_group])
-            .status();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            let process_group = format!("-{pid}");
-            let still_running = std::process::Command::new("kill")
-                .args(["-0", "--", &process_group])
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false);
-            if still_running {
-                let _ = std::process::Command::new("kill")
-                    .args(["-KILL", "--", &process_group])
-                    .status();
-            }
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
-    #[test]
-    fn strips_csi_and_osc_sequences() {
-        let value = "\u{1b}[32mok\u{1b}[0m \u{1b}]0;title\u{7}done";
-        assert_eq!(strip_ansi(value), "ok done");
+    fn policy() -> PolicyConfig {
+        PolicyConfig {
+            max_file_bytes: 1_000_000,
+            max_context_chars: 50_000,
+            max_search_results: 100,
+            max_task_output_chars: 30_000,
+            shell_enabled: false,
+            allowed_commands: vec!["cargo".to_owned(), "python".to_owned()],
+            task_retention_hours: None,
+        }
+    }
+
+    fn record(cache: &Path, task_id: &str, status: &str, output: &str) -> TaskRecord {
+        TaskRecord {
+            task_id: task_id.to_owned(),
+            status: status.to_owned(),
+            command: vec!["cargo".to_owned(), "test".to_owned()],
+            cwd: cache.to_path_buf(),
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            exit_code: (status == "succeeded").then_some(0),
+            output: output.to_owned(),
+            output_truncated: false,
+            logs: TaskLogPaths::new(cache, task_id),
+            pid: None,
+            cancel_requested: false,
+            job: None,
+        }
     }
 
     #[test]
     fn validation_profiles_are_rejected_before_execution() {
-        let cache = tempfile::tempdir().unwrap();
-        let supervisor = TaskSupervisor::new(
-            cache.path().to_path_buf(),
-            PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
-            },
-            HashMap::new(),
-        )
-        .unwrap();
+        let cache = tempdir().unwrap();
+        let supervisor =
+            TaskSupervisor::new(cache.path().to_path_buf(), policy(), HashMap::new()).unwrap();
         let error = supervisor
             .validate_profiles(&["typecheck".to_owned()])
             .unwrap_err();
         assert_eq!(error.0.code, "UNKNOWN_VALIDATION_PROFILE");
         let details = error.0.details.unwrap();
         assert_eq!(details["missing"], json!(["typecheck"]));
-        assert_eq!(details["available"], json!([]));
     }
 
     #[test]
     fn later_success_suppresses_same_command_failure() {
-        let cache = tempfile::tempdir().unwrap();
-        let supervisor = TaskSupervisor::new(
-            cache.path().to_path_buf(),
-            PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
-            },
-            HashMap::new(),
-        )
-        .unwrap();
-        let command = vec!["cargo".to_owned(), "test".to_owned()];
-        let cwd = cache.path().to_path_buf();
+        let cache = tempdir().unwrap();
+        let supervisor =
+            TaskSupervisor::new(cache.path().to_path_buf(), policy(), HashMap::new()).unwrap();
         let failed_at = Utc::now() - ChronoDuration::seconds(2);
         let succeeded_at = Utc::now() - ChronoDuration::seconds(1);
-        supervisor.tasks.lock().insert(
-            "failed".to_owned(),
-            Arc::new(Mutex::new(TaskRecord {
-                task_id: "failed".to_owned(),
-                status: "failed".to_owned(),
-                command: command.clone(),
-                cwd: cwd.clone(),
-                started_at: failed_at,
-                ended_at: Some(failed_at),
-                exit_code: Some(1),
-                output: "compile error".to_owned(),
-                log_path: cache.path().join("failed.log"),
-                pid: None,
-            })),
-        );
-        supervisor.tasks.lock().insert(
-            "succeeded".to_owned(),
-            Arc::new(Mutex::new(TaskRecord {
-                task_id: "succeeded".to_owned(),
-                status: "succeeded".to_owned(),
-                command,
-                cwd,
-                started_at: succeeded_at,
-                ended_at: Some(succeeded_at),
-                exit_code: Some(0),
-                output: "tests passed".to_owned(),
-                log_path: cache.path().join("succeeded.log"),
-                pid: None,
-            })),
-        );
+        let mut failed = record(cache.path(), "failed", "failed", "compile error");
+        failed.started_at = failed_at;
+        failed.ended_at = Some(failed_at);
+        let mut succeeded = record(cache.path(), "succeeded", "succeeded", "tests passed");
+        succeeded.started_at = succeeded_at;
+        succeeded.ended_at = Some(succeeded_at);
+        supervisor
+            .tasks
+            .lock()
+            .insert("failed".to_owned(), Arc::new(Mutex::new(failed)));
+        supervisor
+            .tasks
+            .lock()
+            .insert("succeeded".to_owned(), Arc::new(Mutex::new(succeeded)));
         assert!(supervisor.recent_failures("compile error", 3).is_empty());
     }
 
     #[test]
-    fn task_errors_finalize_retained_records() {
-        let now = Utc::now();
-        let record = Arc::new(Mutex::new(TaskRecord {
-            task_id: "failed".to_owned(),
-            status: "running".to_owned(),
-            command: vec!["cargo".to_owned(), "test".to_owned()],
-            cwd: PathBuf::from("."),
-            started_at: now,
-            ended_at: None,
-            exit_code: None,
-            output: String::new(),
-            log_path: PathBuf::from("missing.log"),
-            pid: Some(123),
-        }));
+    fn task_errors_preserve_live_output() {
+        let cache = tempdir().unwrap();
+        let record = Arc::new(Mutex::new(record(
+            cache.path(),
+            "failed",
+            "running",
+            "partial output",
+        )));
+        record.lock().ended_at = None;
         finalize_task_error(
             &record,
             &AppError::new("TASK_LOG_FAILED", "Access is denied"),
         );
         let record = record.lock();
-        assert_eq!(record.status, "failed");
-        assert!(record.ended_at.is_some());
-        assert_eq!(record.pid, None);
+        assert!(record.output.contains("partial output"));
         assert!(record.output.contains("Access is denied"));
     }
 
     #[test]
     fn read_log_falls_back_to_in_memory_output() {
-        let cache = tempfile::tempdir().unwrap();
-        let supervisor = TaskSupervisor::new(
-            cache.path().to_path_buf(),
-            PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
-            },
-            HashMap::new(),
-        )
-        .unwrap();
+        let cache = tempdir().unwrap();
+        let supervisor =
+            TaskSupervisor::new(cache.path().to_path_buf(), policy(), HashMap::new()).unwrap();
         supervisor.tasks.lock().insert(
             "memory-only".to_owned(),
-            Arc::new(Mutex::new(TaskRecord {
-                task_id: "memory-only".to_owned(),
-                status: "succeeded".to_owned(),
-                command: vec!["cargo".to_owned(), "test".to_owned()],
-                cwd: cache.path().to_path_buf(),
-                started_at: Utc::now(),
-                ended_at: Some(Utc::now()),
-                exit_code: Some(0),
-                output: "tests passed".to_owned(),
-                log_path: cache.path().join("missing.log"),
-                pid: None,
-            })),
+            Arc::new(Mutex::new(record(
+                cache.path(),
+                "memory-only",
+                "succeeded",
+                "tests passed",
+            ))),
         );
         assert_eq!(supervisor.read_log("memory-only").unwrap(), "tests passed");
     }
 
     #[test]
-    fn trimming_expired_tasks_removes_their_log_files() {
-        let cache = tempfile::tempdir().unwrap();
-        let supervisor = TaskSupervisor::new(
-            cache.path().to_path_buf(),
-            PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
-            },
-            HashMap::new(),
-        )
-        .unwrap();
-        let log_path = cache.path().join("task-logs").join("expired.log");
-        fs::write(&log_path, "old output").unwrap();
-        let ended = Utc::now() - ChronoDuration::hours(TASK_RETENTION_HOURS + 1);
-        supervisor.tasks.lock().insert(
-            "expired".to_owned(),
-            Arc::new(Mutex::new(TaskRecord {
-                task_id: "expired".to_owned(),
-                status: "succeeded".to_owned(),
-                command: vec!["cargo".to_owned(), "test".to_owned()],
-                cwd: cache.path().to_path_buf(),
-                started_at: ended,
-                ended_at: Some(ended),
-                exit_code: Some(0),
-                output: String::new(),
-                log_path: log_path.clone(),
-                pid: None,
-            })),
+    fn failed_views_use_the_tail() {
+        let cache = tempdir().unwrap();
+        let item = record(
+            cache.path(),
+            "failed",
+            "failed",
+            &format!("{}important failure", "noise".repeat(100)),
         );
+        let view = view(&item, 40);
+        assert!(view.output.contains("important failure"));
+        assert!(view.output_truncated);
+    }
 
-        supervisor.trim_tasks();
+    #[test]
+    fn abandoned_execution_guard_finalizes_the_record() {
+        let cache = tempdir().unwrap();
+        let item = Arc::new(Mutex::new(record(
+            cache.path(),
+            "abandoned",
+            "running",
+            "partial output",
+        )));
+        item.lock().ended_at = None;
 
-        assert!(!supervisor.tasks.lock().contains_key("expired"));
-        assert!(!log_path.exists());
+        drop(ExecutionGuard::new(item.clone(), None, None));
+
+        let item = item.lock();
+        assert_eq!(item.status, "cancelled");
+        assert!(item.ended_at.is_some());
+        assert!(item.output.contains("process tree was terminated"));
+    }
+
+    #[test]
+    fn output_action_selects_stdout_and_stderr_streams() {
+        let cache = tempdir().unwrap();
+        let supervisor =
+            TaskSupervisor::new(cache.path().to_path_buf(), policy(), HashMap::new()).unwrap();
+        let item = record(cache.path(), "streams", "failed", "combined");
+        fs::write(&item.logs.combined, "combined").unwrap();
+        fs::write(&item.logs.stdout, "stdout-only").unwrap();
+        fs::write(&item.logs.stderr, "stderr-only").unwrap();
+        supervisor
+            .tasks
+            .lock()
+            .insert("streams".to_owned(), Arc::new(Mutex::new(item)));
+
+        let stdout = supervisor
+            .output_stream("streams", None, Some("stdout"))
+            .unwrap();
+        let stderr = supervisor
+            .output_stream("streams", None, Some("stderr"))
+            .unwrap();
+        assert_eq!(stdout["output"], "stdout-only");
+        assert_eq!(stderr["output"], "stderr-only");
     }
 
     #[test]

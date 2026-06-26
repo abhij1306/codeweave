@@ -5,6 +5,7 @@ mod model;
 mod repository;
 mod security;
 mod symbols;
+mod task_runtime;
 mod tasks;
 mod workspace;
 
@@ -378,7 +379,7 @@ fn tools() -> Value {
             "command":{"type":"array","items":{"type":"string"}},
             "profile":{"type":"string"},
             "cwd":{"type":"string"},
-            "task_id":{"type":"string"}
+            "task_id":{"type":"string"}, "background":{"type":"boolean"}, "timeout_ms":{"type":"integer","minimum":1}, "shell":{"type":"boolean"}, "continuation":{"type":"string"}, "stream":{"type":"string","enum":["combined","stdout","stderr"]}
           },
           "$schema":"http://json-schema.org/draft-07/schema#"
         }

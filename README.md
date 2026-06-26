@@ -198,11 +198,30 @@ Detailed guides:
     "allowedCommands": ["git", "rg", "node", "npm", "npx", "pnpm", "python", "pytest", "cargo"]
   },
   "tasks": {
-    "test": { "command": ["cargo", "test"], "timeoutMs": 120000 },
-    "check": { "command": ["cargo", "check"], "timeoutMs": 120000 }
+    "test": {
+      "command": ["cargo", "test"],
+      "timeoutMs": 120000,
+      "outputFilter": { "type": "failedTail", "chars": 30000 }
+    },
+    "check": {
+      "command": ["cargo", "check", "--message-format=json"],
+      "timeoutMs": 120000,
+      "background": true,
+      "outputFilter": { "type": "cargoJson", "includeWarnings": true }
+    }
   }
 }
 ```
+
+Task profiles can set `background: true` for long builds, browser smoke tests, and acceptance suites. Explicit `run` calls can override `background` and `timeout_ms`. Profile `outputFilter` values are:
+
+- `{ "type": "raw" }` — successful tasks show the head; failed, cancelled, and timed-out tasks show the tail.
+- `{ "type": "failedTail", "chars": 30000 }` — use a specific failure-tail budget.
+- `{ "type": "tailLines", "lines": 40 }` — useful when a Python or Node script prints its summary last.
+- `{ "type": "cargoJson", "includeWarnings": true }` — extracts Cargo compiler diagnostics from `--message-format=json`.
+- `{ "type": "jsonSummary", "marker": "CODEWEAVE_SUMMARY:" }` — returns a script-emitted JSON summary after the marker.
+
+Task output is written incrementally. While a background task is running, call `run` with `action: "status"` for its live tail or `action: "output"` with `stream: "combined"`, `"stdout"`, or `"stderr"`. Reuse the returned continuation token to page through the selected stream. Timeouts and cancellation retain partial logs. On Windows, task processes are assigned to a kill-on-close Job Object so descendant processes such as `rustc`, Node, and Chromium are cleaned up with the task.
 
 `server.statefulMode` defaults to `false` and `server.jsonResponse` defaults to `true`, so Streamable HTTP uses direct POST responses without a persistent GET/SSE stream. Enable stateful mode only for MCP clients that require server-initiated messages or session-level SSE.
 

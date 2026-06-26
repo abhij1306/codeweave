@@ -24,12 +24,45 @@ pub struct PolicyConfig {
     pub task_retention_hours: Option<i64>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum OutputFilter {
+    #[default]
+    Raw,
+    FailedTail {
+        #[serde(default = "default_failed_tail_chars")]
+        chars: usize,
+    },
+    TailLines {
+        lines: usize,
+    },
+    CargoJson {
+        #[serde(default)]
+        include_warnings: bool,
+    },
+    JsonSummary {
+        marker: String,
+    },
+}
+
+fn default_failed_tail_chars() -> usize {
+    30_000
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskProfile {
     pub command: Vec<String>,
     pub cwd: Option<String>,
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub background: bool,
+    #[serde(default)]
+    pub output_filter: OutputFilter,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -196,4 +229,45 @@ pub fn string_list(value: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_profile_new_fields_default_for_existing_configs() {
+        let profile: TaskProfile = serde_json::from_value(serde_json::json!({
+            "command": ["cargo", "check"],
+            "cwd": null,
+            "timeoutMs": 120000
+        }))
+        .unwrap();
+
+        assert!(!profile.background);
+        assert!(matches!(profile.output_filter, OutputFilter::Raw));
+    }
+
+    #[test]
+    fn task_profile_parses_cargo_json_filter() {
+        let profile: TaskProfile = serde_json::from_value(serde_json::json!({
+            "command": ["cargo", "check", "--message-format=json"],
+            "cwd": null,
+            "timeoutMs": 120000,
+            "background": true,
+            "outputFilter": {
+                "type": "cargoJson",
+                "includeWarnings": true
+            }
+        }))
+        .unwrap();
+
+        assert!(profile.background);
+        assert!(matches!(
+            profile.output_filter,
+            OutputFilter::CargoJson {
+                include_warnings: true
+            }
+        ));
+    }
 }
