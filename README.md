@@ -14,7 +14,7 @@ CodeWeave is a fast, local-first Model Context Protocol (MCP) server for AI-assi
 - **Safe edits** â€” narrow single-operation tools with snapshot and content-hash preconditions, validation, and rollback.
 - **Controlled execution** â€” allow-listed commands, optional task profiles, timeouts, and retained task logs.
 - **Git integration** â€” status, diff, log, show, blame, staging, commits, and confirmed restores.
-- **Dynamic workspaces** â€” switch repositories without restarting while keeping isolated per-repository caches.
+- **Session-isolated dynamic workspaces** â€” each MCP session can switch repositories without restarting while cached repository actors are reused by canonical path.
 - **Remote MCP** â€” expose the local server through ngrok, Cloudflare Tunnel, or another trusted HTTPS reverse proxy.
 
 ## Quick start
@@ -176,8 +176,8 @@ Detailed guides:
     "port": 8820,
     "authMode": "bearer",
     "tokenFile": ".mcp-token",
-    "statefulMode": false,
-    "jsonResponse": true
+    "statefulMode": true,
+    "jsonResponse": false
   },
   "workspace": {
     "defaultPath": "/path/to/projects/example",
@@ -215,15 +215,15 @@ Detailed guides:
 
 Task profiles can set `background: true` for long builds, browser smoke tests, and acceptance suites. Explicit `run` calls can override `background` and `timeout_ms`. Profile `outputFilter` values are:
 
-- `{ "type": "raw" }` — successful tasks show the head; failed, cancelled, and timed-out tasks show the tail.
-- `{ "type": "failedTail", "chars": 30000 }` — use a specific failure-tail budget.
-- `{ "type": "tailLines", "lines": 40 }` — useful when a Python or Node script prints its summary last.
-- `{ "type": "cargoJson", "includeWarnings": true }` — extracts Cargo compiler diagnostics from `--message-format=json`.
-- `{ "type": "jsonSummary", "marker": "CODEWEAVE_SUMMARY:" }` — returns a script-emitted JSON summary after the marker.
+- `{ "type": "raw" }` - successful tasks show the head; failed, cancelled, and timed-out tasks show the tail.
+- `{ "type": "failedTail", "chars": 30000 }` - use a specific failure-tail budget.
+- `{ "type": "tailLines", "lines": 40 }` - useful when a Python or Node script prints its summary last.
+- `{ "type": "cargoJson", "includeWarnings": true }` - extracts Cargo compiler diagnostics from `--message-format=json`.
+- `{ "type": "jsonSummary", "marker": "CODEWEAVE_SUMMARY:" }` - returns a script-emitted JSON summary after the marker.
 
 Task output is written incrementally. While a background task is running, call `run` with `action: "status"` for its live tail or `action: "output"` with `stream: "combined"`, `"stdout"`, or `"stderr"`. Reuse the returned continuation token to page through the selected stream. Timeouts and cancellation retain partial logs. On Windows, task processes are assigned to a kill-on-close Job Object so descendant processes such as `rustc`, Node, and Chromium are cleaned up with the task.
 
-`server.statefulMode` defaults to `false` and `server.jsonResponse` defaults to `true`, so Streamable HTTP uses direct POST responses without a persistent GET/SSE stream. Enable stateful mode only for MCP clients that require server-initiated messages or session-level SSE.
+`server.statefulMode` defaults to `true` so independent chats or LLM clients receive isolated active-workspace state through the MCP session id. `server.jsonResponse` defaults to `false` and only applies when `statefulMode` is disabled. Stateless HTTP remains supported for legacy direct JSON responses, but all stateless requests share one fallback workspace key.
 
 `workspace.allowedRoots` is a security boundary. CodeWeave canonicalizes requested repository paths and rejects paths outside those roots, including junction and symlink escapes.
 
@@ -233,7 +233,7 @@ Never commit `config.json`, `.mcp-token`, tunnel credentials, generated caches, 
 
 | Tool | Purpose |
 | --- | --- |
-| `workspace` | Open or switch the active repository, summarize state, refresh, and inspect session changes |
+| `workspace` | Open or switch this MCP session's active repository, summarize state, refresh, and inspect session changes |
 | `code_context` | Retrieve ranked semantic and syntax-aware context |
 | `code_search` | Search text, regex, filenames, symbols, references, outlines, or the repository map |
 | `code_fetch` | Read exact files, line ranges, symbols, handles, continuations, and task logs |

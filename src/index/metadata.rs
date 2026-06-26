@@ -1,0 +1,144 @@
+use super::FileEntry;
+use crate::symbols::Symbol;
+use regex::Regex;
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
+pub(super) fn low_signal_context_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "cargo.lock"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "license"
+            | "license.md"
+            | "license.txt"
+    )
+}
+
+pub(super) fn evidence_allowed(document_type: &str, evidence: &[String]) -> bool {
+    if evidence.is_empty() {
+        return true;
+    }
+    evidence.iter().any(|item| match item.as_str() {
+        "source" => document_type == "source",
+        "tests" => document_type == "test",
+        "artifacts" => matches!(document_type, "runtime_evidence" | "artifact" | "log"),
+        "changes" => false,
+        "instructions" => document_type == "instruction",
+        _ => false,
+    })
+}
+
+pub(super) fn classify_document(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with("agents.md") || lower.ends_with("claude.md") {
+        return "instruction".to_owned();
+    }
+    if lower.contains("/test")
+        || lower.contains("/tests/")
+        || lower.contains("/__tests__/")
+        || lower.ends_with(".test.ts")
+        || lower.ends_with(".spec.ts")
+        || lower.starts_with("test_")
+    {
+        return "test".to_owned();
+    }
+    if lower.contains("evidence")
+        || lower.contains("runtime") && (lower.ends_with(".json") || lower.ends_with(".log"))
+    {
+        return "runtime_evidence".to_owned();
+    }
+    if lower.contains("artifact") || lower.contains("fixtures") || lower.contains("recording") {
+        return "artifact".to_owned();
+    }
+    if lower.ends_with(".log") {
+        return "log".to_owned();
+    }
+    "source".to_owned()
+}
+
+pub(super) fn query_terms(query: &str) -> Vec<String> {
+    static TERM_REGEX: OnceLock<Regex> = OnceLock::new();
+    static STOP_WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    let regex = TERM_REGEX.get_or_init(|| {
+        Regex::new(r"[A-Za-z_][A-Za-z0-9_.-]{1,}").expect("valid query term regex")
+    });
+    let stop = STOP_WORDS.get_or_init(|| {
+        [
+            "a", "an", "as", "at", "be", "by", "for", "from", "in", "into", "is", "it", "of", "on",
+            "or", "the", "this", "that", "to", "we", "with", "you", "when", "where", "what", "how",
+            "why", "find", "focus", "include", "fix", "add", "change", "update", "code", "file",
+            "files", "result", "results", "source", "tests", "tool", "tools",
+        ]
+        .into_iter()
+        .collect()
+    });
+    let mut terms: Vec<String> = regex
+        .find_iter(query)
+        .map(|m| {
+            m.as_str()
+                .trim_matches(|c: char| c == '`' || c == '.' || c == '-')
+                .to_ascii_lowercase()
+        })
+        .filter(|term| term.len() > 1 && !stop.contains(term.as_str()))
+        .collect();
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+pub(super) fn compact_reason_codes(mut reasons: Vec<String>) -> Vec<String> {
+    const PRIORITY: &[&str] = &[
+        "exact_symbol",
+        "exact_phrase",
+        "full_term_coverage",
+        "path_match",
+        "runtime_evidence",
+        "dirty_file",
+        "recent_mutation",
+        "symbol_match",
+    ];
+    reasons.sort();
+    reasons.dedup();
+    let mut compact = Vec::new();
+    for preferred in PRIORITY {
+        if reasons.iter().any(|reason| reason == preferred) {
+            compact.push((*preferred).to_owned());
+        }
+        if compact.len() == 3 {
+            break;
+        }
+    }
+    compact
+}
+
+pub(super) fn build_indexed_terms(
+    search_content: &str,
+    path_lower: &str,
+    symbols: &[Symbol],
+) -> Vec<String> {
+    let mut terms = query_terms(search_content);
+    terms.extend(query_terms(path_lower));
+    for symbol in symbols {
+        terms.extend(query_terms(&symbol.name));
+    }
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+pub(super) fn normalize_entry(entry: &mut FileEntry) {
+    if entry.search_content.is_empty() {
+        entry.search_content = entry.content.to_ascii_lowercase();
+    }
+    if entry.path_lower.is_empty() {
+        entry.path_lower = entry.path.to_ascii_lowercase();
+    }
+    if entry.indexed_terms.is_empty() {
+        entry.indexed_terms =
+            build_indexed_terms(&entry.search_content, &entry.path_lower, &entry.symbols);
+    }
+}

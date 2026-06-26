@@ -1,5 +1,7 @@
 use super::io_helpers::{atomic_write, read_optional, remove_if_exists, render_diff, restore_one};
-use super::journal::{trim_journal, MutationRecord};
+use super::journal::{
+    open_journal, rotate_journal_now, trim_journal, MutationRecord, MAX_JOURNAL_BYTES,
+};
 use super::util::{
     changes_without_independent_preconditions, line_offset, line_range_bytes,
     stale_snapshot_for_paths,
@@ -13,7 +15,8 @@ use crate::tasks::StartRequest;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::fs;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{atomic::Ordering, Arc};
 use std::time::Instant;
@@ -32,6 +35,7 @@ struct AppliedEdit {
     apply_result: Vec<MutationRecord>,
     diff: String,
     snapshot_rebased_from: Option<String>,
+    commit_ms: u128,
 }
 
 enum PreparedEdit {
@@ -40,16 +44,20 @@ enum PreparedEdit {
 }
 
 impl WorkspaceActor {
-    pub async fn code_edit(self: &Arc<Self>, params: &Value) -> AppResult<Value> {
+    pub async fn code_edit(self: &Arc<Self>, session_id: &str, params: &Value) -> AppResult<Value> {
         let validate = string_list(params, "validate");
         self.tasks.validate_profiles(&validate)?;
         let write_guard = self.write_lock.clone().lock_owned().await;
         let actor = Arc::clone(self);
         let params_owned = params.clone();
-        let prepared =
-            tokio::task::spawn_blocking(move || actor.prepare_edit(&params_owned, write_guard))
-                .await
-                .map_err(AppError::internal)??;
+        let session_id_owned = session_id.to_owned();
+        let prepare_started = Instant::now();
+        let prepared = tokio::task::spawn_blocking(move || {
+            actor.prepare_edit(&session_id_owned, &params_owned, write_guard)
+        })
+        .await
+        .map_err(AppError::internal)??;
+        let prepare_ms = prepare_started.elapsed().as_millis();
 
         let applied = match prepared {
             PreparedEdit::Preview(value) => return Ok(value),
@@ -61,6 +69,7 @@ impl WorkspaceActor {
             apply_result,
             diff,
             snapshot_rebased_from,
+            commit_ms,
         } = applied;
 
         let mut validation = Vec::new();
@@ -104,10 +113,12 @@ impl WorkspaceActor {
             let write_guard = self.write_lock.clone().lock_owned().await;
             let actor = Arc::clone(self);
             let rollback_request_id = request_id.clone();
+            let rollback_session_id = session_id.to_owned();
             let rollback_result = tokio::task::spawn_blocking(move || {
                 let _write_guard = write_guard;
+                let _reconcile_guard = actor.reconcile_lock.lock();
                 actor.recheck_applied_state(&planned)?;
-                actor.restore_plan(&planned, &rollback_request_id)
+                actor.restore_plan(&rollback_session_id, &planned, &rollback_request_id)
             })
             .await
             .map_err(AppError::internal)?;
@@ -122,7 +133,11 @@ impl WorkspaceActor {
                     "validation": validation,
                     "generation": self.generation(),
                     "snapshot_id": self.snapshot(),
-                    "mutations": apply_result
+                    "mutations": apply_result,
+                    "phase_ms": {
+                        "prepare_and_commit": prepare_ms,
+                        "commit": commit_ms
+                    }
                 }));
             }
             return Ok(json!({
@@ -134,7 +149,11 @@ impl WorkspaceActor {
                 "validation": validation,
                 "generation": self.generation(),
                 "snapshot_id": self.snapshot(),
-                "mutations": apply_result
+                "mutations": apply_result,
+                "phase_ms": {
+                    "prepare_and_commit": prepare_ms,
+                    "commit": commit_ms
+                }
             }));
         }
 
@@ -147,16 +166,22 @@ impl WorkspaceActor {
             "validation": validation,
             "generation": self.generation(),
             "snapshot_id": self.snapshot(),
-            "mutations": apply_result
+            "mutations": apply_result,
+            "phase_ms": {
+                "prepare_and_commit": prepare_ms,
+                "commit": commit_ms
+            }
         }))
     }
 
     fn prepare_edit(
         &self,
+        session_id: &str,
         params: &Value,
         write_guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> AppResult<PreparedEdit> {
         self.reconcile_pending()?;
+        let _reconcile_guard = self.reconcile_lock.lock();
         let current_snapshot = self.snapshot();
         let requested_snapshot = params
             .get("snapshot_id")
@@ -224,7 +249,9 @@ impl WorkspaceActor {
         }
         self.recheck_preconditions(&planned)?;
         let request_id = format!("req_{}", Uuid::new_v4().simple());
-        let apply_result = self.commit_plan(&planned, &request_id)?;
+        let commit_started = Instant::now();
+        let apply_result = self.commit_plan(session_id, &planned, &request_id)?;
+        let commit_ms = commit_started.elapsed().as_millis();
         drop(write_guard);
         Ok(PreparedEdit::Applied(AppliedEdit {
             planned,
@@ -232,6 +259,7 @@ impl WorkspaceActor {
             apply_result,
             diff,
             snapshot_rebased_from,
+            commit_ms,
         }))
     }
 
@@ -500,10 +528,27 @@ impl WorkspaceActor {
 
     pub(super) fn commit_plan(
         &self,
+        session_id: &str,
         plan: &[PlannedFile],
         request_id: &str,
     ) -> AppResult<Vec<MutationRecord>> {
-        let mut completed: Vec<PlannedFile> = Vec::new();
+        let generation = self.generation() + 1;
+        let timestamp = Utc::now();
+        let records: Vec<MutationRecord> = plan
+            .iter()
+            .map(|item| MutationRecord {
+                mutation_id: format!("mut_{}", Uuid::new_v4().simple()),
+                session_id: session_id.to_owned(),
+                path: item.path.clone(),
+                before_hash: item.before.as_ref().map(|value| content_hash(value)),
+                after_hash: item.after.as_ref().map(|value| content_hash(value)),
+                source: "mcp_edit".to_owned(),
+                request_id: request_id.to_owned(),
+                timestamp,
+                generation,
+            })
+            .collect();
+        let mut completed_count = 0usize;
         for item in plan {
             let absolute = self.root.join(&item.path);
             self.internal_writes
@@ -517,7 +562,7 @@ impl WorkspaceActor {
                 self.internal_writes.lock().remove(&absolute);
                 let mut restored_paths = Vec::new();
                 let mut rollback_failures = Vec::new();
-                for rollback in completed.iter().rev() {
+                for rollback in plan[..completed_count].iter().rev() {
                     self.internal_writes
                         .lock()
                         .insert(self.root.join(&rollback.path), Instant::now());
@@ -540,37 +585,176 @@ impl WorkspaceActor {
                     error.to_string(),
                     json!({
                         "failed_path": item.path,
-                        "completed_before_failure": completed.iter().map(|value| &value.path).collect::<Vec<_>>(),
+                        "completed_before_failure": plan[..completed_count].iter().map(|value| &value.path).collect::<Vec<_>>(),
                         "restored_paths": restored_paths,
                         "rollback_failures": rollback_failures,
                         "manual_recovery_required": manual_recovery_required
                     }),
                 ));
             }
-            completed.push(item.clone());
+            completed_count += 1;
         }
         let paths: HashSet<PathBuf> = plan.iter().map(|item| self.root.join(&item.path)).collect();
         self.index
             .write()
-            .refresh_paths(&self.root, &paths, self.policy.max_file_bytes)?;
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            .refresh_paths(&self.root, &paths, self.policy.max_file_bytes)
+            .map_err(|error| {
+                self.failed_after_apply(
+                    plan,
+                    completed_count,
+                    "INDEX_REFRESH_FAILED",
+                    error.to_string(),
+                )
+            })?;
+        self.persist_mutations(&records).map_err(|error| {
+            self.failed_after_apply(
+                plan,
+                completed_count,
+                "JOURNAL_COMMIT_FAILED",
+                error.to_string(),
+            )
+        })?;
+        self.generation.store(generation, Ordering::Release);
         self.recompute_snapshot();
-        let mut records = Vec::new();
-        for item in plan {
-            records.push(MutationRecord {
-                mutation_id: format!("mut_{}", Uuid::new_v4().simple()),
-                session_id: self.session_id.clone(),
-                path: item.path.clone(),
-                before_hash: item.before.as_ref().map(|value| content_hash(value)),
-                after_hash: item.after.as_ref().map(|value| content_hash(value)),
-                source: "mcp_edit".to_owned(),
-                request_id: request_id.to_owned(),
-                timestamp: Utc::now(),
-                generation,
-            });
-        }
-        self.record_mutations(&records)?;
+        self.publish_mutations(&records);
         Ok(records)
+    }
+
+    fn failed_after_apply(
+        &self,
+        plan: &[PlannedFile],
+        completed_count: usize,
+        failure_code: &'static str,
+        message: String,
+    ) -> AppError {
+        let completed = &plan[..completed_count.min(plan.len())];
+        let mut restored_paths = Vec::new();
+        let mut rollback_failures = Vec::new();
+        for item in completed.iter().rev() {
+            self.internal_writes
+                .lock()
+                .insert(self.root.join(&item.path), Instant::now());
+            match restore_one(&self.root, item) {
+                Ok(()) => restored_paths.push(item.path.clone()),
+                Err(error) => rollback_failures.push(json!({
+                    "path": item.path,
+                    "error": error.to_string()
+                })),
+            }
+        }
+
+        let paths: HashSet<PathBuf> = completed
+            .iter()
+            .map(|item| self.root.join(&item.path))
+            .collect();
+        if !paths.is_empty() {
+            self.pending_paths.lock().extend(paths);
+            self.needs_reconcile.store(true, Ordering::Release);
+        }
+
+        let manual_recovery_required = !rollback_failures.is_empty();
+        AppError::details(
+            if manual_recovery_required {
+                "PARTIAL_COMMIT"
+            } else {
+                failure_code
+            },
+            message,
+            json!({
+                "completed_before_failure": completed.iter().map(|item| &item.path).collect::<Vec<_>>(),
+                "restored_paths": restored_paths,
+                "rollback_failures": rollback_failures,
+                "manual_recovery_required": manual_recovery_required
+            }),
+        )
+    }
+
+    fn persist_mutations(&self, records: &[MutationRecord]) -> AppResult<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut encoded = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut encoded, record).map_err(|error| {
+                AppError::details(
+                    "JOURNAL_SERIALIZATION_FAILED",
+                    error.to_string(),
+                    json!({"mutation_id": record.mutation_id}),
+                )
+            })?;
+            encoded.push(b'\n');
+        }
+
+        let mut slot = self.journal_file.lock();
+        let mut file = slot
+            .take()
+            .ok_or_else(|| AppError::new("JOURNAL_UNAVAILABLE", "Mutation journal is not open"))?;
+        let current_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if current_len > 0 && current_len.saturating_add(encoded.len() as u64) > MAX_JOURNAL_BYTES {
+            if let Err(error) = file.flush() {
+                *slot = Some(file);
+                return Err(AppError::details(
+                    "JOURNAL_FLUSH_FAILED",
+                    error.to_string(),
+                    json!({}),
+                ));
+            }
+            drop(file);
+            if let Err(error) = rotate_journal_now(&self.journal_path) {
+                *slot = open_journal(&self.journal_path).ok();
+                return Err(error);
+            }
+            file = match open_journal(&self.journal_path) {
+                Ok(file) => file,
+                Err(error) => {
+                    let archive = self.journal_path.with_file_name("mutations.previous.jsonl");
+                    if self.journal_path.exists() {
+                        *slot = open_journal(&self.journal_path).ok();
+                    } else if fs::rename(&archive, &self.journal_path).is_ok() {
+                        *slot = open_journal(&self.journal_path).ok();
+                    }
+                    return Err(AppError::details(
+                        "JOURNAL_OPEN_FAILED",
+                        error.to_string(),
+                        json!({"path": self.journal_path}),
+                    ));
+                }
+            };
+        }
+
+        let original_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if let Err(error) = file
+            .seek(SeekFrom::End(0))
+            .and_then(|_| file.write_all(&encoded))
+            .and_then(|_| file.flush())
+        {
+            let recovery_error = file
+                .set_len(original_len)
+                .and_then(|_| file.flush())
+                .err()
+                .map(|recovery| recovery.to_string());
+            *slot = Some(file);
+            return Err(AppError::details(
+                if recovery_error.is_some() {
+                    "JOURNAL_RECOVERY_FAILED"
+                } else {
+                    "JOURNAL_WRITE_FAILED"
+                },
+                error.to_string(),
+                json!({
+                    "original_len": original_len,
+                    "recovery_error": recovery_error
+                }),
+            ));
+        }
+        *slot = Some(file);
+        Ok(())
+    }
+
+    fn publish_mutations(&self, records: &[MutationRecord]) {
+        let mut journal = self.mutations.lock();
+        journal.extend(records.iter().cloned());
+        trim_journal(&mut journal);
     }
 
     pub(super) fn recheck_applied_state(&self, plan: &[PlannedFile]) -> AppResult<()> {
@@ -591,7 +775,12 @@ impl WorkspaceActor {
         Ok(())
     }
 
-    fn restore_plan(&self, plan: &[PlannedFile], request_id: &str) -> AppResult<()> {
+    fn restore_plan(
+        &self,
+        session_id: &str,
+        plan: &[PlannedFile],
+        request_id: &str,
+    ) -> AppResult<()> {
         for item in plan.iter().rev() {
             self.internal_writes
                 .lock()
@@ -602,13 +791,12 @@ impl WorkspaceActor {
         self.index
             .write()
             .refresh_paths(&self.root, &paths, self.policy.max_file_bytes)?;
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.recompute_snapshot();
+        let generation = self.generation() + 1;
         let records: Vec<_> = plan
             .iter()
             .map(|item| MutationRecord {
                 mutation_id: format!("mut_{}", Uuid::new_v4().simple()),
-                session_id: self.session_id.clone(),
+                session_id: session_id.to_owned(),
                 path: item.path.clone(),
                 before_hash: item.after.as_ref().map(|value| content_hash(value)),
                 after_hash: item.before.as_ref().map(|value| content_hash(value)),
@@ -618,40 +806,17 @@ impl WorkspaceActor {
                 generation,
             })
             .collect();
-        self.record_mutations(&records)?;
+        self.persist_mutations(&records)?;
+        self.generation.store(generation, Ordering::Release);
+        self.recompute_snapshot();
+        self.publish_mutations(&records);
         Ok(())
     }
 
     pub(super) fn record_mutations(&self, records: &[MutationRecord]) -> AppResult<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        {
-            let mut journal = self.mutations.lock();
-            journal.extend(records.iter().cloned());
-            trim_journal(&mut journal);
-        }
-        let mut file = self.journal_file.lock();
-        for record in records {
-            let mut encoded = serde_json::to_vec(record).map_err(|error| {
-                AppError::details(
-                    "JOURNAL_SERIALIZATION_FAILED",
-                    error.to_string(),
-                    json!({"mutation_id": record.mutation_id}),
-                )
-            })?;
-            encoded.push(b'\n');
-            file.write_all(&encoded).map_err(|error| {
-                AppError::details(
-                    "JOURNAL_WRITE_FAILED",
-                    error.to_string(),
-                    json!({"mutation_id": record.mutation_id}),
-                )
-            })?;
-        }
-        file.flush().map_err(|error| {
-            AppError::details("JOURNAL_FLUSH_FAILED", error.to_string(), json!({}))
-        })
+        self.persist_mutations(records)?;
+        self.publish_mutations(records);
+        Ok(())
     }
 }
 

@@ -2,7 +2,7 @@
 
 ## `workspace`
 
-Opens or switches the active repository, returns a summary, refreshes repository state, reports session changes, and explicitly lists or reads configured skills.
+Opens or switches this MCP session's active repository, returns a summary, refreshes repository state, reports session changes, and explicitly lists or reads configured skills.
 
 Dynamic paths must resolve inside `workspace.allowedRoots`.
 

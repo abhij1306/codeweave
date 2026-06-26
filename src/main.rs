@@ -17,7 +17,7 @@ use axum::{
     Json,
 };
 use clap::{Parser, ValueEnum};
-use manager::WorkspaceManager;
+use manager::{SessionKey, WorkspaceManager};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::{
@@ -81,10 +81,10 @@ fn default_token() -> String {
     ".mcp-token".into()
 }
 fn default_stateful_mode() -> bool {
-    false
+    true
 }
 fn default_json_response() -> bool {
-    true
+    false
 }
 
 fn validate_auth_mode(auth_mode: &str) -> Result<()> {
@@ -174,7 +174,7 @@ fn tools() -> Value {
       {
         "name":"workspace",
         "title":"Workspace",
-        "description":"Open or switch the single active repository, view its summary or changes, refresh it, or explicitly list/read configured skills. Pass path to switch repositories without restarting the server. Skills must only be used when the user explicitly asks.",
+        "description":"Open or switch this MCP session's active repository, view its summary or changes, refresh it, or explicitly list/read configured skills. Pass path to switch repositories without restarting the server. Skills must only be used when the user explicitly asks.",
         "annotations":read.clone(),
         "execution":execution.clone(),
         "inputSchema":{
@@ -507,7 +507,7 @@ async fn prepare(
             );
         }
     }
-    // A CodeWeave process owns exactly one active repository. Legacy workspace_id
+    // A CodeWeave MCP session owns exactly one active repository. Legacy workspace_id
     // arguments are accepted but ignored so they can never reopen or redirect a tool call.
     params.remove("workspace_id");
     params.remove("workspace");
@@ -603,7 +603,11 @@ async fn live(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    match state.manager.dispatch("health", &json!({})).await {
+    match state
+        .manager
+        .dispatch(SessionKey::stateless(), "health", &json!({}))
+        .await
+    {
         Ok(value) => (
             StatusCode::OK,
             Json(json!({"ok":true,"gateway_ready":true,"engine":value})),
@@ -657,7 +661,7 @@ async fn main() -> Result<()> {
     };
     let manager = Arc::new(WorkspaceManager::default());
     manager
-        .dispatch("initialize", &config)
+        .dispatch(SessionKey::stdio(), "initialize", &config)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
     let state = AppState {
@@ -832,7 +836,10 @@ mod tests {
             "tasks": {},
             "cache_root": cache.path()
         });
-        manager.dispatch("initialize", &config).await.unwrap();
+        manager
+            .dispatch(SessionKey::stdio(), "initialize", &config)
+            .await
+            .unwrap();
 
         let prepared = prepare(
             &manager,
@@ -846,9 +853,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let result = manager.dispatch("code_write", &prepared).await.unwrap();
+        let result = manager
+            .dispatch(SessionKey::stdio(), "code_write", &prepared)
+            .await
+            .unwrap();
 
         assert_eq!(result["applied"], true);
+        assert!(result["phase_ms"]["commit"].is_number());
         assert_eq!(
             std::fs::read_to_string(root.path().join("created.txt")).unwrap(),
             "created through code_write\n"
@@ -876,11 +887,12 @@ mod tests {
             "cache_root": cache.path()
         });
         manager
-            .dispatch("initialize", &daemon_config)
+            .dispatch(SessionKey::stdio(), "initialize", &daemon_config)
             .await
             .unwrap();
         manager
             .dispatch(
+                SessionKey::stdio(),
                 "workspace",
                 &json!({"action": "open", "path": dynamic.path()}),
             )
@@ -898,6 +910,7 @@ mod tests {
         assert!(prepared.get("workspace_id").is_none());
         let summary = manager
             .dispatch(
+                SessionKey::stdio(),
                 "workspace",
                 &json!({"action": "summary", "workspace_id": "main"}),
             )

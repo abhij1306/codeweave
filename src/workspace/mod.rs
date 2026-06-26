@@ -5,7 +5,7 @@ mod journal;
 mod util;
 
 pub use journal::MutationRecord;
-use journal::{load_journal, rotate_journal_if_needed};
+use journal::{load_journal, open_journal, rotate_journal_if_needed};
 use util::{stale_snapshot, summarize_changed_paths};
 
 use crate::index::{content_hash, ignored_workspace_path, CodeIndex, ContextParams, SearchParams};
@@ -21,7 +21,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -47,14 +47,14 @@ pub struct WorkspaceActor {
     repo_status: RwLock<RepoStatus>,
     opened_dirty_summary: (Vec<String>, usize, bool),
     opened_at: DateTime<Utc>,
-    session_id: String,
     external_changed: Mutex<HashSet<String>>,
     pending_paths: Arc<Mutex<HashSet<PathBuf>>>,
     needs_reconcile: Arc<AtomicBool>,
     reconcile_lock: Mutex<()>,
     internal_writes: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     mutations: Mutex<VecDeque<MutationRecord>>,
-    journal_file: Mutex<fs::File>,
+    journal_file: Mutex<Option<fs::File>>,
+    journal_path: PathBuf,
     tasks: TaskSupervisor,
     task_generations: Mutex<HashMap<String, u64>>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -138,14 +138,10 @@ impl WorkspaceActor {
             .map_err(AppError::internal)?;
         let watcher_ms = watcher_started.elapsed().as_millis();
         let journal_started = Instant::now();
-        let session_id = format!("session_{}", Uuid::new_v4().simple());
         let journal_path = workspace_cache.join("mutations.jsonl");
         rotate_journal_if_needed(&journal_path)?;
         let mutations = load_journal(&journal_path);
-        let journal_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&journal_path)?;
+        let journal_file = open_journal(&journal_path)?;
         let tasks = TaskSupervisor::new(workspace_cache, policy.clone(), tasks)?;
         let journal_ms = journal_started.elapsed().as_millis();
         let open_diagnostics = json!({
@@ -172,14 +168,14 @@ impl WorkspaceActor {
             repo_status: RwLock::new(repo_status),
             opened_dirty_summary: summarize_changed_paths(opened_dirty),
             opened_at: Utc::now(),
-            session_id,
             external_changed: Mutex::new(HashSet::new()),
             pending_paths,
             needs_reconcile,
             reconcile_lock: Mutex::new(()),
             internal_writes,
             mutations: Mutex::new(mutations),
-            journal_file: Mutex::new(journal_file),
+            journal_file: Mutex::new(Some(journal_file)),
+            journal_path,
             tasks,
             task_generations: Mutex::new(HashMap::new()),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -246,6 +242,7 @@ impl WorkspaceActor {
         for (path, relative, was_internal) in candidates {
             if was_internal {
                 self.internal_writes.lock().remove(&path);
+                relevant.insert(path);
                 continue;
             }
             external_candidates.insert(relative);
@@ -292,7 +289,7 @@ impl WorkspaceActor {
                 let after_hash = self.index.read().get(&path).map(|file| file.hash.clone());
                 records.push(MutationRecord {
                     mutation_id: format!("mut_{}", Uuid::new_v4().simple()),
-                    session_id: self.session_id.clone(),
+                    session_id: "external".to_owned(),
                     path,
                     before_hash: None,
                     after_hash,
@@ -325,6 +322,10 @@ impl WorkspaceActor {
         *self.snapshot_id.write() = self.index.write().snapshot_id(&head);
     }
 
+    fn read_reconcile_pending(&self) -> bool {
+        self.needs_reconcile.load(Ordering::Acquire)
+    }
+
     /// Lightweight alternative to `summary()` for the warm-path auto-open in
     /// `prepare()`. Returns only the identifiers that `prepare()` mines from
     /// the full summary (workspace_id, snapshot_id, generation) without
@@ -339,8 +340,11 @@ impl WorkspaceActor {
         }))
     }
 
-    pub fn summary(&self) -> AppResult<Value> {
+    pub fn summary(&self, session_id: &str, stateless_session: bool) -> AppResult<Value> {
+        let started = Instant::now();
+        let reconcile_started = Instant::now();
         self.reconcile_pending()?;
+        let reconcile_ms = reconcile_started.elapsed().as_millis();
         let index = self.index.read();
         let repo = self.repo_status.read().clone();
         let mcp_paths: HashSet<String> = self
@@ -348,7 +352,7 @@ impl WorkspaceActor {
             .lock()
             .iter()
             .filter(|item| {
-                item.session_id == self.session_id
+                item.session_id == session_id
                     && item.source == "mcp_edit"
                     && item.timestamp >= self.opened_at
             })
@@ -382,7 +386,11 @@ impl WorkspaceActor {
         } else {
             vec!["No task profiles are configured; profile-based write validation is unavailable, but policy-allowed raw commands remain available through run(command=[...]).".to_owned()]
         };
-        Ok(json!({
+        let mut warnings = warnings;
+        if stateless_session {
+            warnings.push("Stateless HTTP requests share one legacy workspace key; enable server.statefulMode for isolated chat sessions.".to_owned());
+        }
+        let mut result = json!({
             "workspace_id": self.id, "name": self.name, "root": self.root, "generation": self.generation(), "snapshot_id": self.snapshot(),
             "file_count": index.file_count(), "languages": index.languages(), "repository": repo, "instructions": instructions,
             "task_profiles": task_profiles,
@@ -409,11 +417,24 @@ impl WorkspaceActor {
                     "observed_external": external_truncated
                 }
             },
-            "tool_guidance": format!("This server process has one active repository. Context and edits read cached state; call workspace refresh only after suspected missed external changes. {validation_guidance}")
-        }))
+            "tool_guidance": format!("This MCP session has one active repository. Context and edits read cached state; call workspace refresh only after suspected missed external changes. {validation_guidance}")
+        });
+        add_phase_metrics(
+            &mut result,
+            &[
+                ("reconcile", reconcile_ms),
+                ("total_local", started.elapsed().as_millis()),
+            ],
+        );
+        Ok(result)
     }
 
-    pub fn refresh(&self, force: bool) -> AppResult<Value> {
+    pub fn refresh(
+        &self,
+        force: bool,
+        session_id: &str,
+        stateless_session: bool,
+    ) -> AppResult<Value> {
         if force {
             let _guard = self.reconcile_lock.lock();
             self.pending_paths.lock().clear();
@@ -426,15 +447,17 @@ impl WorkspaceActor {
         } else {
             self.reconcile_pending()?;
         }
-        self.summary()
+        self.summary(session_id, stateless_session)
     }
 
     pub fn code_context(&self, params: &Value) -> AppResult<Value> {
-        self.reconcile_pending()?;
+        let started = Instant::now();
+        let reconcile_pending = self.read_reconcile_pending();
         let query = required_str(params, "query")?;
         if let Some(expected) = params.get("snapshot_id").and_then(Value::as_str) {
-            if expected != self.snapshot() {
-                return Err(stale_snapshot(expected, &self.snapshot()));
+            let current = self.snapshot();
+            if expected != current {
+                return Err(stale_snapshot(expected, &current));
             }
         }
         let budget = match params
@@ -468,6 +491,7 @@ impl WorkspaceActor {
             .map(|item| item.path.clone())
             .collect();
         let snapshot = self.snapshot();
+        let index_started = Instant::now();
         let mut result = self.index.read().context(ContextParams {
             workspace_id: &self.id,
             snapshot_id: &snapshot,
@@ -479,15 +503,25 @@ impl WorkspaceActor {
             budget_chars: budget,
             max_results,
         })?;
+        let index_ms = index_started.elapsed().as_millis();
         let task_failures = self.tasks.recent_failures(query, 3);
         if let Some(object) = result.as_object_mut() {
             object.insert("recent_task_failures".to_owned(), json!(task_failures));
+            object.insert("reconcile_pending".to_owned(), json!(reconcile_pending));
         }
+        add_phase_metrics(
+            &mut result,
+            &[
+                ("index_context", index_ms),
+                ("total_local", started.elapsed().as_millis()),
+            ],
+        );
         Ok(result)
     }
 
     pub fn code_search(&self, params: &Value) -> AppResult<Value> {
-        self.reconcile_pending()?;
+        let started = Instant::now();
+        let reconcile_pending = self.read_reconcile_pending();
         let mode = params
             .get("mode")
             .and_then(Value::as_str)
@@ -540,17 +574,28 @@ impl WorkspaceActor {
             })
         };
         if queries.len() == 1 {
-            return run_search(queries[0]);
+            let search_started = Instant::now();
+            let mut result = run_search(queries[0])?;
+            add_reconcile_pending(&mut result, reconcile_pending);
+            add_phase_metrics(
+                &mut result,
+                &[
+                    ("index_search", search_started.elapsed().as_millis()),
+                    ("total_local", started.elapsed().as_millis()),
+                ],
+            );
+            return Ok(result);
         }
         let mut results = Vec::new();
         let mut errors = Vec::new();
+        let search_started = Instant::now();
         for query in &queries {
             match run_search(query) {
                 Ok(result) => results.push(json!({"query": query, "result": result})),
                 Err(error) => errors.push(json!({"query": query, "error": error.0})),
             }
         }
-        Ok(json!({
+        let mut result = json!({
             "mode": mode,
             "snapshot_id": snapshot,
             "query_count": queries.len(),
@@ -559,11 +604,23 @@ impl WorkspaceActor {
             "partial_success": !results.is_empty() && !errors.is_empty(),
             "results": results,
             "errors": errors,
-        }))
+        });
+        add_reconcile_pending(&mut result, reconcile_pending);
+        add_phase_metrics(
+            &mut result,
+            &[
+                ("index_search", search_started.elapsed().as_millis()),
+                ("total_local", started.elapsed().as_millis()),
+            ],
+        );
+        Ok(result)
     }
 
-    pub fn changes(&self, params: &Value) -> AppResult<Value> {
+    pub fn changes(&self, session_id: &str, params: &Value) -> AppResult<Value> {
+        let started = Instant::now();
+        let reconcile_started = Instant::now();
         self.reconcile_pending()?;
+        let reconcile_ms = reconcile_started.elapsed().as_millis();
         let since = params
             .get("since_generation")
             .and_then(Value::as_u64)
@@ -575,33 +632,61 @@ impl WorkspaceActor {
             .lock()
             .iter()
             .rev()
-            .filter(|item| item.session_id == self.session_id)
+            .filter(|item| item.session_id == session_id)
             .filter(|item| item.generation > since)
             .filter(|item| source.map(|value| item.source == value).unwrap_or(true))
             .take(limit)
             .cloned()
             .collect();
-        Ok(
-            json!({"workspace_id": self.id, "generation": self.generation(), "snapshot_id": self.snapshot(), "mutations": records}),
-        )
+        let mut result = json!({
+            "workspace_id": self.id,
+            "generation": self.generation(),
+            "snapshot_id": self.snapshot(),
+            "mutations": records
+        });
+        add_phase_metrics(
+            &mut result,
+            &[
+                ("reconcile", reconcile_ms),
+                ("total_local", started.elapsed().as_millis()),
+            ],
+        );
+        Ok(result)
     }
 
     pub fn git(&self, params: &Value) -> AppResult<Value> {
+        let started = Instant::now();
+        let reconcile_started = Instant::now();
         self.reconcile_pending()?;
+        let reconcile_ms = reconcile_started.elapsed().as_millis();
         let action = required_str(params, "action")?;
         let paths = string_list(params, "paths");
         for path in &paths {
             validate_relative(path)?;
         }
         let staged = bool_value(params, "staged", false);
+        let git_started = Instant::now();
         let result = match action {
             "status" => {
                 let status = self.repository.status(&self.root)?;
+                let git_ms = git_started.elapsed().as_millis();
                 *self.repo_status.write() = status.clone();
                 self.recompute_snapshot();
-                return Ok(
-                    json!({"action": action, "status": status, "generation": self.generation(), "snapshot_id": self.snapshot()}),
+                let mut result = json!({
+                    "action": action,
+                    "status": status,
+                    "generation": self.generation(),
+                    "snapshot_id": self.snapshot()
+                });
+                add_phase_metrics(
+                    &mut result,
+                    &[
+                        ("reconcile", reconcile_ms),
+                        ("git_status", git_ms),
+                        ("total_local", started.elapsed().as_millis()),
+                    ],
                 );
+                return Ok(result);
             }
             "diff" => {
                 self.repository
@@ -649,7 +734,7 @@ impl WorkspaceActor {
                     ));
                 }
                 let output = self.repository.restore(&self.root, &paths, staged)?;
-                let _ = self.refresh(true)?;
+                let _ = self.refresh(true, "git", false)?;
                 output
             }
             _ => {
@@ -660,21 +745,38 @@ impl WorkspaceActor {
                 ))
             }
         };
+        let git_ms = git_started.elapsed().as_millis();
         if matches!(action, "stage" | "commit") {
             *self.repo_status.write() = self.repository.status(&self.root).unwrap_or_default();
             self.recompute_snapshot();
         }
-        Ok(
-            json!({"action": action, "output": result, "generation": self.generation(), "snapshot_id": self.snapshot()}),
-        )
+        let mut response = json!({
+            "action": action,
+            "output": result,
+            "generation": self.generation(),
+            "snapshot_id": self.snapshot()
+        });
+        add_phase_metrics(
+            &mut response,
+            &[
+                ("reconcile", reconcile_ms),
+                ("git", git_ms),
+                ("total_local", started.elapsed().as_millis()),
+            ],
+        );
+        Ok(response)
     }
 
-    pub async fn run(self: &Arc<Self>, params: &Value) -> AppResult<Value> {
+    pub async fn run(self: &Arc<Self>, session_id: &str, params: &Value) -> AppResult<Value> {
+        let started = Instant::now();
+        let reconcile_started = Instant::now();
         self.reconcile_pending_async().await?;
+        let reconcile_before_ms = reconcile_started.elapsed().as_millis();
         let action = params
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or("start");
+        let mut run_startup_ms = None;
         let mut result = match action {
             "start" => {
                 let before = self.generation();
@@ -688,6 +790,7 @@ impl WorkspaceActor {
                             .map(str::to_owned)
                             .collect::<Vec<_>>()
                     });
+                let run_started = Instant::now();
                 let value = self
                     .tasks
                     .start(
@@ -705,10 +808,12 @@ impl WorkspaceActor {
                         },
                     )
                     .await?;
+                run_startup_ms = Some(run_started.elapsed().as_millis());
                 if let Some(task_id) = value.get("task_id").and_then(Value::as_str) {
-                    self.task_generations
-                        .lock()
-                        .insert(task_id.to_owned(), before);
+                    let retained = self.tasks.retained_task_ids();
+                    let mut generations = self.task_generations.lock();
+                    generations.retain(|known_task, _| retained.contains(known_task));
+                    generations.insert(task_id.to_owned(), before);
                 }
                 value
             }
@@ -753,7 +858,9 @@ impl WorkspaceActor {
                 ))
             }
         };
+        let reconcile_after_started = Instant::now();
         self.reconcile_pending_async().await?;
+        let reconcile_after_ms = reconcile_after_started.elapsed().as_millis();
         if let Some(task_id) = result.get("task_id").and_then(Value::as_str) {
             let start = self
                 .task_generations
@@ -765,7 +872,10 @@ impl WorkspaceActor {
                 .mutations
                 .lock()
                 .iter()
-                .filter(|item| item.session_id == self.session_id && item.generation > start)
+                .filter(|item| {
+                    item.generation > start
+                        && (item.session_id == session_id || item.source == "external")
+                })
                 .map(|item| item.path.clone())
                 .collect();
             let (changed_paths, changed_path_count, changed_paths_truncated) =
@@ -791,7 +901,40 @@ impl WorkspaceActor {
                 );
             }
         }
+        if let Some(object) = result.as_object_mut() {
+            let mut phases = serde_json::Map::new();
+            phases.insert("reconcile_before".to_owned(), json!(reconcile_before_ms));
+            phases.insert("reconcile_after".to_owned(), json!(reconcile_after_ms));
+            phases.insert(
+                "total_local".to_owned(),
+                json!(started.elapsed().as_millis()),
+            );
+            if let Some(run_startup_ms) = run_startup_ms {
+                phases.insert("run_startup".to_owned(), json!(run_startup_ms));
+            }
+            object.insert("phase_ms".to_owned(), Value::Object(phases));
+        }
         Ok(result)
+    }
+}
+
+pub(super) fn add_reconcile_pending(value: &mut Value, pending: bool) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("reconcile_pending".to_owned(), json!(pending));
+    }
+}
+
+pub(super) fn add_phase_metrics(value: &mut Value, phases: &[(&str, u128)]) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "phase_ms".to_owned(),
+            Value::Object(
+                phases
+                    .iter()
+                    .map(|(name, elapsed)| ((*name).to_owned(), json!(elapsed)))
+                    .collect(),
+            ),
+        );
     }
 }
 

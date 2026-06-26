@@ -100,6 +100,44 @@ fn search_accepts_multiple_queries() {
 }
 
 #[test]
+fn read_tools_report_pending_reconciliation_without_blocking() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("existing.rs"), "fn existing_symbol() {}\n").unwrap();
+    let actor = test_actor(root.path());
+    fs::write(root.path().join("pending.rs"), "fn pending_symbol() {}\n").unwrap();
+    actor
+        .pending_paths
+        .lock()
+        .insert(root.path().join("pending.rs"));
+    actor
+        .needs_reconcile
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let fetch = actor
+        .code_fetch(&json!({"path": "existing.rs", "max_chars": 5_000}))
+        .unwrap();
+    assert_eq!(fetch["reconcile_pending"], true);
+    assert!(fetch["phase_ms"]["fetch_items"].is_number());
+
+    let search = actor
+        .code_search(&json!({"mode": "literal", "query": "pending_symbol"}))
+        .unwrap();
+    assert_eq!(search["reconcile_pending"], true);
+    assert_eq!(search["result_count"], 0);
+    assert!(search["phase_ms"]["index_search"].is_number());
+
+    let context = actor
+        .code_context(&json!({"query": "existing_symbol"}))
+        .unwrap();
+    assert_eq!(context["reconcile_pending"], true);
+    assert_eq!(context["result_count"], 1);
+    assert!(context["phase_ms"]["index_context"].is_number());
+    assert!(actor
+        .needs_reconcile
+        .load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
 fn fetch_rejects_a_stale_snapshot() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("valid.rs"), "fn valid() {}\n").unwrap();
@@ -130,6 +168,102 @@ fn fetch_reports_character_truncation_separately() {
 }
 
 #[test]
+fn open_ended_line_fetch_reports_clamped_end_line() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("short.txt"), "one\ntwo\n").unwrap();
+    let actor = test_actor(root.path());
+
+    let result = actor
+        .code_fetch(&json!({
+            "path": "short.txt",
+            "start_line": 2,
+            "max_chars": 5_000
+        }))
+        .unwrap();
+
+    assert_eq!(result["results"][0]["start_line"], 2);
+    assert_eq!(result["results"][0]["end_line"], 2);
+    assert_eq!(result["results"][0]["content"], "two");
+}
+
+#[test]
+fn ranged_fetch_continuation_stays_within_the_original_range() {
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("range.txt"),
+        "outside-before\nalpha\nbeta\ngamma\noutside-after\n",
+    )
+    .unwrap();
+    let actor = test_actor(root.path());
+
+    let first = actor
+        .code_fetch(&json!({
+            "path": "range.txt",
+            "start_line": 2,
+            "end_line": 4,
+            "max_chars": 7
+        }))
+        .unwrap();
+    assert_eq!(first["results"][0]["content"], "alpha\nb");
+    let continuation = first["results"][0]["continuation"].as_str().unwrap();
+
+    let second = actor
+        .code_fetch(&json!({
+            "items": [{"kind": "continuation", "value": continuation}],
+            "max_chars": 100
+        }))
+        .unwrap();
+
+    assert_eq!(second["results"][0]["content"], "eta\ngamma");
+    assert!(!second["results"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("outside"));
+    assert!(second["results"][0]["continuation"].is_null());
+}
+
+#[test]
+fn handle_fetch_continuation_preserves_the_handle_range() {
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("handle.txt"),
+        "outside-before\nalpha\nbeta\ngamma\noutside-after\n",
+    )
+    .unwrap();
+    let actor = test_actor(root.path());
+    let direct = actor
+        .code_fetch(&json!({
+            "path": "handle.txt",
+            "start_line": 2,
+            "end_line": 4,
+            "max_chars": 100
+        }))
+        .unwrap();
+    let handle = direct["results"][0]["handle"].as_str().unwrap();
+
+    let first = actor
+        .code_fetch(&json!({
+            "items": [{"kind": "handle", "value": handle}],
+            "max_chars": 7
+        }))
+        .unwrap();
+    let continuation = first["results"][0]["continuation"].as_str().unwrap();
+    let second = actor
+        .code_fetch(&json!({
+            "items": [{"kind": "continuation", "value": continuation}],
+            "max_chars": 100
+        }))
+        .unwrap();
+
+    assert_eq!(second["results"][0]["content"], "eta\ngamma");
+    assert!(!second["results"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("outside"));
+    assert!(second["results"][0]["continuation"].is_null());
+}
+
+#[test]
 fn rollback_recheck_rejects_concurrent_changes() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("value.rs"), "after\n").unwrap();
@@ -155,12 +289,76 @@ fn failed_write_does_not_leave_an_internal_write_marker() {
         after: None,
     }];
 
-    let error = actor.commit_plan(&plan, "failed-write").unwrap_err();
+    let error = actor
+        .commit_plan("test-session", &plan, "failed-write")
+        .unwrap_err();
     assert_eq!(error.0.code, "ATOMIC_WRITE_FAILED");
     assert!(!actor
         .internal_writes
         .lock()
         .contains_key(&actor.root.join("blocked")));
+}
+
+#[test]
+fn journal_failure_rolls_back_applied_files_before_returning_error() {
+    let root = tempdir().unwrap();
+    let original = "before\n";
+    fs::write(root.path().join("value.txt"), original).unwrap();
+    let actor = test_actor(root.path());
+    let generation = actor.generation();
+    *actor.journal_file.lock() = None;
+    let plan = vec![PlannedFile {
+        path: "value.txt".to_owned(),
+        before: Some(original.to_owned()),
+        after: Some("after\n".to_owned()),
+    }];
+
+    let error = actor
+        .commit_plan("test-session", &plan, "journal-failure")
+        .unwrap_err();
+
+    assert_eq!(error.0.code, "JOURNAL_COMMIT_FAILED");
+    assert_eq!(
+        fs::read_to_string(root.path().join("value.txt")).unwrap(),
+        original
+    );
+    assert_eq!(actor.generation(), generation);
+    assert!(actor
+        .needs_reconcile
+        .load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn journal_rotates_during_append_when_the_live_file_is_oversized() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("value.txt"), "value\n").unwrap();
+    let actor = test_actor(root.path());
+    {
+        let mut slot = actor.journal_file.lock();
+        let file = slot.as_mut().unwrap();
+        file.set_len(MAX_JOURNAL_BYTES + 1).unwrap();
+        std::io::Write::flush(file).unwrap();
+    }
+    let record = MutationRecord {
+        mutation_id: "rotation-record".to_owned(),
+        session_id: "test-session".to_owned(),
+        path: "value.txt".to_owned(),
+        before_hash: None,
+        after_hash: Some("hash".to_owned()),
+        source: "test".to_owned(),
+        request_id: "rotation".to_owned(),
+        timestamp: Utc::now(),
+        generation: actor.generation(),
+    };
+
+    actor.record_mutations(&[record]).unwrap();
+
+    let archive = actor
+        .journal_path
+        .with_file_name("mutations.previous.jsonl");
+    assert!(archive.exists());
+    let live = fs::read_to_string(&actor.journal_path).unwrap();
+    assert!(live.contains("rotation-record"));
 }
 
 #[tokio::test]
@@ -171,19 +369,22 @@ async fn stale_snapshot_rebases_when_file_hash_is_current() {
     let actor = test_actor(root.path());
     let old_snapshot = actor.snapshot();
     fs::write(root.path().join("unrelated.rs"), "fn unrelated() {}\n").unwrap();
-    actor.refresh(true).unwrap();
+    actor.refresh(true, "test-session", false).unwrap();
     let result = actor
-        .code_edit(&json!({
-            "snapshot_id": old_snapshot,
-            "preview": true,
-            "changes": [{
-                "kind": "replace",
-                "path": "value.rs",
-                "old_text": "{ 1 }",
-                "new_text": "{ 2 }",
-                "expected_hash": content_hash(original)
-            }]
-        }))
+        .code_edit(
+            "test-session",
+            &json!({
+                "snapshot_id": old_snapshot,
+                "preview": true,
+                "changes": [{
+                    "kind": "replace",
+                    "path": "value.rs",
+                    "old_text": "{ 1 }",
+                    "new_text": "{ 2 }",
+                    "expected_hash": content_hash(original)
+                }]
+            }),
+        )
         .await
         .unwrap();
     assert_eq!(result["preview"], true);
@@ -196,7 +397,7 @@ async fn unknown_validation_profile_fails_before_mutation() {
     let original = "fn value() -> i32 { 1 }\n";
     fs::write(root.path().join("value.rs"), original).unwrap();
     let actor = test_actor(root.path());
-    let summary = actor.summary().unwrap();
+    let summary = actor.summary("test-session", false).unwrap();
     assert_eq!(
         summary["capabilities"]["profile_validation_available"],
         false
@@ -207,16 +408,19 @@ async fn unknown_validation_profile_fails_before_mutation() {
         .is_some_and(|warnings| !warnings.is_empty()));
     let generation = actor.generation();
     let error = actor
-        .code_edit(&json!({
-            "changes": [{
-                "kind": "replace",
-                "path": "value.rs",
-                "old_text": "{ 1 }",
-                "new_text": "{ 2 }",
-                "expected_hash": content_hash(original)
-            }],
-            "validate": ["typecheck"]
-        }))
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [{
+                    "kind": "replace",
+                    "path": "value.rs",
+                    "old_text": "{ 1 }",
+                    "new_text": "{ 2 }",
+                    "expected_hash": content_hash(original)
+                }],
+                "validate": ["typecheck"]
+            }),
+        )
         .await
         .unwrap_err();
     assert_eq!(error.0.code, "UNKNOWN_VALIDATION_PROFILE");
@@ -240,7 +444,7 @@ fn changes_treats_since_generation_as_exclusive() {
     let actor = test_actor(root.path());
     actor.mutations.lock().push_back(MutationRecord {
         mutation_id: "current".to_owned(),
-        session_id: actor.session_id.clone(),
+        session_id: "test-session".to_owned(),
         path: "value.rs".to_owned(),
         before_hash: None,
         after_hash: Some("hash".to_owned()),
@@ -250,11 +454,44 @@ fn changes_treats_since_generation_as_exclusive() {
         generation: 7,
     });
 
-    let after_six = actor.changes(&json!({"since_generation": 6})).unwrap();
+    let after_six = actor
+        .changes("test-session", &json!({"since_generation": 6}))
+        .unwrap();
     assert_eq!(after_six["mutations"].as_array().unwrap().len(), 1);
 
-    let after_seven = actor.changes(&json!({"since_generation": 7})).unwrap();
+    let after_seven = actor
+        .changes("test-session", &json!({"since_generation": 7}))
+        .unwrap();
     assert!(after_seven["mutations"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn changes_are_filtered_by_calling_session() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("value.rs"), "fn value() {}\n").unwrap();
+    let actor = test_actor(root.path());
+    for session_id in ["session-a", "session-b"] {
+        actor.mutations.lock().push_back(MutationRecord {
+            mutation_id: format!("mutation-{session_id}"),
+            session_id: session_id.to_owned(),
+            path: format!("{session_id}.rs"),
+            before_hash: None,
+            after_hash: Some("hash".to_owned()),
+            source: "mcp_edit".to_owned(),
+            request_id: "request".to_owned(),
+            timestamp: Utc::now(),
+            generation: actor.generation(),
+        });
+    }
+
+    let result = actor
+        .changes("session-a", &json!({"since_generation": 0}))
+        .unwrap();
+    let mutations = result["mutations"].as_array().unwrap();
+
+    assert_eq!(mutations.len(), 1);
+    assert_eq!(mutations[0]["session_id"], "session-a");
+    assert_eq!(mutations[0]["path"], "session-a.rs");
 }
 
 #[test]
@@ -274,7 +511,9 @@ fn historical_journal_records_are_not_current_session_changes() {
         generation: 99,
     });
 
-    let result = actor.changes(&json!({"since_generation": 0})).unwrap();
+    let result = actor
+        .changes("test-session", &json!({"since_generation": 0}))
+        .unwrap();
     assert!(result["mutations"].as_array().unwrap().is_empty());
 }
 

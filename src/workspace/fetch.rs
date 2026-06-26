@@ -1,10 +1,22 @@
 use super::util::stale_snapshot;
 use super::WorkspaceActor;
-use crate::index::{decode_handle, encode_handle, slice_lines, RangeHandle};
+use crate::index::{decode_handle, encode_handle, slice_lines, FileEntry, RangeHandle};
 use crate::model::{required_str, usize_value, AppError, AppResult};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum FetchScope {
+    #[default]
+    Full,
+    Lines {
+        start_line: usize,
+        end_line: usize,
+    },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FetchContinuation {
@@ -12,11 +24,23 @@ struct FetchContinuation {
     path: String,
     offset: usize,
     content_hash: String,
+    #[serde(default)]
+    scope: FetchScope,
+}
+
+#[derive(Clone, Copy)]
+struct FetchPrecondition<'a> {
+    expected_hash: &'a str,
+    missing_code: &'static str,
+    missing_message: &'static str,
+    stale_code: &'static str,
+    stale_message: &'static str,
 }
 
 impl WorkspaceActor {
     pub fn code_fetch(&self, params: &Value) -> AppResult<Value> {
-        self.reconcile_pending()?;
+        let started = std::time::Instant::now();
+        let reconcile_pending = self.read_reconcile_pending();
         if let Some(expected) = params.get("snapshot_id").and_then(Value::as_str) {
             let current = self.snapshot();
             if expected != current {
@@ -41,6 +65,7 @@ impl WorkspaceActor {
         let mut remaining = max_chars;
         let mut results = Vec::new();
         let mut errors = Vec::new();
+        let fetch_started = std::time::Instant::now();
         for (index, item) in items.iter().enumerate() {
             if remaining == 0 {
                 break;
@@ -75,7 +100,7 @@ impl WorkspaceActor {
                     .zip(result.get("total_chars").and_then(Value::as_u64))
                     .is_some_and(|(content, total)| content.len() < total as usize)
         });
-        Ok(json!({
+        let mut result = json!({
             "snapshot_id": self.snapshot(),
             "result_count": results.len(),
             "error_count": errors.len(),
@@ -85,24 +110,33 @@ impl WorkspaceActor {
             "chars_truncated": chars_truncated,
             "results": results,
             "errors": errors,
-        }))
+        });
+        super::add_reconcile_pending(&mut result, reconcile_pending);
+        super::add_phase_metrics(
+            &mut result,
+            &[
+                ("fetch_items", fetch_started.elapsed().as_millis()),
+                ("total_local", started.elapsed().as_millis()),
+            ],
+        );
+        Ok(result)
     }
 
     fn fetch_item(&self, item: &Value, remaining: usize) -> AppResult<Value> {
         let kind = required_str(item, "kind")?;
         let value = required_str(item, "value")?;
         match kind {
-            "path" => self.fetch_path(
-                value,
-                item.get("start_line")
+            "path" => {
+                let start = item
+                    .get("start_line")
                     .and_then(Value::as_u64)
-                    .map(|v| v as usize),
-                item.get("end_line")
+                    .map(|value| value as usize);
+                let end = item
+                    .get("end_line")
                     .and_then(Value::as_u64)
-                    .map(|v| v as usize),
-                0,
-                remaining,
-            ),
+                    .map(|value| value as usize);
+                self.fetch_indexed_path(value, scope_from_bounds(start, end), 0, remaining, None)
+            }
             "handle" => {
                 let handle = decode_handle(value)?;
                 if handle.workspace_id != self.id {
@@ -111,44 +145,24 @@ impl WorkspaceActor {
                         "Handle belongs to another workspace",
                     ));
                 }
-                let file = self
-                    .index
-                    .read()
-                    .get(&handle.path)
-                    .cloned()
-                    .ok_or_else(|| AppError::new("STALE_HANDLE", "Handle path no longer exists"))?;
-                if file.hash != handle.content_hash {
-                    return Err(AppError::details(
-                        "STALE_HANDLE",
-                        "File changed after handle creation",
-                        json!({"path": handle.path, "expected_hash": handle.content_hash, "actual_hash": file.hash}),
-                    ));
-                }
-                self.fetch_path(
+                self.fetch_indexed_path(
                     &handle.path,
-                    Some(handle.start_line),
-                    Some(handle.end_line),
+                    FetchScope::Lines {
+                        start_line: handle.start_line,
+                        end_line: handle.end_line,
+                    },
                     0,
                     remaining,
+                    Some(FetchPrecondition {
+                        expected_hash: &handle.content_hash,
+                        missing_code: "STALE_HANDLE",
+                        missing_message: "Handle path no longer exists",
+                        stale_code: "STALE_HANDLE",
+                        stale_message: "File changed after handle creation",
+                    }),
                 )
             }
-            "symbol" => {
-                let (path, symbol, _) =
-                    self.index.read().find_symbol(None, value).ok_or_else(|| {
-                        AppError::details(
-                            "SYMBOL_NOT_FOUND",
-                            "Symbol not found",
-                            json!({"symbol": value}),
-                        )
-                    })?;
-                self.fetch_path(
-                    &path,
-                    Some(symbol.start_line),
-                    Some(symbol.end_line),
-                    0,
-                    remaining,
-                )
-            }
+            "symbol" => self.fetch_symbol(value, remaining),
             "task_log" => {
                 let task_id = value.strip_prefix("task-log:").unwrap_or(value);
                 let content = self.tasks.read_log(task_id)?;
@@ -168,27 +182,18 @@ impl WorkspaceActor {
                         "Continuation belongs to another workspace",
                     ));
                 }
-                let file = self
-                    .index
-                    .read()
-                    .get(&continuation.path)
-                    .cloned()
-                    .ok_or_else(|| {
-                        AppError::new("STALE_CONTINUATION", "Continuation path no longer exists")
-                    })?;
-                if file.hash != continuation.content_hash {
-                    return Err(AppError::details(
-                        "STALE_CONTINUATION",
-                        "File changed after continuation creation",
-                        json!({"path": continuation.path, "expected_hash": continuation.content_hash, "actual_hash": file.hash}),
-                    ));
-                }
-                self.fetch_path(
+                self.fetch_indexed_path(
                     &continuation.path,
-                    None,
-                    None,
+                    continuation.scope,
                     continuation.offset,
                     remaining,
+                    Some(FetchPrecondition {
+                        expected_hash: &continuation.content_hash,
+                        missing_code: "STALE_CONTINUATION",
+                        missing_message: "Continuation path no longer exists",
+                        stale_code: "STALE_CONTINUATION",
+                        stale_message: "File changed after continuation creation",
+                    }),
                 )
             }
             _ => Err(AppError::details(
@@ -199,32 +204,96 @@ impl WorkspaceActor {
         }
     }
 
-    fn fetch_path(
+    fn fetch_symbol(&self, symbol_name: &str, limit: usize) -> AppResult<Value> {
+        let index = self.index.read();
+        let (path, symbol, _) = index.find_symbol(None, symbol_name).ok_or_else(|| {
+            AppError::details(
+                "SYMBOL_NOT_FOUND",
+                "Symbol not found",
+                json!({"symbol": symbol_name}),
+            )
+        })?;
+        let file = index.get(&path).ok_or_else(|| {
+            AppError::details(
+                "PATH_NOT_INDEXED",
+                "Symbol path is not indexed",
+                json!({"path": path, "symbol": symbol_name}),
+            )
+        })?;
+        self.build_fetch_response(
+            file,
+            FetchScope::Lines {
+                start_line: symbol.start_line,
+                end_line: symbol.end_line,
+            },
+            0,
+            limit,
+        )
+    }
+
+    fn fetch_indexed_path(
         &self,
         path: &str,
-        start: Option<usize>,
-        end: Option<usize>,
+        scope: FetchScope,
         offset: usize,
         limit: usize,
+        precondition: Option<FetchPrecondition<'_>>,
     ) -> AppResult<Value> {
         let index = self.index.read();
         let file = index.get(path).ok_or_else(|| {
-            AppError::details(
-                "PATH_NOT_INDEXED",
-                "File is not indexed",
-                json!({"path": path}),
+            precondition.map_or_else(
+                || {
+                    AppError::details(
+                        "PATH_NOT_INDEXED",
+                        "File is not indexed",
+                        json!({"path": path}),
+                    )
+                },
+                |condition| AppError::new(condition.missing_code, condition.missing_message),
             )
         })?;
-        let (content, start_line, end_line) = if start.is_some() || end.is_some() {
-            let start_line = start.unwrap_or(1);
-            let end_line = end.unwrap_or_else(|| file.content.lines().count());
-            (
-                slice_lines(&file.content, start_line, end_line),
+        if let Some(condition) = precondition {
+            if file.hash != condition.expected_hash {
+                return Err(AppError::details(
+                    condition.stale_code,
+                    condition.stale_message,
+                    json!({
+                        "path": file.path,
+                        "expected_hash": condition.expected_hash,
+                        "actual_hash": file.hash
+                    }),
+                ));
+            }
+        }
+        self.build_fetch_response(file, scope, offset, limit)
+    }
+
+    fn build_fetch_response(
+        &self,
+        file: &FileEntry,
+        scope: FetchScope,
+        offset: usize,
+        limit: usize,
+    ) -> AppResult<Value> {
+        let (content, start_line, end_line): (Cow<'_, str>, usize, usize) = match scope {
+            FetchScope::Full => (
+                Cow::Borrowed(file.content.as_str()),
+                1,
+                file.content.lines().count().max(1),
+            ),
+            FetchScope::Lines {
                 start_line,
                 end_line,
-            )
-        } else {
-            (file.content.clone(), 1, file.content.lines().count().max(1))
+            } => {
+                let start_line = start_line.max(1);
+                let line_count = file.content.lines().count().max(1);
+                let end_line = end_line.max(start_line).min(line_count);
+                (
+                    Cow::Owned(slice_lines(&file.content, start_line, end_line)),
+                    start_line,
+                    end_line,
+                )
+            }
         };
         let handle = encode_handle(&RangeHandle {
             version: 1,
@@ -236,23 +305,43 @@ impl WorkspaceActor {
             content_hash: file.hash.clone(),
             symbol: None,
         })?;
-        let base = json!({"path": file.path, "hash": file.hash, "start_line": start_line, "end_line": end_line, "handle": handle});
+        let base = json!({
+            "path": file.path,
+            "hash": file.hash,
+            "start_line": start_line,
+            "end_line": end_line,
+            "handle": handle
+        });
+        let continuation_scope = scope;
         let continuation = |next_offset| {
             encode_fetch_continuation(&FetchContinuation {
                 workspace_id: self.id.clone(),
                 path: file.path.clone(),
                 offset: next_offset,
                 content_hash: file.hash.clone(),
+                scope: continuation_scope,
             })
             .ok()
         };
         Ok(bounded_content(
             base,
-            &content,
+            content.as_ref(),
             offset,
             limit,
             Some(&continuation),
         ))
+    }
+}
+
+fn scope_from_bounds(start: Option<usize>, end: Option<usize>) -> FetchScope {
+    if start.is_none() && end.is_none() {
+        FetchScope::Full
+    } else {
+        let start_line = start.unwrap_or(1).max(1);
+        FetchScope::Lines {
+            start_line,
+            end_line: end.unwrap_or(usize::MAX).max(start_line),
+        }
     }
 }
 
@@ -302,6 +391,6 @@ fn decode_fetch_continuation(value: &str) -> AppResult<FetchContinuation> {
         .ok_or_else(|| AppError::new("INVALID_CONTINUATION", "Unsupported continuation"))?;
     let bytes = URL_SAFE_NO_PAD
         .decode(payload)
-        .map_err(|e| AppError::new("INVALID_CONTINUATION", e.to_string()))?;
+        .map_err(|error| AppError::new("INVALID_CONTINUATION", error.to_string()))?;
     Ok(serde_json::from_slice(&bytes)?)
 }

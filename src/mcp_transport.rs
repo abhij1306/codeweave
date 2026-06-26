@@ -27,13 +27,15 @@ use rmcp::{
     },
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
+use serde_json::Value;
 
+use crate::manager::SessionKey;
 use crate::{
     health, is_loopback, live, prepare, tool_failure, tool_result, tools, AppState, Cli,
     SERVER_NAME,
 };
 
-const INSTRUCTIONS: &str = "Use code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, the single-operation code_write/code_replace/code_insert/code_delete/code_rename tools for changes, run for builds/tests, and git for repository operations. CodeWeave manages one active repository per server process; call workspace with an absolute path to switch it explicitly.";
+const INSTRUCTIONS: &str = "Use code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, the single-operation code_write/code_replace/code_insert/code_delete/code_rename tools for changes, run for builds/tests, and git for repository operations. CodeWeave manages one active repository per MCP session; call workspace with an absolute path to switch this session explicitly.";
 
 #[derive(Clone)]
 pub(crate) struct CodeWeaveMcp {
@@ -68,17 +70,12 @@ impl ServerHandler for CodeWeaveMcp {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let request_value = serde_json::to_value(request)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let name = request_value
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let args = request_value
-            .get("arguments")
-            .cloned()
+        let name = request.name.as_ref();
+        let args = request
+            .arguments
+            .map(Value::Object)
             .unwrap_or_else(|| serde_json::json!({}));
 
         if ![
@@ -102,8 +99,9 @@ impl ServerHandler for CodeWeaveMcp {
             ));
         }
 
+        let session = session_key(&context);
         let result = match prepare(&self.state.manager, &self.state.config, name, args).await {
-            Ok(prepared) => self.state.manager.dispatch(name, &prepared).await,
+            Ok(prepared) => self.state.manager.dispatch(session, name, &prepared).await,
             Err(error) => Err(error),
         };
         let value = match result {
@@ -115,16 +113,39 @@ impl ServerHandler for CodeWeaveMcp {
     }
 }
 
-#[derive(Debug)]
+fn session_key(context: &RequestContext<RoleServer>) -> SessionKey {
+    context
+        .extensions
+        .get::<axum::http::request::Parts>()
+        .map(|parts| session_key_from_headers(&parts.headers))
+        .unwrap_or_else(SessionKey::stateless)
+}
+
+fn session_key_from_headers(headers: &axum::http::HeaderMap) -> SessionKey {
+    headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(|value| SessionKey::new(format!("http:{value}")))
+        .unwrap_or_else(SessionKey::stateless)
+}
+
 struct CompatibleSessionManager {
     inner: LocalSessionManager,
+    manager: Arc<crate::manager::WorkspaceManager>,
 }
 
 impl Default for CompatibleSessionManager {
     fn default() -> Self {
+        Self::new(Arc::new(crate::manager::WorkspaceManager::default()))
+    }
+}
+
+impl CompatibleSessionManager {
+    fn new(manager: Arc<crate::manager::WorkspaceManager>) -> Self {
         let mut inner = LocalSessionManager::default();
         inner.session_config.sse_retry = None;
-        Self { inner }
+        Self { inner, manager }
     }
 }
 
@@ -162,7 +183,10 @@ impl SessionManager for CompatibleSessionManager {
     }
 
     async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
-        self.inner.close_session(id).await
+        let result = self.inner.close_session(id).await;
+        self.manager
+            .close_session(&SessionKey::new(format!("http:{id}")));
+        result
     }
 
     async fn create_stream(
@@ -254,7 +278,7 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
                 let state = state.clone();
                 move || Ok::<_, std::io::Error>(CodeWeaveMcp::new(state.clone()))
             },
-            Arc::new(CompatibleSessionManager::default()),
+            Arc::new(CompatibleSessionManager::new(state.manager.clone())),
             config,
         );
 
@@ -295,5 +319,37 @@ mod tests {
     fn compatibility_manager_disables_empty_priming() {
         let manager = CompatibleSessionManager::default();
         assert!(manager.inner.session_config.sse_retry.is_none());
+    }
+
+    #[test]
+    fn session_key_uses_http_session_header_when_available() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("mcp-session-id", "abc123".parse().unwrap());
+
+        let session = session_key_from_headers(&headers);
+
+        assert_eq!(session.as_str(), "http:abc123");
+        assert!(!session.is_stateless());
+    }
+
+    #[test]
+    fn session_key_falls_back_to_stateless_without_header() {
+        let headers = axum::http::HeaderMap::new();
+
+        let session = session_key_from_headers(&headers);
+
+        assert_eq!(session.as_str(), "stateless");
+        assert!(session.is_stateless());
+    }
+
+    #[test]
+    fn session_key_falls_back_to_stateless_for_empty_header() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("mcp-session-id", "".parse().unwrap());
+
+        let session = session_key_from_headers(&headers);
+
+        assert_eq!(session.as_str(), "stateless");
+        assert!(session.is_stateless());
     }
 }

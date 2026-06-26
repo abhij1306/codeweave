@@ -2,7 +2,7 @@ use crate::model::AppResult;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -47,14 +47,14 @@ fn recover_interrupted_rotation(archive: &Path, backup: &Path) -> io::Result<()>
     }
 }
 
-pub(super) fn rotate_journal_if_needed(path: &Path) -> AppResult<()> {
+fn rotate_journal(path: &Path, force: bool) -> AppResult<()> {
     let (archive, backup) = archive_paths(path);
     recover_interrupted_rotation(&archive, &backup)?;
 
     let Ok(metadata) = fs::metadata(path) else {
         return Ok(());
     };
-    if metadata.len() <= MAX_JOURNAL_BYTES {
+    if !force && metadata.len() <= MAX_JOURNAL_BYTES {
         return Ok(());
     }
 
@@ -90,6 +90,23 @@ pub(super) fn rotate_journal_if_needed(path: &Path) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+pub(super) fn rotate_journal_if_needed(path: &Path) -> AppResult<()> {
+    rotate_journal(path, false)
+}
+
+pub(super) fn rotate_journal_now(path: &Path) -> AppResult<()> {
+    rotate_journal(path, true)
+}
+
+pub(super) fn open_journal(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
 }
 
 pub(super) fn load_journal(path: &Path) -> VecDeque<MutationRecord> {

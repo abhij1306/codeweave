@@ -140,6 +140,84 @@ pub struct StartRequest {
     pub timeout_ms: Option<u64>,
 }
 
+fn command_uses_path(value: &str) -> bool {
+    Path::new(value).is_absolute() || value.contains('/') || value.contains('\\')
+}
+
+fn normalized_command_name(value: &str) -> String {
+    Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value)
+        .to_ascii_lowercase()
+        .trim_end_matches(".exe")
+        .to_owned()
+}
+
+fn authorize_executable(
+    requested: &str,
+    cwd: &Path,
+    allowed_commands: &[String],
+) -> AppResult<Option<PathBuf>> {
+    if !command_uses_path(requested) {
+        let requested_name = normalized_command_name(requested);
+        let allowed = allowed_commands.iter().any(|allowed| {
+            !command_uses_path(allowed)
+                && normalized_command_name(allowed).eq_ignore_ascii_case(&requested_name)
+        });
+        return if allowed {
+            Ok(None)
+        } else {
+            Err(AppError::details(
+                "COMMAND_NOT_ALLOWED",
+                "Command is not allowed by policy",
+                json!({"command": requested, "allowed": allowed_commands}),
+            ))
+        };
+    }
+
+    let requested_path = Path::new(requested);
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        cwd.join(requested_path)
+    };
+    let canonical = candidate.canonicalize().map_err(|error| {
+        AppError::details(
+            "COMMAND_NOT_FOUND",
+            "Executable path could not be resolved",
+            json!({"command": requested, "error": error.to_string()}),
+        )
+    })?;
+    if !canonical.is_file() {
+        return Err(AppError::details(
+            "COMMAND_NOT_FOUND",
+            "Executable path is not a file",
+            json!({"command": requested, "resolved": canonical}),
+        ));
+    }
+
+    let explicitly_allowed = allowed_commands.iter().any(|allowed| {
+        let allowed_path = Path::new(allowed);
+        allowed_path.is_absolute()
+            && allowed_path
+                .canonicalize()
+                .is_ok_and(|configured| configured == canonical)
+    });
+    if !explicitly_allowed {
+        return Err(AppError::details(
+            "COMMAND_NOT_ALLOWED",
+            "Executable paths must be explicitly allowlisted by absolute canonical path",
+            json!({
+                "command": requested,
+                "resolved": canonical,
+                "allowed": allowed_commands
+            }),
+        ));
+    }
+    Ok(Some(canonical))
+}
+
 impl TaskSupervisor {
     pub fn new(
         cache_root: PathBuf,
@@ -179,6 +257,10 @@ impl TaskSupervisor {
             .values()
             .filter(|record| record.lock().ended_at.is_none())
             .count()
+    }
+
+    pub fn retained_task_ids(&self) -> HashSet<String> {
+        self.tasks.lock().keys().cloned().collect()
     }
 
     pub fn validate_profiles(&self, requested: &[String]) -> AppResult<()> {
@@ -240,23 +322,6 @@ impl TaskSupervisor {
         if command.is_empty() {
             return Err(AppError::invalid("Command cannot be empty"));
         }
-        let executable = Path::new(&command[0])
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or(&command[0])
-            .trim_end_matches(".exe")
-            .to_ascii_lowercase();
-        if !self.policy.allowed_commands.iter().any(|allowed| {
-            allowed
-                .trim_end_matches(".exe")
-                .eq_ignore_ascii_case(&executable)
-        }) {
-            return Err(AppError::details(
-                "COMMAND_NOT_ALLOWED",
-                "Command is not allowed by policy",
-                json!({"command": executable, "allowed": self.policy.allowed_commands}),
-            ));
-        }
         if request.shell && !self.policy.shell_enabled {
             return Err(AppError::new(
                 "SHELL_DISABLED",
@@ -275,14 +340,10 @@ impl TaskSupervisor {
         if !cwd.is_dir() {
             return Err(AppError::new("INVALID_CWD", "Task cwd is not a directory"));
         }
-        let requested_executable = Path::new(&command[0]);
-        if requested_executable.is_relative()
-            && (command[0].contains('/') || command[0].contains('\\'))
+        if let Some(resolved) =
+            authorize_executable(&command[0], &cwd, &self.policy.allowed_commands)?
         {
-            let resolved = cwd.join(requested_executable);
-            if resolved.is_file() {
-                command[0] = resolved.to_string_lossy().into_owned();
-            }
+            command[0] = resolved.to_string_lossy().into_owned();
         }
         let run_permit = self
             .run_permit
@@ -557,6 +618,23 @@ impl TaskSupervisor {
     }
 }
 
+fn finalize_cancelled_before_start(record: &Arc<Mutex<TaskRecord>>) -> bool {
+    let mut item = record.lock();
+    if !item.cancel_requested {
+        return false;
+    }
+    item.status = "cancelled".to_owned();
+    item.ended_at = Some(Utc::now());
+    item.pid = None;
+    item.job = None;
+    if !item.output.is_empty() {
+        item.output.push('\n');
+    }
+    item.output
+        .push_str("Task was cancelled before the process started.");
+    true
+}
+
 async fn execute(
     record: Arc<Mutex<TaskRecord>>,
     command: Vec<String>,
@@ -566,6 +644,10 @@ async fn execute(
     max_output: usize,
     output_filter: OutputFilter,
 ) -> AppResult<()> {
+    if finalize_cancelled_before_start(&record) {
+        return Ok(());
+    }
+
     let mut process = if shell {
         let script = if cfg!(windows) {
             powershell_command(&command)
@@ -619,13 +701,19 @@ async fn execute(
     #[cfg(not(windows))]
     let (job, setup_warning): (Option<Arc<WindowsJob>>, Option<String>) = (None, None);
 
-    {
+    let cancel_after_spawn = {
         let mut item = record.lock();
-        item.status = "running".to_owned();
+        let cancelled = item.cancel_requested;
+        item.status = if cancelled {
+            "cancelling".to_owned()
+        } else {
+            "running".to_owned()
+        };
         item.started_at = Utc::now();
         item.pid = pid;
         item.job = job.clone();
-    }
+        cancelled
+    };
     let mut execution_guard = ExecutionGuard::new(record.clone(), pid, job.clone());
     let stdout = child
         .stdout
@@ -641,7 +729,21 @@ async fn execute(
             async move { stream_output(stdout, stderr, collector_record, max_output).await },
         );
 
-    let wait_outcome = timeout(Duration::from_millis(timeout_ms), child.wait()).await;
+    if cancel_after_spawn {
+        if let Some(pid) = pid {
+            let cancel_job = job.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                terminate_process_tree(pid, cancel_job.as_deref());
+            })
+            .await;
+        }
+    }
+    let wait_duration = if cancel_after_spawn {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(timeout_ms)
+    };
+    let wait_outcome = timeout(wait_duration, child.wait()).await;
     let (status, exit_code) = match wait_outcome {
         Ok(Ok(result)) => {
             let cancelled = record.lock().cancel_requested;
@@ -665,6 +767,7 @@ async fn execute(
             ("failed", None)
         }
         Err(_) => {
+            let cancelled = record.lock().cancel_requested;
             if let Some(pid) = pid {
                 let kill_job = job.clone();
                 let _ = tokio::task::spawn_blocking(move || {
@@ -673,7 +776,7 @@ async fn execute(
                 .await;
             }
             let _ = timeout(Duration::from_secs(5), child.wait()).await;
-            ("timed_out", None)
+            (if cancelled { "cancelled" } else { "timed_out" }, None)
         }
     };
 
@@ -905,6 +1008,64 @@ mod tests {
         assert_eq!(error.0.code, "UNKNOWN_VALIDATION_PROFILE");
         let details = error.0.details.unwrap();
         assert_eq!(details["missing"], json!(["typecheck"]));
+    }
+
+    #[test]
+    fn executable_paths_require_an_explicit_absolute_allowlist_entry() {
+        let root = tempdir().unwrap();
+        let executable_name = if cfg!(windows) { "cargo.exe" } else { "cargo" };
+        let executable = root.path().join(executable_name);
+        fs::write(&executable, b"not actually executed").unwrap();
+        let relative = format!("./{executable_name}");
+
+        assert!(
+            authorize_executable("cargo", root.path(), &["cargo".to_owned()])
+                .unwrap()
+                .is_none()
+        );
+        let rejected =
+            authorize_executable(&relative, root.path(), &["cargo".to_owned()]).unwrap_err();
+        assert_eq!(rejected.0.code, "COMMAND_NOT_ALLOWED");
+
+        let allowed = authorize_executable(
+            &relative,
+            root.path(),
+            &[executable.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert_eq!(allowed, Some(executable.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn command_allowlist_normalizes_uppercase_exe_suffix() {
+        assert_eq!(normalized_command_name("CARGO.EXE"), "cargo");
+        assert_eq!(normalized_command_name("C:/Tools/CARGO.EXE"), "cargo");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_spawn_prevents_process_start() {
+        let cache = tempdir().unwrap();
+        let mut item = record(cache.path(), "cancelled", "queued", "");
+        item.ended_at = None;
+        item.cancel_requested = true;
+        let item = Arc::new(Mutex::new(item));
+
+        execute(
+            item.clone(),
+            vec!["definitely-not-a-real-codeweave-command".to_owned()],
+            cache.path().to_path_buf(),
+            false,
+            1_000,
+            10_000,
+            OutputFilter::Raw,
+        )
+        .await
+        .unwrap();
+
+        let item = item.lock();
+        assert_eq!(item.status, "cancelled");
+        assert!(item.ended_at.is_some());
+        assert!(item.output.contains("before the process started"));
     }
 
     #[test]
