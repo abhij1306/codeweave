@@ -517,13 +517,6 @@ impl Drop for WindowsJob {
     }
 }
 
-#[cfg(not(windows))]
-impl WindowsJob {
-    pub fn terminate(&self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 pub fn terminate_process_tree(pid: u32, job: Option<&WindowsJob>) {
     #[cfg(windows)]
     {

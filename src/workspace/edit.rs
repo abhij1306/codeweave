@@ -708,9 +708,9 @@ impl WorkspaceActor {
                 Ok(file) => file,
                 Err(error) => {
                     let archive = self.journal_path.with_file_name("mutations.previous.jsonl");
-                    if self.journal_path.exists() {
-                        *slot = open_journal(&self.journal_path).ok();
-                    } else if fs::rename(&archive, &self.journal_path).is_ok() {
+                    if self.journal_path.exists()
+                        || fs::rename(&archive, &self.journal_path).is_ok()
+                    {
                         *slot = open_journal(&self.journal_path).ok();
                     }
                     return Err(AppError::details(
