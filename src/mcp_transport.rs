@@ -8,16 +8,21 @@ use axum::{
     routing::get,
     Router,
 };
+use futures_util::{stream, Stream, StreamExt};
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
     },
     service::RequestContext,
     transport::{
         stdio,
         streamable_http_server::{
-            session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+            session::{
+                local::{LocalSessionManager, LocalSessionManagerError},
+                RestoreOutcome, ServerSseMessage, SessionId, SessionManager,
+            },
+            StreamableHttpServerConfig, StreamableHttpService,
         },
     },
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -110,6 +115,96 @@ impl ServerHandler for CodeWeaveMcp {
     }
 }
 
+#[derive(Debug)]
+struct CompatibleSessionManager {
+    inner: LocalSessionManager,
+}
+
+impl Default for CompatibleSessionManager {
+    fn default() -> Self {
+        let mut inner = LocalSessionManager::default();
+        inner.session_config.sse_retry = None;
+        Self { inner }
+    }
+}
+
+fn compatibility_ready_event() -> ServerSseMessage {
+    let message: ServerJsonRpcMessage = serde_json::from_value(serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/codeweave/ready",
+        "params": {
+            "transport": "streamable-http",
+            "stateful": true
+        }
+    }))
+    .expect("static compatibility notification must be valid JSON-RPC");
+    ServerSseMessage::from_message(message)
+}
+
+impl SessionManager for CompatibleSessionManager {
+    type Error = LocalSessionManagerError;
+    type Transport = <LocalSessionManager as SessionManager>::Transport;
+
+    async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        self.inner.create_session().await
+    }
+
+    async fn initialize_session(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<ServerJsonRpcMessage, Self::Error> {
+        self.inner.initialize_session(id, message).await
+    }
+
+    async fn has_session(&self, id: &SessionId) -> Result<bool, Self::Error> {
+        self.inner.has_session(id).await
+    }
+
+    async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
+        self.inner.close_session(id).await
+    }
+
+    async fn create_stream(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
+        self.inner.create_stream(id, message).await
+    }
+
+    async fn accept_message(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<(), Self::Error> {
+        self.inner.accept_message(id, message).await
+    }
+
+    async fn create_standalone_stream(
+        &self,
+        id: &SessionId,
+    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
+        let stream = self.inner.create_standalone_stream(id).await?;
+        Ok(stream::iter([compatibility_ready_event()]).chain(stream))
+    }
+
+    async fn resume(
+        &self,
+        id: &SessionId,
+        last_event_id: String,
+    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
+        self.inner.resume(id, last_event_id).await
+    }
+
+    async fn restore_session(
+        &self,
+        id: SessionId,
+    ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
+        self.inner.restore_session(id).await
+    }
+}
+
 async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if crate::authorized(request.headers(), &state) {
         next.run(request).await
@@ -149,15 +244,17 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
     let mut config = StreamableHttpServerConfig::default();
     config.stateful_mode = state.server.stateful_mode;
     config.json_response = state.server.json_response;
+    config.sse_retry = None;
     config.allowed_hosts = allowed_hosts;
     config.allowed_origins = state.server.allowed_origins.clone();
-    let service: StreamableHttpService<CodeWeaveMcp, LocalSessionManager> =
+
+    let service: StreamableHttpService<CodeWeaveMcp, CompatibleSessionManager> =
         StreamableHttpService::new(
             {
                 let state = state.clone();
                 move || Ok::<_, std::io::Error>(CodeWeaveMcp::new(state.clone()))
             },
-            Arc::new(LocalSessionManager::default()),
+            Arc::new(CompatibleSessionManager::default()),
             config,
         );
 
@@ -183,4 +280,20 @@ pub(crate) async fn run_stdio(state: AppState) -> Result<()> {
     let service = CodeWeaveMcp::new(state).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compatibility_event_contains_json_rpc_message() {
+        assert!(compatibility_ready_event().message.is_some());
+    }
+
+    #[test]
+    fn compatibility_manager_disables_empty_priming() {
+        let manager = CompatibleSessionManager::default();
+        assert!(manager.inner.session_config.sse_retry.is_none());
+    }
 }
