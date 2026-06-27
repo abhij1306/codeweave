@@ -11,8 +11,9 @@ use axum::{
 use futures_util::{stream, Stream, StreamExt};
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
+        CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, Extensions, GetExtensions,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+        ServerJsonRpcMessage,
     },
     service::RequestContext,
     transport::{
@@ -36,6 +37,9 @@ use crate::{
 };
 
 const INSTRUCTIONS: &str = "Use code_capabilities to inspect supported contracts, code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, code_preview/code_transaction for multi-file edits, the single-operation code_write/code_replace/code_insert/code_delete/code_rename tools for narrow changes, run for builds/tests, and git for repository operations. CodeWeave manages one active repository per MCP session; call workspace with an absolute path to switch this session explicitly.";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CodeWeaveSessionId(String);
 
 #[derive(Clone)]
 pub(crate) struct CodeWeaveMcp {
@@ -117,11 +121,18 @@ impl ServerHandler for CodeWeaveMcp {
 }
 
 fn session_key(context: &RequestContext<RoleServer>) -> SessionKey {
-    context
-        .extensions
+    session_key_from_extensions(&context.extensions).unwrap_or_else(SessionKey::stateless)
+}
+
+fn session_key_from_extensions(extensions: &Extensions) -> Option<SessionKey> {
+    if let Some(session) = extensions.get::<CodeWeaveSessionId>() {
+        return Some(SessionKey::new(format!("http:{}", session.0)));
+    }
+
+    extensions
         .get::<axum::http::request::Parts>()
         .map(|parts| session_key_from_headers(&parts.headers))
-        .unwrap_or_else(SessionKey::stateless)
+        .filter(|session| !session.is_stateless())
 }
 
 fn session_key_from_headers(headers: &axum::http::HeaderMap) -> SessionKey {
@@ -165,6 +176,19 @@ fn compatibility_ready_event() -> ServerSseMessage {
     ServerSseMessage::from_message(message)
 }
 
+fn attach_codeweave_session_id(message: &mut ClientJsonRpcMessage, id: &SessionId) {
+    let session = CodeWeaveSessionId(id.to_string());
+    match message {
+        ClientJsonRpcMessage::Request(request) => {
+            request.request.extensions_mut().insert(session);
+        }
+        ClientJsonRpcMessage::Notification(notification) => {
+            notification.notification.extensions_mut().insert(session);
+        }
+        _ => {}
+    }
+}
+
 impl SessionManager for CompatibleSessionManager {
     type Error = LocalSessionManagerError;
     type Transport = <LocalSessionManager as SessionManager>::Transport;
@@ -176,8 +200,9 @@ impl SessionManager for CompatibleSessionManager {
     async fn initialize_session(
         &self,
         id: &SessionId,
-        message: ClientJsonRpcMessage,
+        mut message: ClientJsonRpcMessage,
     ) -> Result<ServerJsonRpcMessage, Self::Error> {
+        attach_codeweave_session_id(&mut message, id);
         self.inner.initialize_session(id, message).await
     }
 
@@ -195,16 +220,18 @@ impl SessionManager for CompatibleSessionManager {
     async fn create_stream(
         &self,
         id: &SessionId,
-        message: ClientJsonRpcMessage,
+        mut message: ClientJsonRpcMessage,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
+        attach_codeweave_session_id(&mut message, id);
         self.inner.create_stream(id, message).await
     }
 
     async fn accept_message(
         &self,
         id: &SessionId,
-        message: ClientJsonRpcMessage,
+        mut message: ClientJsonRpcMessage,
     ) -> Result<(), Self::Error> {
+        attach_codeweave_session_id(&mut message, id);
         self.inner.accept_message(id, message).await
     }
 
@@ -357,6 +384,52 @@ mod tests {
 
         assert_eq!(session.as_str(), "http:abc123");
         assert!(!session.is_stateless());
+    }
+
+    #[test]
+    fn session_key_prefers_internal_session_marker_over_headers() {
+        let request = axum::http::Request::builder()
+            .header("mcp-session-id", "stale-header")
+            .body(())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+        let mut extensions = Extensions::new();
+        extensions.insert(parts);
+        extensions.insert(CodeWeaveSessionId("actual-session".to_owned()));
+
+        let session = session_key_from_extensions(&extensions).unwrap();
+
+        assert_eq!(session.as_str(), "http:actual-session");
+        assert!(!session.is_stateless());
+    }
+
+    #[test]
+    fn attach_session_id_tags_tool_request_without_http_headers() {
+        let mut message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "code_capabilities",
+                "arguments": {}
+            }
+        }))
+        .unwrap();
+        let session_id: SessionId = "session-42".into();
+
+        attach_codeweave_session_id(&mut message, &session_id);
+
+        let ClientJsonRpcMessage::Request(request) = message else {
+            panic!("expected request");
+        };
+        assert_eq!(
+            request
+                .request
+                .extensions()
+                .get::<CodeWeaveSessionId>()
+                .unwrap(),
+            &CodeWeaveSessionId("session-42".to_owned())
+        );
     }
 
     #[test]
