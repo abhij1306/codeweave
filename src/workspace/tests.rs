@@ -4,7 +4,7 @@ use super::util::{
     line_ending_label, line_range_bytes, normalize_line_endings_for_content,
     summarize_changed_paths, MAX_CHANGED_PATH_GROUPS, MAX_OBSERVED_CHANGED_PATHS,
 };
-use super::{TaskBaseline, WorkspaceActor};
+use super::{validated_push_target, TaskBaseline, WorkspaceActor};
 use crate::index::content_hash;
 use crate::model::{PolicyConfig, WorkspaceConfig};
 use chrono::Utc;
@@ -48,6 +48,33 @@ fn test_actor_with_exclusions(root: &Path, exclude_paths: Vec<String>) -> Arc<Wo
         )
         .unwrap(),
     )
+}
+
+#[test]
+fn push_target_defaults_to_current_branch_and_rejects_git_syntax() {
+    assert_eq!(
+        validated_push_target(&json!({}), "feature/current").unwrap(),
+        ("origin".to_owned(), "feature/current".to_owned())
+    );
+    assert_eq!(
+        validated_push_target(
+            &json!({"remote": "upstream", "branch": "feature/explicit"}),
+            "feature/current"
+        )
+        .unwrap(),
+        ("upstream".to_owned(), "feature/explicit".to_owned())
+    );
+
+    for params in [
+        json!({"remote": "--mirror"}),
+        json!({"remote": "https://example.com/repository.git"}),
+        json!({"branch": ":main"}),
+        json!({"branch": "+main"}),
+        json!({"branch": "main~1"}),
+    ] {
+        assert!(validated_push_target(&params, "main").is_err());
+    }
+    assert!(validated_push_target(&json!({}), "").is_err());
 }
 
 #[test]
@@ -848,7 +875,7 @@ async fn unknown_validation_profile_fails_before_mutation() {
         summary["capabilities"]["profile_validation_available"],
         false
     );
-    assert_eq!(summary["capabilities"]["raw_commands_available"], true);
+    assert_eq!(summary["capabilities"]["raw_commands_available"], false);
     assert!(summary["warnings"]
         .as_array()
         .is_some_and(|warnings| !warnings.is_empty()));

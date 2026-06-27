@@ -1,11 +1,18 @@
 use crate::model::{AppError, AppResult};
+use crate::task_runtime::{terminate_process_tree, WindowsJob};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const GIT_PUSH_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RepoStatus {
@@ -13,6 +20,10 @@ pub struct RepoStatus {
     pub head: String,
     pub branch: String,
     pub dirty_files: Vec<String>,
+    pub staged_files: Vec<String>,
+    pub unstaged_files: Vec<String>,
+    pub untracked_files: Vec<String>,
+    pub partially_staged_files: Vec<String>,
 }
 
 pub trait RepositoryBackend: Send + Sync {
@@ -37,6 +48,7 @@ pub trait RepositoryBackend: Send + Sync {
     fn stage(&self, root: &Path, paths: &[String]) -> AppResult<String>;
     fn commit(&self, root: &Path, message: &str) -> AppResult<String>;
     fn restore(&self, root: &Path, paths: &[String], staged: bool) -> AppResult<String>;
+    fn push(&self, root: &Path, remote: &str, branch: &str) -> AppResult<String>;
 }
 
 #[derive(Debug, Default)]
@@ -59,19 +71,31 @@ impl CliGitBackend {
 
     fn run(&self, root: &Path, args: &[String], max_chars: usize) -> AppResult<String> {
         let output = self.run_raw(root, args)?;
-        let text = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
-            return Err(AppError::details(
-                "GIT_FAILED",
-                stderr.trim().to_owned(),
-                json!({"args": args, "exit_code": output.status.code()}),
-            ));
-        }
-        if !stderr.trim().is_empty() {
-            eprintln!("git warning for {:?}: {}", args, stderr.trim());
-        }
-        Ok(truncate_output(text, max_chars))
+        checked_output(output, args, max_chars)
+    }
+
+    fn run_with_timeout(
+        &self,
+        root: &Path,
+        args: &[String],
+        max_chars: usize,
+        timeout: Duration,
+    ) -> AppResult<String> {
+        let mut command = Command::new("git");
+        command
+            .current_dir(root)
+            .arg("--no-pager")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command.spawn().map_err(|error| {
+            AppError::details("GIT_UNAVAILABLE", error.to_string(), json!({"args": args}))
+        })?;
+        let output = wait_for_output(child, args, timeout)?;
+        checked_output(output, args, max_chars)
     }
 
     fn untracked_diff(&self, root: &Path, paths: &[String], max_chars: usize) -> AppResult<String> {
@@ -133,6 +157,88 @@ impl CliGitBackend {
         }
         Ok(diff)
     }
+}
+
+fn checked_output(output: Output, args: &[String], max_chars: usize) -> AppResult<String> {
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(AppError::details(
+            "GIT_FAILED",
+            stderr.trim().to_owned(),
+            json!({"args": args, "exit_code": output.status.code()}),
+        ));
+    }
+    if !stderr.trim().is_empty() {
+        eprintln!("git warning for {:?}: {}", args, stderr.trim());
+    }
+    Ok(truncate_output(text, max_chars))
+}
+
+fn wait_for_output(mut child: Child, args: &[String], timeout: Duration) -> AppResult<Output> {
+    let pid = child.id();
+    #[cfg(windows)]
+    let job = WindowsJob::assign(pid).ok();
+    #[cfg(not(windows))]
+    let job: Option<std::sync::Arc<WindowsJob>> = None;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::internal("git stdout was not piped"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::internal("git stderr was not piped"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).map(|_| output)
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                terminate_process_tree(pid, job.as_deref());
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(AppError::details(
+                    "GIT_TIMEOUT",
+                    "Git operation timed out",
+                    json!({"args": args, "timeout_ms": timeout.as_millis() as u64}),
+                ));
+            }
+            Err(error) => {
+                terminate_process_tree(pid, job.as_deref());
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(AppError::details(
+                    "GIT_FAILED",
+                    error.to_string(),
+                    json!({"args": args}),
+                ));
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| AppError::internal("git stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| AppError::internal("git stderr reader panicked"))??;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn string_prefix(text: &str, max_bytes: usize) -> (String, bool) {
@@ -206,6 +312,9 @@ fn parse_porcelain_v2(raw: &str) -> RepoStatus {
         ..RepoStatus::default()
     };
     let mut dirty = HashSet::new();
+    let mut staged: HashSet<String> = HashSet::new();
+    let mut unstaged: HashSet<String> = HashSet::new();
+    let mut untracked: HashSet<String> = HashSet::new();
     let mut index = 0usize;
 
     while index < records.len() {
@@ -221,13 +330,31 @@ fn parse_porcelain_v2(raw: &str) -> RepoStatus {
         } else {
             match record.as_bytes().first().copied() {
                 Some(b'1') => {
+                    // "1 XY sub mH mI mW hH hI path"; '.' = unmodified in that dimension
                     if let Some(path) = porcelain_path(record, 9) {
-                        dirty.insert(path);
+                        dirty.insert(path.clone());
+                        let x = record.chars().nth(2).unwrap_or('.');
+                        let y = record.chars().nth(3).unwrap_or('.');
+                        if x != '.' {
+                            staged.insert(path.clone());
+                        }
+                        if y != '.' {
+                            unstaged.insert(path);
+                        }
                     }
                 }
                 Some(b'2') => {
+                    // "2 XY sub mH mI mW hH hI X score path"
                     if let Some(path) = porcelain_path(record, 10) {
-                        dirty.insert(path);
+                        dirty.insert(path.clone());
+                        let x = record.chars().nth(2).unwrap_or('.');
+                        let y = record.chars().nth(3).unwrap_or('.');
+                        if x != '.' {
+                            staged.insert(path.clone());
+                        }
+                        if y != '.' {
+                            unstaged.insert(path);
+                        }
                     }
                     if let Some(original) = records
                         .get(index + 1)
@@ -238,13 +365,17 @@ fn parse_porcelain_v2(raw: &str) -> RepoStatus {
                     }
                 }
                 Some(b'u') => {
+                    // Unmerged: always in both staged and unstaged
                     if let Some(path) = porcelain_path(record, 11) {
-                        dirty.insert(path);
+                        dirty.insert(path.clone());
+                        staged.insert(path.clone());
+                        unstaged.insert(path);
                     }
                 }
                 Some(b'?') => {
                     if let Some(path) = record.strip_prefix("? ").and_then(normalized_path) {
-                        dirty.insert(path);
+                        dirty.insert(path.clone());
+                        untracked.insert(path);
                     }
                 }
                 _ => {}
@@ -253,8 +384,17 @@ fn parse_porcelain_v2(raw: &str) -> RepoStatus {
         index += 1;
     }
 
+    let partially_staged: HashSet<String> = staged.intersection(&unstaged).cloned().collect();
     status.dirty_files = dirty.into_iter().collect();
     status.dirty_files.sort();
+    status.staged_files = staged.into_iter().collect();
+    status.staged_files.sort();
+    status.unstaged_files = unstaged.into_iter().collect();
+    status.unstaged_files.sort();
+    status.untracked_files = untracked.into_iter().collect();
+    status.untracked_files.sort();
+    status.partially_staged_files = partially_staged.into_iter().collect();
+    status.partially_staged_files.sort();
     status
 }
 
@@ -388,12 +528,45 @@ impl RepositoryBackend for CliGitBackend {
         self.run(root, &args, 20_000)?;
         Ok(format!("Restored {} path(s)", paths.len()))
     }
+    fn push(&self, root: &Path, remote: &str, branch: &str) -> AppResult<String> {
+        let mut args = vec!["push".to_owned(), remote.to_owned()];
+        if !branch.is_empty() {
+            args.push(branch.to_owned());
+        }
+        self.run_with_timeout(root, &args, 20_000, GIT_PUSH_TIMEOUT)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn timed_process_is_terminated_and_reported() {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep 5"]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 5"]);
+            command
+        };
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command.spawn().unwrap();
+
+        let error = wait_for_output(
+            child,
+            &["test-timeout".to_owned()],
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.0.code, "GIT_TIMEOUT");
+    }
 
     #[test]
     fn parses_porcelain_v2_branch_and_dirty_paths() {
@@ -422,6 +595,16 @@ mod tests {
                 "src/untracked file.rs",
             ]
         );
+        assert_eq!(
+            status.staged_files,
+            vec!["src/conflict.rs", "src/new name.rs"]
+        );
+        assert_eq!(
+            status.unstaged_files,
+            vec!["src/changed file.rs", "src/conflict.rs"]
+        );
+        assert_eq!(status.untracked_files, vec!["src/untracked file.rs"]);
+        assert_eq!(status.partially_staged_files, vec!["src/conflict.rs"]);
     }
 
     #[test]
@@ -433,6 +616,10 @@ mod tests {
         assert!(status.head.is_empty());
         assert!(status.branch.is_empty());
         assert_eq!(status.dirty_files, vec!["new.rs"]);
+        assert!(status.staged_files.is_empty());
+        assert!(status.unstaged_files.is_empty());
+        assert_eq!(status.untracked_files, vec!["new.rs"]);
+        assert!(status.partially_staged_files.is_empty());
     }
 
     #[test]

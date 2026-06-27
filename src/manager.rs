@@ -37,7 +37,6 @@ impl SessionKey {
     pub fn is_stateless(&self) -> bool {
         self.0 == "stateless"
     }
-
 }
 
 impl Default for SessionKey {
@@ -174,14 +173,41 @@ impl WorkspaceManager {
                 }
                 actor.code_edit(session.as_str(), &prepared).await
             }
-            "git" => {
+            "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame" | "git_preflight"
+            | "git_stage" | "git_commit" | "git_restore" | "git_push" => {
                 let actor = self.active_actor(session)?;
                 let params = params.clone();
                 run_blocking(move || actor.git(&params)).await
             }
-            "run" => {
+            "task_run" | "task_status" | "task_output" | "task_cancel" => {
+                let action = match method {
+                    "task_run" => "start",
+                    "task_status" => "status",
+                    "task_output" => "output",
+                    "task_cancel" => "cancel",
+                    _ => unreachable!("matched task method"),
+                };
+                let mut prepared = params.clone();
+                if method == "task_run" {
+                    let valid_profile = prepared
+                        .get("profile")
+                        .and_then(Value::as_str)
+                        .is_some_and(|profile| !profile.is_empty());
+                    let has_disallowed_field = match prepared.as_object() {
+                        Some(object) => object
+                            .keys()
+                            .any(|field| !matches!(field.as_str(), "profile" | "action")),
+                        None => true,
+                    };
+                    if !valid_profile || has_disallowed_field {
+                        return Err(AppError::invalid(
+                            "task_run requires exactly one non-empty profile and accepts no command overrides",
+                        ));
+                    }
+                }
+                prepared["action"] = Value::String(action.to_owned());
                 self.active_actor(session)?
-                    .run(session.as_str(), params)
+                    .run(session.as_str(), &prepared)
                     .await
             }
             _ => Err(AppError::details(
@@ -759,7 +785,9 @@ fn add_phase_metrics(value: &mut Value, phases: &[(&str, u128)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PolicyConfig, SkillsConfig, WorkspaceConfig, WorkspaceSettings};
+    use crate::model::{
+        PolicyConfig, SkillsConfig, TaskProfile, WorkspaceConfig, WorkspaceSettings,
+    };
     use tempfile::tempdir;
 
     fn daemon_config(
@@ -810,6 +838,23 @@ mod tests {
         (
             vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
             "sh".to_owned(),
+        )
+    }
+
+    fn sleep_task() -> (HashMap<String, TaskProfile>, String) {
+        let (command, allowed_command) = sleep_command();
+        (
+            HashMap::from([(
+                "sleep".to_owned(),
+                TaskProfile {
+                    command,
+                    cwd: None,
+                    timeout_ms: 60_000,
+                    background: true,
+                    output_filter: Default::default(),
+                },
+            )]),
+            allowed_command,
         )
     }
 
@@ -1044,7 +1089,10 @@ mod tests {
         let auto_session = SessionKey::new("http:auto-opened");
         let explicit_session = SessionKey::new("http:explicit-open");
 
-        assert_eq!(manager.active_actor(&auto_session).unwrap().root_path(), std::fs::canonicalize(&default_workspace).unwrap());
+        assert_eq!(
+            manager.active_actor(&auto_session).unwrap().root_path(),
+            std::fs::canonicalize(&default_workspace).unwrap()
+        );
         manager
             .workspace(
                 &explicit_session,
@@ -1052,7 +1100,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(manager.active_actor(&auto_session).unwrap().root_path(), std::fs::canonicalize(&default_workspace).unwrap());
+        assert_eq!(
+            manager.active_actor(&auto_session).unwrap().root_path(),
+            std::fs::canonicalize(&default_workspace).unwrap()
+        );
         assert_eq!(
             manager.active_actor(&explicit_session).unwrap().root_path(),
             std::fs::canonicalize(&explicit_workspace).unwrap()
@@ -1252,7 +1303,7 @@ mod tests {
         std::fs::create_dir_all(&second).unwrap();
         std::fs::write(first.join("main.rs"), "fn first() {}\n").unwrap();
         std::fs::write(second.join("main.rs"), "fn second() {}\n").unwrap();
-        let (command, allowed_command) = sleep_command();
+        let (tasks, allowed_command) = sleep_task();
         let manager = Arc::new(WorkspaceManager::default());
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
@@ -1272,7 +1323,7 @@ mod tests {
                 allowed_commands: vec![allowed_command],
                 task_retention_hours: None,
             },
-            tasks: HashMap::new(),
+            tasks,
             cache_root: cache.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1291,11 +1342,7 @@ mod tests {
             .await
             .unwrap();
         let started = manager
-            .dispatch(
-                session_a.clone(),
-                "run",
-                &json!({"action": "start", "command": command, "background": true}),
-            )
+            .dispatch(session_a.clone(), "task_run", &json!({"profile": "sleep"}))
             .await
             .unwrap();
         assert_eq!(started["background"], true);
@@ -1327,11 +1374,7 @@ mod tests {
 
         let task_id = started["task_id"].as_str().unwrap();
         let _ = manager
-            .dispatch(
-                session_a,
-                "run",
-                &json!({"action": "cancel", "task_id": task_id}),
-            )
+            .dispatch(session_a, "task_cancel", &json!({"task_id": task_id}))
             .await;
     }
 
@@ -1547,6 +1590,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_run_dispatch_requires_only_a_profile_and_forces_start_action() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let manager = Arc::new(WorkspaceManager::default());
+        let config = daemon_config(root.path(), cache.path(), 1_000_000);
+        manager
+            .dispatch(SessionKey::stdio(), "initialize", &config)
+            .await
+            .unwrap();
+        manager
+            .dispatch(SessionKey::stdio(), "workspace", &json!({"action": "open"}))
+            .await
+            .unwrap();
+
+        let raw_command = manager
+            .dispatch(
+                SessionKey::stdio(),
+                "task_run",
+                &json!({"command": ["not-allowed"]}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(raw_command.0.code, "INVALID_ARGUMENT");
+
+        let spoofed_action = manager
+            .dispatch(
+                SessionKey::stdio(),
+                "task_run",
+                &json!({"profile": "missing", "action": "cancel"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(spoofed_action.0.code, "UNKNOWN_TASK_PROFILE");
+    }
+
+    #[tokio::test]
     async fn actor_cache_eviction_skips_running_idle_actor() {
         let root = tempdir().unwrap();
         let cache = root.path().join("cache");
@@ -1561,7 +1641,7 @@ mod tests {
             .unwrap();
             workspaces.push(workspace);
         }
-        let (command, allowed_command) = sleep_command();
+        let (tasks, allowed_command) = sleep_task();
         let manager = Arc::new(WorkspaceManager::default());
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
@@ -1581,7 +1661,7 @@ mod tests {
                 allowed_commands: vec![allowed_command],
                 task_retention_hours: None,
             },
-            tasks: HashMap::new(),
+            tasks,
             cache_root: cache.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1601,8 +1681,8 @@ mod tests {
         let started = manager
             .dispatch(
                 running_session.clone(),
-                "run",
-                &json!({"action": "start", "command": command, "background": true}),
+                "task_run",
+                &json!({"profile": "sleep"}),
             )
             .await
             .unwrap();

@@ -162,17 +162,35 @@ fn authorized(headers: &HeaderMap, state: &AppState) -> bool {
 }
 
 fn tools() -> Value {
+    // One annotation constant per risk level. The hosted-client safety classifier
+    // reads these per advertised tool, so every tool must map to exactly one level.
+    // READ: no side effects. WRITE_CLOSED: mutates local state only.
+    // DESTRUCTIVE_CLOSED: may discard local state. WRITE_OPEN reaches the network.
+    // There is no open-world execution level
+    // because all command execution is constrained to configured task profiles.
     let read = json!({
         "readOnlyHint": true,
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": false
     });
-    let write = json!({
+    let write_closed = json!({
         "readOnlyHint": false,
         "destructiveHint": false,
         "idempotentHint": false,
         "openWorldHint": false
+    });
+    let destructive_closed = json!({
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false
+    });
+    let write_open = json!({
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
     });
     let execution = json!({"taskSupport":"forbidden"});
 
@@ -180,7 +198,7 @@ fn tools() -> Value {
     // mishandle deeply nested oneOf/not/const schemas even though they are valid JSON Schema.
     // These definitions mirror the TypeScript gateway that is known to work with Perplexity;
     // the Rust request normalizer still accepts the richer compatibility forms internally.
-    json!([
+    let mut advertised = json!([
       {
         "name":"workspace",
         "title":"Workspace",
@@ -273,7 +291,7 @@ fn tools() -> Value {
         "name":"code_write",
         "title":"Write One File",
         "description":"Create or overwrite exactly one file. Use expected_hash when replacing an existing file.",
-        "annotations":write.clone(),
+        "annotations":write_closed.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
@@ -294,7 +312,7 @@ fn tools() -> Value {
         "name":"code_replace",
         "title":"Replace Text in One File",
         "description":"Replace exact text in exactly one file. The replacement count is checked before writing.",
-        "annotations":write.clone(),
+        "annotations":write_closed.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
@@ -317,7 +335,7 @@ fn tools() -> Value {
         "name":"code_replace_range",
         "title":"Replace Fetched Range in One File",
         "description":"Replace the complete line range selected by a code_fetch handle in exactly one file.",
-        "annotations":write.clone(),
+        "annotations":write_closed.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
@@ -337,7 +355,7 @@ fn tools() -> Value {
         "name":"code_insert",
         "title":"Insert Text in One File",
         "description":"Insert text before, after, or inside one named symbol in exactly one file.",
-        "annotations":write.clone(),
+        "annotations":write_closed.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
@@ -359,7 +377,7 @@ fn tools() -> Value {
         "name":"code_delete",
         "title":"Delete One File",
         "description":"Delete exactly one file with an optional content-hash precondition.",
-        "annotations":write.clone(),
+        "annotations":destructive_closed.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
@@ -378,7 +396,7 @@ fn tools() -> Value {
         "name":"code_rename",
         "title":"Rename One File",
         "description":"Rename exactly one file with an optional content-hash precondition.",
-        "annotations":write.clone(),
+        "annotations":write_closed.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
@@ -414,7 +432,7 @@ fn tools() -> Value {
         "name":"code_transaction",
         "title":"Apply Code Transaction",
         "description":"Apply a multi-file edit transaction through the same precondition, validation, diff, and rollback engine as the narrow write tools.",
-        "annotations":write.clone(),
+        "annotations":write_closed.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
@@ -427,96 +445,259 @@ fn tools() -> Value {
           "required":["changes"],
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
+      }
+    ]);
+    let mut git_tools = json!([
+      {
+        "name":"git_status",
+        "title":"Git Status",
+        "description":"Show the working tree status: staged, unstaged, untracked, and partially staged files.",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{},
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
       },
       {
-        "name":"git",
-        "title":"Git",
-        "description":"Check Git status or diff, inspect history, stage files, commit, or restore files. Restore requires confirm=true.",
-        "annotations":write.clone(),
+        "name":"git_diff",
+        "title":"Git Diff",
+        "description":"Show the diff for the working tree or, with staged=true, the staged index. Limit to specific paths when given.",
+        "annotations":read.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
           "properties":{
-            "action":{"type":"string","enum":["status","diff","log","show","blame","stage","commit","restore"]},
             "paths":{"type":"array","items":{"type":"string"}},
-            "ref":{"type":"string"},
-            "message":{"type":"string"},
-            "max_chars":{"type":"integer","minimum":1,"maximum":200000},
-            "confirm":{"type":"boolean"}
+            "staged":{"type":"boolean","default":false},
+            "max_chars":{"type":"integer","minimum":1,"maximum":200000}
           },
-          "required":["action"],
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
       },
       {
-        "name":"run",
-        "title":"Run Task or Controlled Command",
-        "description":"Run tests, builds, or another allowed command. Use a configured profile when available, otherwise pass command as an argument array. Also supports background task status, output, and cancellation.",
-        "annotations":write,
-        "execution":execution,
+        "name":"git_log",
+        "title":"Git Log",
+        "description":"Show recent commit history.",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
           "properties":{
-            "action":{"default":"start","type":"string","enum":["start","status","output","cancel"]},
-            "command":{"type":"array","items":{"type":"string"}},
-            "profile":{"type":"string"},
-            "cwd":{"type":"string"},
-            "task_id":{"type":"string"}, "background":{"type":"boolean"}, "timeout_ms":{"type":"integer","minimum":1}, "shell":{"type":"boolean"}, "continuation":{"type":"string"}, "stream":{"type":"string","enum":["combined","stdout","stderr"]}
+            "limit":{"type":"integer","minimum":1,"maximum":200,"default":20}
+          },
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"git_show",
+        "title":"Git Show",
+        "description":"Show the patch for one commit ref (default HEAD).",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "ref":{"type":"string","default":"HEAD"},
+            "max_chars":{"type":"integer","minimum":1,"maximum":200000}
+          },
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"git_blame",
+        "title":"Git Blame",
+        "description":"Show line-by-line authorship for one path, optionally bounded by start_line and end_line.",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "paths":{"type":"array","items":{"type":"string"}},
+            "start_line":{"type":"integer","minimum":1},
+            "end_line":{"type":"integer","minimum":1},
+            "max_chars":{"type":"integer","minimum":1,"maximum":200000}
+          },
+          "required":["paths"],
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"git_preflight",
+        "title":"Git Preflight",
+        "description":"Return staged_files, partially_staged_files, and the cached staged diff without committing.",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{},
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"git_stage",
+        "title":"Git Stage",
+        "description":"Stage the given paths into the index.",
+        "annotations":write_closed.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "paths":{"type":"array","items":{"type":"string"}}
+          },
+          "required":["paths"],
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"git_commit",
+        "title":"Git Commit",
+        "description":"Commit the currently staged changes with the given message.",
+        "annotations":write_closed.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "message":{"type":"string"}
+          },
+          "required":["message"],
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"git_restore",
+        "title":"Git Restore",
+        "description":"Discard changes for the given paths, restoring them from the index or HEAD. Requires confirm=true because it overwrites local changes.",
+        "annotations":destructive_closed.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "paths":{"type":"array","items":{"type":"string"}},
+            "staged":{"type":"boolean","default":false},
+            "confirm":{"type":"boolean"}
+          },
+          "required":["paths","confirm"],
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"git_push",
+        "title":"Git Push",
+        "description":"Push commits to a remote (default origin) and optional branch. This reaches the network.",
+        "annotations":write_open.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "remote":{"type":"string","description":"Push remote name (default: origin)"},
+            "branch":{"type":"string","description":"Branch to push (default: current branch)"}
           },
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
       }
-    ])
+    ]);
+    let mut task_tools = json!([
+      {
+        "name":"task_run",
+        "title":"Run Configured Task",
+        "description":"Run a configured task profile such as tests, type checks, or builds. The profile defines the exact command; no arbitrary commands are accepted.",
+        "annotations":write_closed.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "profile":{"type":"string","minLength":1,"description":"Configured task profile name."}
+          },
+          "required":["profile"],
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"task_status",
+        "title":"Task Status",
+        "description":"Return the live status and tail for a background task.",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "task_id":{"type":"string"}
+          },
+          "required":["task_id"],
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"task_output",
+        "title":"Task Output",
+        "description":"Return retained output for a background task. Page with the returned continuation token.",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "task_id":{"type":"string"},
+            "stream":{"type":"string","enum":["combined","stdout","stderr"]},
+            "continuation":{"type":"string"}
+          },
+          "required":["task_id"],
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"task_cancel",
+        "title":"Cancel Task",
+        "description":"Cancel a running background task. Partial output is retained.",
+        "annotations":write_closed.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "task_id":{"type":"string"}
+          },
+          "required":["task_id"],
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      }
+    ]);
+
+    for item in git_tools
+        .as_array_mut()
+        .expect("git tools must be an array")
+        .iter_mut()
+        .chain(
+            task_tools
+                .as_array_mut()
+                .expect("task tools must be an array")
+                .iter_mut(),
+        )
+    {
+        item["inputSchema"]["additionalProperties"] = Value::Bool(false);
+    }
+
+    advertised
+        .as_array_mut()
+        .expect("core tools must be an array")
+        .append(
+            git_tools
+                .as_array_mut()
+                .expect("git tools must be an array"),
+        );
+    advertised
+        .as_array_mut()
+        .expect("core tools must be an array")
+        .append(
+            task_tools
+                .as_array_mut()
+                .expect("task tools must be an array"),
+        );
+    advertised
 }
 
 fn object(value: Value) -> Map<String, Value> {
     value.as_object().cloned().unwrap_or_default()
-}
-
-fn split_command_line(input: &str) -> std::result::Result<Vec<String>, model::AppError> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' && quote == Some('"') {
-            if chars.peek().is_some_and(|next| matches!(next, '"' | '\\')) {
-                current.push(chars.next().expect("peeked character must exist"));
-            } else {
-                current.push(ch);
-            }
-            continue;
-        }
-        if matches!(ch, '\'' | '"') {
-            if quote == Some(ch) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(ch);
-            } else {
-                current.push(ch);
-            }
-            continue;
-        }
-        if ch.is_whitespace() && quote.is_none() {
-            if !current.is_empty() {
-                args.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push(ch);
-        }
-    }
-    if quote.is_some() {
-        return Err(model::AppError::invalid(
-            "Command string has an unterminated quote",
-        ));
-    }
-    if !current.is_empty() {
-        args.push(current);
-    }
-    if args.is_empty() {
-        return Err(model::AppError::invalid("Command cannot be empty"));
-    }
-    Ok(args)
 }
 
 fn is_code_mutation(method: &str) -> bool {
@@ -572,6 +753,26 @@ fn normalize_code_mutation(method: &str, params: &mut Map<String, Value>) {
         change.insert("overwrite".into(), Value::Bool(true));
     }
     params.insert("changes".into(), Value::Array(vec![Value::Object(change)]));
+}
+
+fn tool_action(method: &str) -> Option<&'static str> {
+    match method {
+        "git_status" => Some("status"),
+        "git_diff" => Some("diff"),
+        "git_log" => Some("log"),
+        "git_show" => Some("show"),
+        "git_blame" => Some("blame"),
+        "git_preflight" => Some("preflight"),
+        "git_stage" => Some("stage"),
+        "git_commit" => Some("commit"),
+        "git_restore" => Some("restore"),
+        "git_push" => Some("push"),
+        "task_run" => Some("start"),
+        "task_status" => Some("status"),
+        "task_output" => Some("output"),
+        "task_cancel" => Some("cancel"),
+        _ => None,
+    }
 }
 
 async fn prepare(
@@ -632,16 +833,25 @@ async fn prepare(
             params.insert("items".into(), json!([item]));
         }
     }
-    if method == "run" {
-        if let Some(command) = params.get("command").and_then(Value::as_str) {
-            params.insert("command".into(), json!(split_command_line(command)?));
-        }
-    }
     if method == "code_preview" {
         params.insert("preview".into(), Value::Bool(true));
     }
     if is_code_mutation(method) {
         normalize_code_mutation(method, &mut params);
+    }
+    if method == "task_run" {
+        let has_profile = params
+            .get("profile")
+            .and_then(Value::as_str)
+            .is_some_and(|profile| !profile.is_empty());
+        if !has_profile || params.keys().any(|field| field != "profile") {
+            return Err(model::AppError::invalid(
+                "task_run requires exactly one non-empty profile and accepts no command overrides",
+            ));
+        }
+    }
+    if let Some(action) = tool_action(method) {
+        params.insert("action".into(), Value::String(action.into()));
     }
     Ok(Value::Object(params))
 }
@@ -805,25 +1015,42 @@ mod tests {
     fn public_tool_schemas_are_hosted_client_compatible() {
         let all = tools();
         let items = all.as_array().expect("tools array");
-        assert_eq!(items.len(), 15);
-        for name in [
-            "workspace",
-            "code_context",
-            "code_capabilities",
-            "code_fetch",
-            "code_search",
-            "code_preview",
-            "code_transaction",
-            "code_write",
-            "code_replace",
-            "code_replace_range",
-            "code_insert",
-            "code_delete",
-            "code_rename",
-            "git",
-            "run",
-        ] {
-            let _ = tool(&all, name);
+        let expected_annotations = [
+            ("workspace", true, false, true, false),
+            ("code_context", true, false, true, false),
+            ("code_capabilities", true, false, true, false),
+            ("code_fetch", true, false, true, false),
+            ("code_search", true, false, true, false),
+            ("code_write", false, false, false, false),
+            ("code_replace", false, false, false, false),
+            ("code_replace_range", false, false, false, false),
+            ("code_insert", false, false, false, false),
+            ("code_delete", false, true, false, false),
+            ("code_rename", false, false, false, false),
+            ("code_preview", true, false, true, false),
+            ("code_transaction", false, false, false, false),
+            ("git_status", true, false, true, false),
+            ("git_diff", true, false, true, false),
+            ("git_log", true, false, true, false),
+            ("git_show", true, false, true, false),
+            ("git_blame", true, false, true, false),
+            ("git_preflight", true, false, true, false),
+            ("git_stage", false, false, false, false),
+            ("git_commit", false, false, false, false),
+            ("git_restore", false, true, false, false),
+            ("git_push", false, false, false, true),
+            ("task_run", false, false, false, false),
+            ("task_status", true, false, true, false),
+            ("task_output", true, false, true, false),
+            ("task_cancel", false, false, false, false),
+        ];
+        assert_eq!(items.len(), expected_annotations.len());
+        for (name, read_only, destructive, idempotent, open_world) in expected_annotations {
+            let annotations = &tool(&all, name)["annotations"];
+            assert_eq!(annotations["readOnlyHint"], read_only, "{name}");
+            assert_eq!(annotations["destructiveHint"], destructive, "{name}");
+            assert_eq!(annotations["idempotentHint"], idempotent, "{name}");
+            assert_eq!(annotations["openWorldHint"], open_world, "{name}");
         }
 
         for item in items {
@@ -841,11 +1068,24 @@ mod tests {
         assert!(tool(&all, "code_context")["inputSchema"]
             .get("required")
             .is_none());
-        assert_eq!(
-            tool(&all, "git")["inputSchema"]["required"],
-            json!(["action"])
-        );
         assert!(items.iter().all(|item| item["name"] != "code_edit"));
+        assert!(items
+            .iter()
+            .all(|item| !matches!(item["name"].as_str(), Some("git" | "run"))));
+        for item in items.iter().filter(|item| {
+            item["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("git_") || name.starts_with("task_"))
+        }) {
+            assert_eq!(item["inputSchema"]["additionalProperties"], false);
+        }
+        let action_multiplexers = items
+            .iter()
+            .filter(|item| item["inputSchema"]["properties"]["action"]["enum"].is_array())
+            .map(|item| item["name"].as_str().expect("tool name"))
+            .collect::<Vec<_>>();
+        assert_eq!(action_multiplexers, ["workspace"]);
+        assert_eq!(tool(&all, "workspace")["annotations"]["readOnlyHint"], true);
         let fetch_item = &tool(&all, "code_fetch")["inputSchema"]["properties"]["items"]["items"];
         assert_eq!(fetch_item["required"], json!(["kind", "value"]));
         assert_eq!(
@@ -893,20 +1133,21 @@ mod tests {
             tool(&all, "code_transaction")["inputSchema"]["required"],
             json!(["changes"])
         );
-    }
-
-    #[test]
-    fn command_strings_are_split_without_shell_expansion() {
         assert_eq!(
-            split_command_line("cargo test --manifest-path 'project dir/Cargo.toml'").unwrap(),
-            vec![
-                "cargo".to_owned(),
-                "test".to_owned(),
-                "--manifest-path".to_owned(),
-                "project dir/Cargo.toml".to_owned(),
-            ]
+            tool(&all, "task_run")["inputSchema"]["required"],
+            json!(["profile"])
         );
-        assert!(split_command_line("cargo 'test").is_err());
+        assert_eq!(
+            tool(&all, "task_run")["inputSchema"]["properties"]["profile"]["minLength"],
+            1
+        );
+        assert!(tool(&all, "task_run")["inputSchema"]["properties"]
+            .get("command")
+            .is_none());
+        assert_eq!(
+            tool(&all, "git_restore")["inputSchema"]["required"],
+            json!(["paths", "confirm"])
+        );
     }
 
     #[tokio::test]
@@ -969,10 +1210,44 @@ mod tests {
         assert_eq!(replace_range["changes"][0]["kind"], "replace_range");
         assert_eq!(replace_range["changes"][0]["handle"], "range_handle");
 
-        let run = prepare(&manager, &config, "run", json!({"command": "cargo test"}))
+        for (method, action) in [
+            ("git_status", "status"),
+            ("git_diff", "diff"),
+            ("git_log", "log"),
+            ("git_show", "show"),
+            ("git_blame", "blame"),
+            ("git_preflight", "preflight"),
+            ("git_stage", "stage"),
+            ("git_commit", "commit"),
+            ("git_restore", "restore"),
+            ("git_push", "push"),
+            ("task_status", "status"),
+            ("task_output", "output"),
+            ("task_cancel", "cancel"),
+        ] {
+            let prepared = prepare(
+                &manager,
+                &config,
+                method,
+                json!({"action": "spoofed", "profile": "test"}),
+            )
             .await
             .unwrap();
-        assert_eq!(run["command"], json!(["cargo", "test"]));
+            assert_eq!(prepared["action"], action, "{method}");
+        }
+
+        let task_run = prepare(&manager, &config, "task_run", json!({"profile": "test"}))
+            .await
+            .unwrap();
+        assert_eq!(task_run["action"], "start");
+        assert!(prepare(
+            &manager,
+            &config,
+            "task_run",
+            json!({"command": ["cargo", "test"]})
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

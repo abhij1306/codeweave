@@ -79,6 +79,31 @@
       ],
       "cwd": "backend",
       "timeoutMs": 120000
+    },
+    "vp-check": {
+      "command": [
+        "vp",
+        "check"
+      ],
+      "timeoutMs": 120000
+    },
+    "vp-test": {
+      "command": [
+        "vp",
+        "test"
+      ],
+      "timeoutMs": 300000,
+      "outputFilter": {
+        "type": "failedTail",
+        "chars": 30000
+      }
+    },
+    "vp-build": {
+      "command": [
+        "vp",
+        "build"
+      ],
+      "timeoutMs": 300000
     }
   }
 }

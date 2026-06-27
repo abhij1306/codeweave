@@ -161,9 +161,39 @@ fn normalized_command_name(value: &str) -> String {
         .to_owned()
 }
 
+fn resolve_local_bin(requested: &str, root: &Path) -> Option<PathBuf> {
+    if command_uses_path(requested) {
+        return None;
+    }
+    let requested_name = normalized_command_name(requested);
+    let canonical_root = root.canonicalize().ok()?;
+    let local_bin = canonical_root.join("node_modules").join(".bin");
+    let workspace_node_modules = local_bin
+        .parent()
+        .and_then(|node_modules| node_modules.canonicalize().ok())
+        .filter(|node_modules| node_modules.starts_with(&canonical_root));
+    let probes: &[&str] = if cfg!(windows) {
+        &[".cmd", ".exe", ""]
+    } else {
+        &[""]
+    };
+    probes.iter().find_map(|ext| {
+        let canonical = local_bin
+            .join(format!("{requested_name}{ext}"))
+            .canonicalize()
+            .ok()?;
+        (canonical.is_file()
+            && workspace_node_modules
+                .as_ref()
+                .is_some_and(|node_modules| canonical.starts_with(node_modules)))
+        .then_some(canonical)
+    })
+}
+
 fn authorize_executable(
     requested: &str,
     cwd: &Path,
+    root: &Path,
     allowed_commands: &[String],
 ) -> AppResult<Option<PathBuf>> {
     if !command_uses_path(requested) {
@@ -172,15 +202,18 @@ fn authorize_executable(
             !command_uses_path(allowed)
                 && normalized_command_name(allowed).eq_ignore_ascii_case(&requested_name)
         });
-        return if allowed {
-            Ok(None)
-        } else {
-            Err(AppError::details(
-                "COMMAND_NOT_ALLOWED",
-                "Command is not allowed by policy",
-                json!({"command": requested, "allowed": allowed_commands}),
-            ))
-        };
+        if allowed {
+            return Ok(None);
+        }
+        if let Some(canonical) = resolve_local_bin(requested, root) {
+            return Ok(Some(canonical));
+        }
+        let local_bin = root.join("node_modules").join(".bin");
+        return Err(AppError::details(
+            "COMMAND_NOT_ALLOWED",
+            "Command is not in allowedCommands and was not found in node_modules/.bin",
+            json!({"command": requested, "allowed": allowed_commands, "local_bin_searched": local_bin}),
+        ));
     }
 
     let requested_path = Path::new(requested);
@@ -225,9 +258,17 @@ fn authorize_executable(
     Ok(Some(canonical))
 }
 
-fn authorize_profile_executable(requested: &str, cwd: &Path) -> AppResult<Option<PathBuf>> {
+fn authorize_profile_executable(
+    requested: &str,
+    cwd: &Path,
+    root: &Path,
+) -> AppResult<Option<PathBuf>> {
     if !command_uses_path(requested) {
-        return Ok(None);
+        return Ok(resolve_local_bin(requested, cwd).or_else(|| {
+            (cwd != root)
+                .then(|| resolve_local_bin(requested, root))
+                .flatten()
+        }));
     }
 
     let requested_path = Path::new(requested);
@@ -271,7 +312,7 @@ fn profile_diagnostic(name: &str, profile: &TaskProfile, root: &Path) -> serde_j
         }
     };
     let executable = profile.command.first().cloned().unwrap_or_default();
-    match authorize_profile_executable(&executable, &cwd) {
+    match authorize_profile_executable(&executable, &cwd, root) {
         Ok(resolved) => json!({
             "name": name,
             "valid": !profile.command.is_empty(),
@@ -363,7 +404,7 @@ impl TaskSupervisor {
                 "missing": missing,
                 "available": available,
                 "validate_accepts": "Configured task profile names only; do not pass shell commands or command strings.",
-                "suggested_action": "Remove validate and call run(action='start', command=[...]) after the edit, or configure tasks.<name> and restart CodeWeave.",
+                "suggested_action": "Configure tasks.<name>, restart CodeWeave, and call task_run(profile='<name>') after the edit.",
             }),
         ))
     }
@@ -431,9 +472,9 @@ impl TaskSupervisor {
             return Err(AppError::new("INVALID_CWD", "Task cwd is not a directory"));
         }
         let resolved = if is_profile {
-            authorize_profile_executable(&command[0], &cwd)?
+            authorize_profile_executable(&command[0], &cwd, root)?
         } else {
-            authorize_executable(&command[0], &cwd, &self.policy.allowed_commands)?
+            authorize_executable(&command[0], &cwd, root, &self.policy.allowed_commands)?
         };
         if let Some(resolved) = resolved {
             command[0] = resolved.to_string_lossy().into_owned();
@@ -1120,16 +1161,18 @@ mod tests {
         let relative = format!("./{executable_name}");
 
         assert!(
-            authorize_executable("cargo", root.path(), &["cargo".to_owned()])
+            authorize_executable("cargo", root.path(), root.path(), &["cargo".to_owned()])
                 .unwrap()
                 .is_none()
         );
         let rejected =
-            authorize_executable(&relative, root.path(), &["cargo".to_owned()]).unwrap_err();
+            authorize_executable(&relative, root.path(), root.path(), &["cargo".to_owned()])
+                .unwrap_err();
         assert_eq!(rejected.0.code, "COMMAND_NOT_ALLOWED");
 
         let allowed = authorize_executable(
             &relative,
+            root.path(),
             root.path(),
             &[executable.to_string_lossy().into_owned()],
         )
@@ -1152,11 +1195,49 @@ mod tests {
         let requested = format!(".venv/Scripts/{executable_name}");
 
         let direct_error =
-            authorize_executable(&requested, root.path(), &["python".to_owned()]).unwrap_err();
+            authorize_executable(&requested, root.path(), root.path(), &["python".to_owned()])
+                .unwrap_err();
         assert_eq!(direct_error.0.code, "COMMAND_NOT_ALLOWED");
 
-        let profile_allowed = authorize_profile_executable(&requested, root.path()).unwrap();
+        let profile_allowed =
+            authorize_profile_executable(&requested, root.path(), root.path()).unwrap();
         assert_eq!(profile_allowed, Some(executable.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn configured_profiles_resolve_workspace_local_binaries() {
+        let root = tempdir().unwrap();
+        let local_bin = root.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&local_bin).unwrap();
+        let executable = local_bin.join(if cfg!(windows) { "vp.cmd" } else { "vp" });
+        fs::write(&executable, b"not actually executed").unwrap();
+
+        let resolved = authorize_profile_executable("vp", root.path(), root.path()).unwrap();
+
+        assert_eq!(resolved, Some(executable.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn local_bin_resolution_rejects_canonical_escape() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let local_bin = root.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&local_bin).unwrap();
+        let outside_executable = outside
+            .path()
+            .join(if cfg!(windows) { "vp.cmd" } else { "vp" });
+        fs::write(&outside_executable, b"not actually executed").unwrap();
+        let link = local_bin.join(if cfg!(windows) { "vp.cmd" } else { "vp" });
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_executable, &link).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&outside_executable, &link).is_err() {
+            return;
+        }
+
+        let error = authorize_executable("vp", root.path(), root.path(), &[]).unwrap_err();
+        assert_eq!(error.0.code, "COMMAND_NOT_ALLOWED");
     }
 
     #[test]

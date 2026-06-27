@@ -36,7 +36,7 @@ Reads exact paths, line ranges, symbols, metadata, provenance handles, continuat
 
 `response_detail` accepts `standard` (default), `compact`, or `debug`. Compact responses keep essential fields such as `path`, `hash`, `content`, and task status while omitting handles and pagination diagnostics. Metadata items return `hash`, `size`, `language`, `document_type`, `line_count`, and `modified_ns` without content. Symbol items may pass `context_lines` and `include_imports`; imports are lexical prelude lines, not inferred dependencies.
 
-Use the returned `status_fetch` descriptor, equivalent to `{"kind":"task_status","value":"task_..."}`, as a read-only fallback when a hosted client blocks `run(action="status")` because `run` can also start commands.
+The returned `status_fetch` descriptor, equivalent to `{"kind":"task_status","value":"task_..."}`, remains available as a read-only task-status handle. The dedicated `task_status` tool provides the same risk-isolated polling path directly.
 
 ## Write tools
 
@@ -95,16 +95,23 @@ Renames exactly one file. The destination must not already exist.
 
 All write tools use the same internal transactional pipeline for precondition checks, atomic writes, mutation recording, optional validation, and rollback.
 
-## `git`
+## Git tools
 
-Supports status, diff, log, show, blame, stage, commit, and confirmed restore. It is intentionally narrower than unrestricted shell access. A scoped diff for an untracked file returns a bounded synthetic new-file patch instead of silently returning an empty diff.
+Git operations are advertised as separate tools so each operation has one static safety classification:
 
-## `run`
+- Read-only: `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, and `git_preflight`.
+- Local writes: `git_stage` and `git_commit`.
+- Destructive local write: `git_restore`, which requires `confirm: true`.
+- Network write: `git_push`.
 
-Runs a configured profile or an allow-listed executable. Foreground and retained background tasks are supported, including status, output, and cancellation.
+These tools remain narrower than unrestricted shell access. A scoped `git_diff` for an untracked file returns a bounded synthetic new-file patch instead of silently returning an empty diff.
+
+## Task tools
+
+`task_run` runs one configured profile. It accepts only `profile`; arbitrary command arrays, shell flags, and per-call working-directory overrides are not part of the public MCP contract. `task_status` and `task_output` read retained task state, while `task_cancel` stops a running background task.
 
 Profiles may set `background`, `timeoutMs`, and an `outputFilter`. Available filters are `raw`, `failedTail`, `tailLines`, `cargoJson`, and `jsonSummary`. Cargo profiles using `cargoJson` should add `--message-format=json` to the command.
 
-Configured profiles are trusted server configuration and may reference explicit repository-local executable paths such as `.venv/Scripts/python.exe`. Ad-hoc `command` requests still require `policy.allowedCommands`.
+Configured profiles are trusted server configuration and may reference explicit repository-local executable paths such as `.venv/Scripts/python.exe`. Bare profile commands first resolve from `node_modules/.bin` in the profile working directory or workspace root, then fall back to the server's `PATH`. The example configuration defines `vp-check`, `vp-test`, and `vp-build` for CrawlerAI's Vite+ frontend; `vp` is required there and `npm` is not an interchangeable fallback.
 
-Background tasks write combined, stdout, and stderr logs incrementally. Use `action: "status"` for the live tail, or `action: "output"` with `stream: "combined"`, `"stdout"`, or `"stderr"`. Page through output by passing the returned `continuation` token. Partial output is retained after cancellation and timeout.
+Background tasks write combined, stdout, and stderr logs incrementally. Use `task_status` for the live tail, or `task_output` with `stream: "combined"`, `"stdout"`, or `"stderr"`. Page through output by passing the returned `continuation` token. Partial output is retained after `task_cancel` and timeout.

@@ -49,11 +49,11 @@ Existing-file changes require a current snapshot, expected content hash, or prov
 
 Tool errors include the stable `code` and `message` fields plus retry metadata when recovery is possible. `retry_kind` distinguishes `retry_same_request`, `retry_with_changes`, and `not_retryable`; argument-correctable failures may include `suggested_calls`.
 
-## Command execution
+## Task execution
 
-The `run` tool executes configured task profiles or executables listed in `policy.allowedCommands`. Configured profiles are trusted server configuration and may resolve explicit repository-local executable paths such as a virtual-environment Python. Ad-hoc `command` requests still require `policy.allowedCommands`. Shell execution is disabled by default. Keep task working directories relative to the active workspace and avoid adding broad command interpreters unless required.
+The public `task_run` tool executes configured task profiles only. Configured profiles are trusted server configuration and may resolve explicit repository-local executable paths such as a virtual-environment Python. The public schema does not accept ad-hoc commands, shell flags, or per-call working directories. Shell execution remains disabled by default. Keep configured task working directories relative to the active workspace and avoid broad command interpreters unless required.
 
-If a hosted client blocks `run(action="status")` because the same tool can also start commands, use the `status_fetch` descriptor returned when the task starts. It maps to `code_fetch` with `{"kind":"task_status","value":"task_..."}` and provides a read-only polling path that hosted safety classifiers can distinguish from command execution.
+Task lifecycle operations have separate public contracts: `task_status` and `task_output` are read-only, while `task_cancel` is a closed-world write. The `status_fetch` descriptor returned when a task starts also maps to `code_fetch` with `{"kind":"task_status","value":"task_..."}`.
 
 ## Recommended agent workflow
 

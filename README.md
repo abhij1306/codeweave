@@ -12,7 +12,7 @@ CodeWeave is a fast, local-first Model Context Protocol (MCP) server for AI-assi
 - **Single Rust process** — no Node.js gateway or companion daemon.
 - **Repository-aware retrieval** — ranked context, symbols, references, outlines, regex, filename search, and repository maps.
 - **Safe edits** — narrow single-operation tools with snapshot and content-hash preconditions, validation, and rollback.
-- **Controlled execution** — allow-listed commands, optional task profiles, timeouts, and retained task logs.
+- **Controlled execution** — configured task profiles, timeouts, cancellation, and retained task logs.
 - **Git integration** — status, diff, log, show, blame, staging, commits, and confirmed restores.
 - **Session-isolated dynamic workspaces** — each MCP session can switch repositories without restarting while cached repository actors are reused by canonical path.
 - **Remote MCP** — expose the local server through ngrok, Cloudflare Tunnel, or another trusted HTTPS reverse proxy.
@@ -219,7 +219,7 @@ Detailed guides:
 
 `workspace.artifactPaths` has the opposite purpose: it explicitly indexes configured paths even when normal Git ignore rules would skip them. Do not list the same directory in both settings. Configured entries under `workspaces` may define their own `artifactPaths` and `excludePaths`; dynamically opened repositories inherit the values under `workspace`.
 
-Task profiles can set `background: true` and `timeoutMs` for long builds, browser smoke tests, and acceptance suites. Direct `run` requests can override `background` and `timeout_ms`; task profile configuration uses `timeoutMs`. Profile `outputFilter` values are:
+`task_run` accepts a configured profile name only. Profiles can set `background: true` and `timeoutMs` for long builds, browser smoke tests, and acceptance suites. The example configuration includes `vp-check`, `vp-test`, and `vp-build` profiles for CrawlerAI's Vite+ frontend; these intentionally use the required `vp` CLI rather than `npm`. Profile `outputFilter` values are:
 
 - `{ "type": "raw" }` - successful tasks show the head; failed, cancelled, and timed-out tasks show the tail.
 - `{ "type": "failedTail", "chars": 30000 }` - use a specific failure-tail budget.
@@ -227,7 +227,7 @@ Task profiles can set `background: true` and `timeoutMs` for long builds, browse
 - `{ "type": "cargoJson", "includeWarnings": true }` - extracts Cargo compiler diagnostics from `--message-format=json`.
 - `{ "type": "jsonSummary", "marker": "CODEWEAVE_SUMMARY:" }` - returns a script-emitted JSON summary after the marker.
 
-Task output is written incrementally. While a background task is running, call `run` with `action: "status"` for its live tail or `action: "output"` with `stream: "combined"`, `"stdout"`, or `"stderr"`. Reuse the returned continuation token to page through the selected stream. Timeouts and cancellation retain partial logs. On Windows, task processes are assigned to a kill-on-close Job Object so descendant processes such as `rustc`, Node, and Chromium are cleaned up with the task.
+Task output is written incrementally. While a background task is running, call `task_status` for its live tail or `task_output` with `stream: "combined"`, `"stdout"`, or `"stderr"`. Reuse the returned continuation token to page through the selected stream. `task_cancel` and timeouts retain partial logs. On Windows, task processes are assigned to a kill-on-close Job Object so descendant processes such as `rustc`, Node, and Chromium are cleaned up with the task.
 
 `server.statefulMode` defaults to `true` so independent chats or LLM clients receive isolated active-workspace state through the MCP session id. Stateful streamable HTTP uses long-lived SSE requests; ngrok's p50/p90 dashboard can include those request durations, so it may show high values even when tool responses report low `elapsed_ms`. `server.jsonResponse` defaults to `false` and only applies when `statefulMode` is disabled. Stateless HTTP remains supported for legacy direct JSON responses, but all stateless requests share one fallback workspace key.
 
@@ -254,8 +254,13 @@ Never commit `config.json`, `.mcp-token`, tunnel credentials, generated caches, 
 | `code_insert` | Insert text relative to a named symbol in one file |
 | `code_delete` | Delete exactly one file |
 | `code_rename` | Rename exactly one file |
-| `git` | Inspect and perform bounded Git operations |
-| `run` | Run configured tasks or policy-approved commands |
+| `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, `git_preflight` | Inspect repository state without mutation |
+| `git_stage`, `git_commit` | Update the local Git index or create a commit |
+| `git_restore` | Restore selected paths after explicit confirmation |
+| `git_push` | Push commits to a remote |
+| `task_run` | Run a configured task profile |
+| `task_status`, `task_output` | Read retained background-task state and output |
+| `task_cancel` | Cancel a running background task |
 
 A typical coding-agent workflow is:
 
@@ -264,8 +269,8 @@ A typical coding-agent workflow is:
 3. Locate exact definitions with `code_search`; use `references` for indexed symbol call-site discovery rather than regex.
 4. Read only the required ranges with `code_fetch`; use `response_detail: "compact"` or `metadata` items when full debug fields or content are unnecessary.
 5. Preview multi-file edits with `code_preview`, then apply with `code_transaction` or a narrow write wrapper.
-6. Run checks with `run`.
-7. Review the final diff with `git`.
+6. Run configured checks with `task_run` and inspect retained output with `task_status` or `task_output`.
+7. Review the final state with `git_status` and `git_diff`.
 
 See [docs/implementation.md](docs/implementation.md) and [docs/tools.md](docs/tools.md).
 

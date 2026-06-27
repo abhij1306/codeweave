@@ -69,6 +69,52 @@ struct TaskBaseline {
     dirty_files: HashSet<String>,
 }
 
+fn validated_push_target(params: &Value, current_branch: &str) -> AppResult<(String, String)> {
+    let remote = match params.get("remote") {
+        None => "origin",
+        Some(Value::String(remote)) => remote,
+        Some(_) => return Err(AppError::invalid("git push remote must be a string")),
+    };
+    if remote.is_empty()
+        || remote.trim() != remote
+        || remote.starts_with('-')
+        || remote.starts_with('+')
+        || remote.contains(':')
+    {
+        return Err(AppError::invalid(
+            "git push remote must be a non-empty remote name, not an option or URL",
+        ));
+    }
+
+    let branch = match params.get("branch") {
+        None => current_branch,
+        Some(Value::String(branch)) => branch,
+        Some(_) => return Err(AppError::invalid("git push branch must be a string")),
+    };
+    let invalid_ref_character = branch
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace() || "~^:?*[\\".contains(ch));
+    let invalid_component = branch.split('/').any(|component| {
+        component.is_empty() || component.starts_with('.') || component.ends_with(".lock")
+    });
+    if branch.is_empty()
+        || branch.starts_with('-')
+        || branch.starts_with('+')
+        || branch == "@"
+        || branch.contains("..")
+        || branch.contains("@{")
+        || branch.ends_with('.')
+        || invalid_ref_character
+        || invalid_component
+    {
+        return Err(AppError::invalid(
+            "git push branch must be a valid branch name, not an option or refspec",
+        ));
+    }
+
+    Ok((remote.to_owned(), branch.to_owned()))
+}
+
 impl WorkspaceActor {
     pub fn root_path(&self) -> &Path {
         &self.root
@@ -479,16 +525,15 @@ impl WorkspaceActor {
             .collect::<Vec<_>>();
         let task_profiles = self.tasks.profile_names();
         let profile_validation_available = !task_profiles.is_empty();
-        let raw_commands_available = !self.policy.allowed_commands.is_empty();
         let validation_guidance = if profile_validation_available {
-            "Write-tool validate fields accept configured task profile names only. Use run(profile='<name>') for standalone profile execution."
+            "Write-tool validate fields accept configured task profile names only. Use task_run(profile='<name>') for standalone profile execution."
         } else {
-            "No validation profiles are configured. Omit validate on write tools and call run(action='start', command=[...]) with a policy-allowed command after applying the edit."
+            "No validation profiles are configured. Configure tasks.<name>, restart CodeWeave, and use task_run(profile='<name>') after applying the edit."
         };
         let warnings = if profile_validation_available {
             Vec::<String>::new()
         } else {
-            vec!["No task profiles are configured; profile-based write validation is unavailable, but policy-allowed raw commands remain available through run(command=[...]).".to_owned()]
+            vec!["No task profiles are configured; task_run and profile-based write validation are unavailable until tasks.<name> is configured and CodeWeave is restarted.".to_owned()]
         };
         let mut warnings = warnings;
         if stateless_session {
@@ -500,8 +545,7 @@ impl WorkspaceActor {
             "task_profiles": task_profiles,
             "capabilities": {
                 "profile_validation_available": profile_validation_available,
-                "raw_commands_available": raw_commands_available,
-                "allowed_commands": self.policy.allowed_commands,
+                "raw_commands_available": false,
                 "validation_guidance": validation_guidance
             },
             "warnings": warnings,
@@ -919,6 +963,37 @@ impl WorkspaceActor {
                 let output = self.repository.restore(&self.root, &paths, staged)?;
                 let _ = self.refresh(true, "git", false)?;
                 output
+            }
+            "push" => {
+                let status = self.repository.status(&self.root)?;
+                let (remote, branch) = validated_push_target(params, &status.branch)?;
+                self.repository.push(&self.root, &remote, &branch)?
+            }
+            "preflight" => {
+                let status = self.repository.status(&self.root)?;
+                let diff =
+                    self.repository
+                        .diff(&self.root, true, &[], self.policy.max_context_chars)?;
+                let git_ms = git_started.elapsed().as_millis();
+                *self.repo_status.write() = status.clone();
+                self.recompute_snapshot();
+                let mut result = json!({
+                    "action": "preflight",
+                    "staged_files": status.staged_files,
+                    "partially_staged_files": status.partially_staged_files,
+                    "cached_diff": diff,
+                    "generation": self.generation(),
+                    "snapshot_id": self.snapshot()
+                });
+                add_phase_metrics(
+                    &mut result,
+                    &[
+                        ("reconcile", reconcile_ms),
+                        ("git", git_ms),
+                        ("total_local", started.elapsed().as_millis()),
+                    ],
+                );
+                return Ok(result);
             }
             _ => {
                 return Err(AppError::details(

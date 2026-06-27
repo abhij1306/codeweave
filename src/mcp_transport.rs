@@ -36,7 +36,7 @@ use crate::{
     SERVER_NAME,
 };
 
-const INSTRUCTIONS: &str = "Use code_capabilities to inspect supported contracts, code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, code_preview/code_transaction for multi-file edits, the single-operation code_write/code_replace/code_replace_range/code_insert/code_delete/code_rename tools for narrow changes, run for builds/tests, and git for repository operations. CodeWeave manages one active repository per MCP session; call workspace with an absolute path to switch this session explicitly.";
+const INSTRUCTIONS: &str = "Use code_capabilities to inspect supported contracts, code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, code_preview/code_transaction for multi-file edits, and the single-operation code_write/code_replace/code_replace_range/code_insert/code_delete/code_rename tools for narrow changes. Run configured builds and tests with task_run; inspect or stop retained tasks with task_status, task_output, and task_cancel. Use the narrowly scoped git_status/git_diff/git_log/git_show/git_blame/git_preflight/git_stage/git_commit/git_restore/git_push tools for repository operations. CodeWeave manages one active repository per MCP session; call workspace with an absolute path to switch this session explicitly.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CodeWeaveSessionId(String);
@@ -96,8 +96,20 @@ impl ServerHandler for CodeWeaveMcp {
             "code_insert",
             "code_delete",
             "code_rename",
-            "git",
-            "run",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_show",
+            "git_blame",
+            "git_preflight",
+            "git_stage",
+            "git_commit",
+            "git_restore",
+            "git_push",
+            "task_run",
+            "task_status",
+            "task_output",
+            "task_cancel",
         ]
         .contains(&name)
         {
