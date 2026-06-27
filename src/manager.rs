@@ -633,6 +633,7 @@ impl WorkspaceManager {
             name: name.to_owned(),
             path: canonical_text,
             artifact_paths: config.workspace.artifact_paths.clone(),
+            exclude_paths: config.workspace.exclude_paths.clone(),
         })
     }
 
@@ -758,6 +759,7 @@ mod tests {
                 name: "Main".to_owned(),
                 path: root.to_string_lossy().into_owned(),
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             }],
             workspace: Default::default(),
             skills: Default::default(),
@@ -809,6 +811,7 @@ mod tests {
                 default_path: Some(root.path().to_string_lossy().into_owned()),
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
             policy: PolicyConfig {
@@ -850,11 +853,13 @@ mod tests {
                 name: "Configured Name".to_owned(),
                 path: root.path().to_string_lossy().into_owned(),
                 artifact_paths: vec!["logs".to_owned()],
+                exclude_paths: vec!["generated/".to_owned()],
             }],
             workspace: WorkspaceSettings {
                 default_path: Some(root.path().to_string_lossy().into_owned()),
                 allowed_roots: Vec::new(),
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
             policy: PolicyConfig {
@@ -897,6 +902,7 @@ mod tests {
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
             policy: PolicyConfig {
@@ -950,6 +956,7 @@ mod tests {
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
             policy: PolicyConfig {
@@ -1003,6 +1010,7 @@ mod tests {
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
             policy: PolicyConfig {
@@ -1055,6 +1063,7 @@ mod tests {
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
             policy: PolicyConfig {
@@ -1111,6 +1120,7 @@ mod tests {
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
             policy: PolicyConfig {
@@ -1184,6 +1194,7 @@ mod tests {
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
             policy: PolicyConfig {
@@ -1334,6 +1345,7 @@ mod tests {
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
             policy: PolicyConfig {
@@ -1374,6 +1386,7 @@ mod tests {
                 default_path: None,
                 allowed_roots: vec![allowed.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
             policy: PolicyConfig {
@@ -1426,6 +1439,7 @@ mod tests {
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
             policy: PolicyConfig {
@@ -1489,6 +1503,7 @@ mod tests {
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
             policy: PolicyConfig {

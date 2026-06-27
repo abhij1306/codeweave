@@ -1,7 +1,8 @@
 use crate::index::ignored_workspace_path;
 use crate::model::{AppError, AppResult};
+use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub(super) fn line_range_bytes(
     content: &str,
@@ -82,14 +83,73 @@ pub(super) fn changes_without_independent_preconditions(changes: &[Value]) -> Ve
 }
 
 pub(super) const MAX_OBSERVED_CHANGED_PATHS: usize = 30;
+const MAX_CHANGED_PATH_GROUPS: usize = 20;
 
-pub(super) fn summarize_changed_paths(paths: HashSet<String>) -> (Vec<String>, usize, bool) {
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct ChangedPathGroup {
+    pub path: String,
+    pub count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ChangedPathSummary {
+    pub paths: Vec<String>,
+    pub count: usize,
+    pub truncated: bool,
+    pub groups: Vec<ChangedPathGroup>,
+}
+
+pub(super) fn summarize_changed_paths(paths: HashSet<String>) -> ChangedPathSummary {
     let mut output: Vec<_> = paths
         .into_iter()
         .filter(|path| !ignored_workspace_path(path))
         .collect();
     output.sort();
     let total = output.len();
+    let mut grouped = HashMap::<String, usize>::new();
+    for path in &output {
+        *grouped.entry(changed_path_group(path)).or_default() += 1;
+    }
+    let mut groups: Vec<_> = grouped
+        .into_iter()
+        .map(|(path, count)| ChangedPathGroup { path, count })
+        .collect();
+    groups.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    if groups.len() > MAX_CHANGED_PATH_GROUPS {
+        let other_count = groups[MAX_CHANGED_PATH_GROUPS..]
+            .iter()
+            .map(|group| group.count)
+            .sum();
+        groups.truncate(MAX_CHANGED_PATH_GROUPS);
+        groups.push(ChangedPathGroup {
+            path: "(other)".to_owned(),
+            count: other_count,
+        });
+    }
     output.truncate(MAX_OBSERVED_CHANGED_PATHS);
-    (output, total, total > MAX_OBSERVED_CHANGED_PATHS)
+    ChangedPathSummary {
+        paths: output,
+        count: total,
+        truncated: total > MAX_OBSERVED_CHANGED_PATHS,
+        groups,
+    }
+}
+
+fn changed_path_group(path: &str) -> String {
+    let components: Vec<_> = path
+        .replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect();
+    match components.as_slice() {
+        [] | [_] => "(root)".to_owned(),
+        [directory, _] => directory.clone(),
+        [first, second, ..] => format!("{first}/{second}"),
+    }
 }

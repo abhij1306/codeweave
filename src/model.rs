@@ -9,6 +9,8 @@ pub struct WorkspaceConfig {
     pub path: String,
     #[serde(default, rename = "artifactPaths")]
     pub artifact_paths: Vec<String>,
+    #[serde(default, rename = "excludePaths")]
+    pub exclude_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -74,6 +76,8 @@ pub struct WorkspaceSettings {
     pub allowed_roots: Vec<String>,
     #[serde(default)]
     pub artifact_paths: Vec<String>,
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -269,5 +273,27 @@ mod tests {
                 include_warnings: true
             }
         ));
+    }
+
+    #[test]
+    fn workspace_exclusions_parse_and_default_for_existing_configs() {
+        let configured: WorkspaceConfig = serde_json::from_value(serde_json::json!({
+            "id": "main",
+            "name": "Main",
+            "path": "/workspace",
+            "excludePaths": ["backend/artifacts/", "*.log"]
+        }))
+        .unwrap();
+        assert_eq!(
+            configured.exclude_paths,
+            vec!["backend/artifacts/", "*.log"]
+        );
+
+        let legacy: WorkspaceSettings = serde_json::from_value(serde_json::json!({
+            "defaultPath": "/workspace",
+            "allowedRoots": ["/"]
+        }))
+        .unwrap();
+        assert!(legacy.exclude_paths.is_empty());
     }
 }

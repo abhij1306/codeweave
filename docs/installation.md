@@ -67,7 +67,8 @@ Unix-style example:
   "workspace": {
     "defaultPath": "/home/user/projects/example",
     "allowedRoots": ["/home/user/projects"],
-    "artifactPaths": ["artifacts"]
+    "artifactPaths": ["artifacts"],
+    "excludePaths": ["**/__pycache__/", "**/.pytest_cache/", "**/.mypy_cache/", "**/.ruff_cache/", "*.log"]
   }
 }
 ```
@@ -79,10 +80,15 @@ Windows example:
   "workspace": {
     "defaultPath": "D:\\Development\\example",
     "allowedRoots": ["D:\\Development"],
-    "artifactPaths": ["artifacts"]
+    "artifactPaths": ["artifacts"],
+    "excludePaths": ["**/__pycache__/", "**/.pytest_cache/", "**/.mypy_cache/", "**/.ruff_cache/", "*.log"]
   }
 }
 ```
+
+`excludePaths` uses workspace-relative gitignore-style patterns and removes matching files from indexing, watcher reconciliation, and change summaries. Negated (`!`) reinclusion patterns are not supported. Add repository-specific generated paths such as `backend/artifacts/`, `.claude/`, `.serena/`, or `.verity/` only when agents do not need to search them.
+
+`artifactPaths` explicitly includes paths that normal Git ignore rules would omit, so a directory should not appear in both lists. Per-workspace entries under `workspaces` can override these lists; dynamically opened repositories inherit the values shown under `workspace`.
 
 Do not commit `config.json` or `.mcp-token`.
 

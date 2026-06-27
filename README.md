@@ -183,7 +183,8 @@ Detailed guides:
   "workspace": {
     "defaultPath": "/path/to/projects/example",
     "allowedRoots": ["/path/to/projects"],
-    "artifactPaths": ["artifacts"]
+    "artifactPaths": ["artifacts"],
+    "excludePaths": ["**/__pycache__/", "**/.pytest_cache/", "**/.mypy_cache/", "**/.ruff_cache/", "*.log"]
   },
   "skills": {
     "enabled": false,
@@ -213,6 +214,10 @@ Detailed guides:
   }
 }
 ```
+
+`workspace.excludePaths` accepts workspace-relative gitignore-style exclusion patterns. Excluded paths are omitted from indexing, filesystem-watcher reconciliation, and workspace change summaries. Add repository-specific generated directories such as `backend/artifacts/` when they do not contain source fixtures. Negated (`!`) reinclusion patterns are not supported.
+
+`workspace.artifactPaths` has the opposite purpose: it explicitly indexes configured paths even when normal Git ignore rules would skip them. Do not list the same directory in both settings. Configured entries under `workspaces` may define their own `artifactPaths` and `excludePaths`; dynamically opened repositories inherit the values under `workspace`.
 
 Task profiles can set `background: true` and `timeoutMs` for long builds, browser smoke tests, and acceptance suites. Direct `run` requests can override `background` and `timeout_ms`; task profile configuration uses `timeoutMs`. Profile `outputFilter` values are:
 

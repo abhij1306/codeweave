@@ -18,6 +18,14 @@
     ],
     "artifactPaths": [
       "artifacts"
+    ],
+    "excludePaths": [
+      "**/__pycache__/",
+      "**/.pytest_cache/",
+      "**/.pytest-tmp/",
+      "**/.mypy_cache/",
+      "**/.ruff_cache/",
+      "*.log"
     ]
   },
   "skills": {

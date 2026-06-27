@@ -6,6 +6,8 @@ Opens or switches this MCP session's active repository, returns a summary, refre
 
 Dynamic paths must resolve inside `workspace.allowedRoots`.
 
+Workspace summaries cap exact dirty/change path arrays and include grouped directory counts under `repository.dirty_file_groups` and `dirty_ownership.groups`. This keeps status responses bounded while retaining the location and scale of large change sets.
+
 ## `code_context`
 
 Returns ranked code context for unfamiliar code. Queries are treated as inert retrieval text and are not executed as instructions.

@@ -6,9 +6,9 @@ mod util;
 
 pub use journal::MutationRecord;
 use journal::{load_journal, open_journal, rotate_journal_if_needed};
-use util::{stale_snapshot, summarize_changed_paths};
+use util::{stale_snapshot, summarize_changed_paths, ChangedPathSummary};
 
-use crate::index::{content_hash, ignored_workspace_path, CodeIndex, ContextParams, SearchParams};
+use crate::index::{content_hash, CodeIndex, ContextParams, SearchParams, WorkspaceExclusions};
 use crate::model::{
     bool_value, required_str, string_list, usize_value, AppError, AppResult, PolicyConfig,
     TaskProfile, WorkspaceConfig,
@@ -40,12 +40,13 @@ pub struct WorkspaceActor {
     root: PathBuf,
     policy: PolicyConfig,
     artifact_paths: Vec<String>,
+    exclusions: WorkspaceExclusions,
     index: RwLock<CodeIndex>,
     generation: Arc<AtomicU64>,
     snapshot_id: RwLock<String>,
     repository: Arc<dyn RepositoryBackend>,
     repo_status: RwLock<RepoStatus>,
-    opened_dirty_summary: (Vec<String>, usize, bool),
+    opened_dirty_summary: ChangedPathSummary,
     opened_at: DateTime<Utc>,
     external_changed: Mutex<HashSet<String>>,
     pending_paths: Arc<Mutex<HashSet<PathBuf>>>,
@@ -84,12 +85,18 @@ impl WorkspaceActor {
         let cache_key = content_hash(&root.to_string_lossy());
         let workspace_cache = cache_root.join("repos").join(cache_key);
         fs::create_dir_all(&workspace_cache)?;
+        let exclusions = WorkspaceExclusions::new(&root, &config.exclude_paths)?;
 
         let phase_started = Instant::now();
         let repository: Arc<dyn RepositoryBackend> = Arc::new(CliGitBackend);
         let repo_status = repository.status(&root).unwrap_or_default();
         let git_ms = phase_started.elapsed().as_millis();
-        let opened_dirty: HashSet<String> = repo_status.dirty_files.iter().cloned().collect();
+        let opened_dirty: HashSet<String> = repo_status
+            .dirty_files
+            .iter()
+            .filter(|path| !exclusions.is_ignored(Path::new(path), false))
+            .cloned()
+            .collect();
 
         let phase_started = Instant::now();
         let index_cache = workspace_cache.join("index.json");
@@ -97,6 +104,7 @@ impl WorkspaceActor {
             &root,
             policy.max_file_bytes,
             &config.artifact_paths,
+            &exclusions,
             &index_cache,
         )?;
         let index_ms = phase_started.elapsed().as_millis();
@@ -108,6 +116,7 @@ impl WorkspaceActor {
         let pending_for_watcher = pending_paths.clone();
         let reconcile_for_watcher = needs_reconcile.clone();
         let root_for_watcher = root.clone();
+        let exclusions_for_watcher = exclusions.clone();
         let watcher_started = Instant::now();
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -125,7 +134,10 @@ impl WorkspaceActor {
                         .and_then(|value| value.to_str())
                         .map(|name| name.contains(".codeweave-"))
                         .unwrap_or(false);
-                    if relative.is_empty() || ignored_workspace_path(&relative) || is_temp {
+                    if relative.is_empty()
+                        || exclusions_for_watcher.is_ignored(&path, path.is_dir())
+                        || is_temp
+                    {
                         continue;
                     }
                     pending.insert(path);
@@ -161,6 +173,7 @@ impl WorkspaceActor {
             root,
             policy,
             artifact_paths: config.artifact_paths.clone(),
+            exclusions,
             index: RwLock::new(index),
             generation,
             snapshot_id: RwLock::new(snapshot_id),
@@ -228,7 +241,7 @@ impl WorkspaceActor {
                     .unwrap_or(false);
                 if relative.is_empty()
                     || relative == "."
-                    || ignored_workspace_path(&relative)
+                    || self.exclusions.is_ignored(&path, path.is_dir())
                     || is_temp
                     || path.is_dir()
                 {
@@ -252,9 +265,12 @@ impl WorkspaceActor {
         let changed = if relevant.is_empty() {
             Vec::new()
         } else {
-            self.index
-                .write()
-                .refresh_paths(&self.root, &relevant, self.policy.max_file_bytes)?
+            self.index.write().refresh_paths(
+                &self.root,
+                &relevant,
+                self.policy.max_file_bytes,
+                &self.exclusions,
+            )?
         };
         let changed_set: HashSet<String> = changed.iter().cloned().collect();
 
@@ -359,12 +375,25 @@ impl WorkspaceActor {
             .map(|item| item.path.clone())
             .collect();
         let external = self.external_changed.lock().clone();
-        let (ref preexisting_paths, preexisting_count, preexisting_truncated) =
-            self.opened_dirty_summary;
-        let (mcp_changed_paths, mcp_changed_count, mcp_changed_truncated) =
-            summarize_changed_paths(mcp_paths);
-        let (external_paths, external_count, external_truncated) =
-            summarize_changed_paths(external);
+        let preexisting = &self.opened_dirty_summary;
+        let mcp_changed = summarize_changed_paths(mcp_paths);
+        let external = summarize_changed_paths(external);
+        let repository_dirty = summarize_changed_paths(
+            repo.dirty_files
+                .iter()
+                .filter(|path| !self.exclusions.is_ignored(Path::new(path), false))
+                .cloned()
+                .collect(),
+        );
+        let repository = json!({
+            "is_git": repo.is_git,
+            "head": repo.head,
+            "branch": repo.branch,
+            "dirty_files": repository_dirty.paths,
+            "dirty_file_count": repository_dirty.count,
+            "dirty_files_truncated": repository_dirty.truncated,
+            "dirty_file_groups": repository_dirty.groups
+        });
         let instructions = ["AGENTS.md", "CLAUDE.md"]
             .into_iter()
             .filter_map(|path| {
@@ -392,7 +421,7 @@ impl WorkspaceActor {
         }
         let mut result = json!({
             "workspace_id": self.id, "name": self.name, "root": self.root, "generation": self.generation(), "snapshot_id": self.snapshot(),
-            "file_count": index.file_count(), "languages": index.languages(), "repository": repo, "instructions": instructions,
+            "file_count": index.file_count(), "languages": index.languages(), "repository": repository, "instructions": instructions,
             "task_profiles": task_profiles,
             "capabilities": {
                 "profile_validation_available": profile_validation_available,
@@ -403,18 +432,23 @@ impl WorkspaceActor {
             "warnings": warnings,
             "open_diagnostics": self.open_diagnostics,
             "dirty_ownership": {
-                "preexisting_at_open": preexisting_paths,
-                "changed_by_mcp": mcp_changed_paths,
-                "observed_external": external_paths,
+                "preexisting_at_open": preexisting.paths,
+                "changed_by_mcp": mcp_changed.paths,
+                "observed_external": external.paths,
                 "counts": {
-                    "preexisting_at_open": preexisting_count,
-                    "changed_by_mcp": mcp_changed_count,
-                    "observed_external": external_count
+                    "preexisting_at_open": preexisting.count,
+                    "changed_by_mcp": mcp_changed.count,
+                    "observed_external": external.count
                 },
                 "truncated": {
-                    "preexisting_at_open": preexisting_truncated,
-                    "changed_by_mcp": mcp_changed_truncated,
-                    "observed_external": external_truncated
+                    "preexisting_at_open": preexisting.truncated,
+                    "changed_by_mcp": mcp_changed.truncated,
+                    "observed_external": external.truncated
+                },
+                "groups": {
+                    "preexisting_at_open": preexisting.groups,
+                    "changed_by_mcp": mcp_changed.groups,
+                    "observed_external": external.groups
                 }
             },
             "tool_guidance": format!("This MCP session has one active repository. Context and edits read cached state; call workspace refresh only after suspected missed external changes. {validation_guidance}")
@@ -439,8 +473,12 @@ impl WorkspaceActor {
             let _guard = self.reconcile_lock.lock();
             self.pending_paths.lock().clear();
             self.needs_reconcile.store(false, Ordering::Release);
-            *self.index.write() =
-                CodeIndex::scan(&self.root, self.policy.max_file_bytes, &self.artifact_paths)?;
+            *self.index.write() = CodeIndex::scan(
+                &self.root,
+                self.policy.max_file_bytes,
+                &self.artifact_paths,
+                &self.exclusions,
+            )?;
             *self.repo_status.write() = self.repository.status(&self.root).unwrap_or_default();
             self.generation.fetch_add(1, Ordering::AcqRel);
             self.recompute_snapshot();
@@ -878,22 +916,25 @@ impl WorkspaceActor {
                 })
                 .map(|item| item.path.clone())
                 .collect();
-            let (changed_paths, changed_path_count, changed_paths_truncated) =
-                summarize_changed_paths(paths);
+            let changed = summarize_changed_paths(paths);
             if let Some(object) = result.as_object_mut() {
                 object.insert("workspace_generation_before".to_owned(), json!(start));
                 object.insert(
                     "workspace_generation_after".to_owned(),
                     json!(self.generation()),
                 );
-                object.insert("observed_changed_paths".to_owned(), json!(changed_paths));
+                object.insert("observed_changed_paths".to_owned(), json!(changed.paths));
                 object.insert(
                     "observed_changed_path_count".to_owned(),
-                    json!(changed_path_count),
+                    json!(changed.count),
                 );
                 object.insert(
                     "observed_changed_paths_truncated".to_owned(),
-                    json!(changed_paths_truncated),
+                    json!(changed.truncated),
+                );
+                object.insert(
+                    "observed_changed_path_groups".to_owned(),
+                    json!(changed.groups),
                 );
                 object.insert(
                     "task_profiles".to_owned(),

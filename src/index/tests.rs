@@ -50,9 +50,10 @@ fn warm_cache_reuses_persisted_indexed_terms() {
     let source = workspace.path().join("lib.rs");
     fs::write(&source, "pub fn warm_cache_symbol() {}\n").unwrap();
     let cache_file = cache_dir.path().join("index.json");
+    let exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
 
     let (first, first_hit) =
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &cache_file).unwrap();
+        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
     assert!(!first_hit);
     assert_eq!(
         first
@@ -68,7 +69,7 @@ fn warm_cache_reuses_persisted_indexed_terms() {
         .any(|term| term == "warm_cache_symbol"));
 
     let (second, second_hit) =
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &cache_file).unwrap();
+        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
     assert!(second_hit);
     assert_eq!(
         second
@@ -426,4 +427,76 @@ fn ignores_custom_cargo_target_directories() {
         "core/target-auditDQhH1o/CACHEDIR.TAG"
     ));
     assert!(!ignored_workspace_path("core/src/targeting.rs"));
+}
+
+#[test]
+fn configured_exclusions_apply_to_scans_and_incremental_refreshes() {
+    let workspace = tempfile::tempdir().unwrap();
+    fs::create_dir_all(workspace.path().join("backend/artifacts")).unwrap();
+    fs::create_dir_all(workspace.path().join("src")).unwrap();
+    fs::write(
+        workspace.path().join("backend/artifacts/result.json"),
+        "generated result",
+    )
+    .unwrap();
+    fs::write(workspace.path().join("debug.log"), "noisy log").unwrap();
+    fs::write(workspace.path().join("src/lib.rs"), "fn retained() {}\n").unwrap();
+    let exclusions = WorkspaceExclusions::new(
+        workspace.path(),
+        &["backend/artifacts/".to_owned(), "*.log".to_owned()],
+    )
+    .unwrap();
+
+    let mut index = CodeIndex::scan(workspace.path(), 2_000_000, &[], &exclusions).unwrap();
+
+    assert!(index.get("src/lib.rs").is_some());
+    assert!(index.get("backend/artifacts/result.json").is_none());
+    assert!(index.get("debug.log").is_none());
+
+    let generated = workspace.path().join("backend/artifacts/new.json");
+    fs::write(&generated, "new generated result").unwrap();
+    let changed = index
+        .refresh_paths(
+            workspace.path(),
+            &HashSet::from([generated]),
+            2_000_000,
+            &exclusions,
+        )
+        .unwrap();
+    assert!(changed.is_empty());
+    assert!(index.get("backend/artifacts/new.json").is_none());
+}
+
+#[test]
+fn changing_exclusions_invalidates_the_index_cache() {
+    let workspace = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_file = cache_dir.path().join("index.json");
+    fs::create_dir_all(workspace.path().join("generated")).unwrap();
+    fs::write(workspace.path().join("generated/value.txt"), "value").unwrap();
+    let no_exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
+    CodeIndex::scan_cached(
+        workspace.path(),
+        2_000_000,
+        &[],
+        &no_exclusions,
+        &cache_file,
+    )
+    .unwrap();
+    let exclusions =
+        WorkspaceExclusions::new(workspace.path(), &["generated/".to_owned()]).unwrap();
+
+    let (index, cache_hit) =
+        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+
+    assert!(!cache_hit);
+    assert!(index.get("generated/value.txt").is_none());
+}
+
+#[test]
+fn exclusion_patterns_reject_reinclusion_rules() {
+    let workspace = tempfile::tempdir().unwrap();
+    let error =
+        WorkspaceExclusions::new(workspace.path(), &["!generated/keep.rs".to_owned()]).unwrap_err();
+    assert_eq!(error.0.code, "INVALID_EXCLUDE_PATTERN");
 }

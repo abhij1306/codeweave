@@ -597,7 +597,12 @@ impl WorkspaceActor {
         let paths: HashSet<PathBuf> = plan.iter().map(|item| self.root.join(&item.path)).collect();
         self.index
             .write()
-            .refresh_paths(&self.root, &paths, self.policy.max_file_bytes)
+            .refresh_paths(
+                &self.root,
+                &paths,
+                self.policy.max_file_bytes,
+                &self.exclusions,
+            )
             .map_err(|error| {
                 self.failed_after_apply(
                     plan,
@@ -650,11 +655,12 @@ impl WorkspaceActor {
         let rollback_refresh_error = if paths.is_empty() {
             None
         } else {
-            match self
-                .index
-                .write()
-                .refresh_paths(&self.root, &paths, self.policy.max_file_bytes)
-            {
+            match self.index.write().refresh_paths(
+                &self.root,
+                &paths,
+                self.policy.max_file_bytes,
+                &self.exclusions,
+            ) {
                 Ok(_) => None,
                 Err(error) => {
                     self.pending_paths.lock().extend(paths);
@@ -801,9 +807,12 @@ impl WorkspaceActor {
             restore_one(&self.root, item)?;
         }
         let paths: HashSet<PathBuf> = plan.iter().map(|item| self.root.join(&item.path)).collect();
-        self.index
-            .write()
-            .refresh_paths(&self.root, &paths, self.policy.max_file_bytes)?;
+        self.index.write().refresh_paths(
+            &self.root,
+            &paths,
+            self.policy.max_file_bytes,
+            &self.exclusions,
+        )?;
         let generation = self.generation() + 1;
         let records: Vec<_> = plan
             .iter()

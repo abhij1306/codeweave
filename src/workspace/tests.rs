@@ -25,6 +25,10 @@ fn test_policy() -> PolicyConfig {
 }
 
 fn test_actor(root: &Path) -> Arc<WorkspaceActor> {
+    test_actor_with_exclusions(root, Vec::new())
+}
+
+fn test_actor_with_exclusions(root: &Path, exclude_paths: Vec<String>) -> Arc<WorkspaceActor> {
     let cache = tempdir().unwrap().keep();
     Arc::new(
         WorkspaceActor::open(
@@ -33,6 +37,7 @@ fn test_actor(root: &Path) -> Arc<WorkspaceActor> {
                 name: "Main".to_owned(),
                 path: root.to_string_lossy().into_owned(),
                 artifact_paths: Vec::new(),
+                exclude_paths,
             },
             test_policy(),
             HashMap::new(),
@@ -133,6 +138,48 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
     assert_eq!(context["result_count"], 1);
     assert!(context["phase_ms"]["index_context"].is_number());
     assert!(actor
+        .needs_reconcile
+        .load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn reconciliation_discards_configured_excluded_paths() {
+    let root = tempdir().unwrap();
+    fs::create_dir_all(root.path().join("backend/artifacts")).unwrap();
+    fs::write(root.path().join("source.rs"), "fn source() {}\n").unwrap();
+    fs::write(
+        root.path().join("backend/artifacts/existing.json"),
+        "existing",
+    )
+    .unwrap();
+    let actor = test_actor_with_exclusions(
+        root.path(),
+        vec!["backend/artifacts/".to_owned(), "*.log".to_owned()],
+    );
+    assert!(actor.index.read().get("source.rs").is_some());
+    assert!(actor
+        .index
+        .read()
+        .get("backend/artifacts/existing.json")
+        .is_none());
+    let generation = actor.generation();
+    let generated = root.path().join("backend/artifacts/new.json");
+    fs::write(&generated, "generated").unwrap();
+    actor.pending_paths.lock().insert(generated);
+    actor
+        .needs_reconcile
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let summary = actor.summary("test-session", false).unwrap();
+
+    assert_eq!(actor.generation(), generation);
+    assert_eq!(summary["dirty_ownership"]["counts"]["observed_external"], 0);
+    assert!(actor
+        .index
+        .read()
+        .get("backend/artifacts/new.json")
+        .is_none());
+    assert!(!actor
         .needs_reconcile
         .load(std::sync::atomic::Ordering::Acquire));
 }
@@ -596,8 +643,57 @@ fn changed_paths_are_filtered_and_capped() {
         .map(|index| format!("src/file_{index}.rs"))
         .collect();
     paths.insert("core/target-audit/release/app.exe".to_owned());
-    let (reported, total, truncated) = summarize_changed_paths(paths);
-    assert_eq!(reported.len(), MAX_OBSERVED_CHANGED_PATHS);
-    assert_eq!(total, 150);
-    assert!(truncated);
+    let summary = summarize_changed_paths(paths);
+    assert_eq!(summary.paths.len(), MAX_OBSERVED_CHANGED_PATHS);
+    assert_eq!(summary.count, 150);
+    assert!(summary.truncated);
+    assert_eq!(summary.groups.len(), 1);
+    assert_eq!(summary.groups[0].path, "src");
+    assert_eq!(summary.groups[0].count, 150);
+}
+
+#[test]
+fn workspace_summary_caps_and_groups_large_change_sets() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("value.rs"), "fn value() {}\n").unwrap();
+    let actor = test_actor(root.path());
+    actor.external_changed.lock().extend(
+        (0..45)
+            .map(|index| format!("backend/artifacts/result_{index}.json"))
+            .chain((0..5).map(|index| format!("src/feature_{index}.rs"))),
+    );
+    actor.repo_status.write().dirty_files = (0..50)
+        .map(|index| format!("backend/artifacts/result_{index}.json"))
+        .collect();
+
+    let summary = actor.summary("test-session", false).unwrap();
+
+    assert_eq!(
+        summary["dirty_ownership"]["observed_external"]
+            .as_array()
+            .unwrap()
+            .len(),
+        MAX_OBSERVED_CHANGED_PATHS
+    );
+    assert_eq!(
+        summary["dirty_ownership"]["counts"]["observed_external"],
+        50
+    );
+    assert_eq!(
+        summary["dirty_ownership"]["groups"]["observed_external"][0]["path"],
+        "backend/artifacts"
+    );
+    assert_eq!(
+        summary["dirty_ownership"]["groups"]["observed_external"][0]["count"],
+        45
+    );
+    assert_eq!(
+        summary["repository"]["dirty_files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        MAX_OBSERVED_CHANGED_PATHS
+    );
+    assert_eq!(summary["repository"]["dirty_file_count"], 50);
+    assert_eq!(summary["repository"]["dirty_files_truncated"], true);
 }

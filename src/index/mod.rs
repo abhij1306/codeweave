@@ -9,6 +9,7 @@ pub use lines::slice_lines;
 use crate::model::{AppError, AppResult};
 use crate::security::{relative_string, validate_relative};
 use crate::symbols::{extract_symbols, language_name, Symbol};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
 use lines::{excerpt_lines, fit_excerpt, hex, line_start_byte};
 use metadata::{
@@ -25,7 +26,91 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const INDEX_SCHEMA: &str = "codeweave-index-v4";
+const INDEX_SCHEMA: &str = "codeweave-index-v5";
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceExclusions {
+    normalized_root: String,
+    matcher: Gitignore,
+    patterns: Vec<String>,
+}
+
+impl WorkspaceExclusions {
+    pub fn new(root: &Path, patterns: &[String]) -> AppResult<Self> {
+        let mut builder = GitignoreBuilder::new(".");
+        for pattern in patterns {
+            let normalized = pattern.replace('\\', "/");
+            if normalized.trim().is_empty() || normalized.starts_with('!') {
+                return Err(AppError::details(
+                    "INVALID_EXCLUDE_PATTERN",
+                    "Workspace exclude patterns must be non-empty exclusions",
+                    json!({"pattern": pattern}),
+                ));
+            }
+            builder.add_line(None, &normalized).map_err(|error| {
+                AppError::details(
+                    "INVALID_EXCLUDE_PATTERN",
+                    error.to_string(),
+                    json!({"pattern": pattern}),
+                )
+            })?;
+        }
+        let matcher = builder.build().map_err(|error| {
+            AppError::details(
+                "INVALID_EXCLUDE_PATTERN",
+                error.to_string(),
+                json!({"patterns": patterns}),
+            )
+        })?;
+        Ok(Self {
+            normalized_root: normalized_absolute_path(root),
+            matcher,
+            patterns: patterns.to_vec(),
+        })
+    }
+
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        let Some(relative) = self.relative_path(path) else {
+            return false;
+        };
+        ignored_workspace_path(&relative)
+            || self
+                .matcher
+                .matched_path_or_any_parents(Path::new(&relative), is_dir)
+                .is_ignore()
+    }
+
+    fn relative_path(&self, path: &Path) -> Option<String> {
+        if !path.is_absolute() {
+            return Some(path.to_string_lossy().replace('\\', "/"));
+        }
+        let normalized = normalized_absolute_path(path);
+        let root_len = self.normalized_root.len();
+        if normalized.len() < root_len
+            || !normalized.as_bytes()[..root_len]
+                .eq_ignore_ascii_case(self.normalized_root.as_bytes())
+        {
+            return None;
+        }
+        let suffix = normalized.get(root_len..)?;
+        if !suffix.is_empty() && !suffix.starts_with('/') {
+            return None;
+        }
+        Some(suffix.trim_start_matches('/').to_owned())
+    }
+
+    fn patterns(&self) -> &[String] {
+        &self.patterns
+    }
+}
+
+fn normalized_absolute_path(path: &Path) -> String {
+    let mut normalized = path.to_string_lossy().replace('\\', "/");
+    if let Some(without_verbatim_prefix) = normalized.strip_prefix("//?/") {
+        normalized = without_verbatim_prefix.to_owned();
+    }
+    normalized.trim_end_matches('/').to_owned()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -97,6 +182,8 @@ struct CachedIndex {
     root: String,
     max_file_bytes: usize,
     artifact_paths: Vec<String>,
+    #[serde(default)]
+    exclude_paths: Vec<String>,
     files: Vec<FileEntry>,
 }
 
@@ -111,23 +198,37 @@ pub struct CodeIndex {
 }
 
 impl CodeIndex {
-    pub fn scan(root: &Path, max_file_bytes: usize, artifact_paths: &[String]) -> AppResult<Self> {
-        Self::scan_with_cache(root, max_file_bytes, artifact_paths, None).map(|(index, _)| index)
+    pub fn scan(
+        root: &Path,
+        max_file_bytes: usize,
+        artifact_paths: &[String],
+        exclusions: &WorkspaceExclusions,
+    ) -> AppResult<Self> {
+        Self::scan_with_cache(root, max_file_bytes, artifact_paths, exclusions, None)
+            .map(|(index, _)| index)
     }
 
     pub fn scan_cached(
         root: &Path,
         max_file_bytes: usize,
         artifact_paths: &[String],
+        exclusions: &WorkspaceExclusions,
         cache_file: &Path,
     ) -> AppResult<(Self, bool)> {
-        Self::scan_with_cache(root, max_file_bytes, artifact_paths, Some(cache_file))
+        Self::scan_with_cache(
+            root,
+            max_file_bytes,
+            artifact_paths,
+            exclusions,
+            Some(cache_file),
+        )
     }
 
     fn scan_with_cache(
         root: &Path,
         max_file_bytes: usize,
         artifact_paths: &[String],
+        exclusions: &WorkspaceExclusions,
         cache_file: Option<&Path>,
     ) -> AppResult<(Self, bool)> {
         let root_key = root.to_string_lossy().into_owned();
@@ -139,6 +240,7 @@ impl CodeIndex {
                     && cache.root == root_key
                     && cache.max_file_bytes == max_file_bytes
                     && cache.artifact_paths == artifact_paths
+                    && cache.exclude_paths == exclusions.patterns()
             });
         let cache_hit = cached.is_some();
         let cached_files: HashMap<String, FileEntry> = cached
@@ -154,7 +256,15 @@ impl CodeIndex {
             })
             .unwrap_or_default();
         let mut index = Self::default();
-        scan_directory(&mut index, root, root, max_file_bytes, true, &cached_files)?;
+        scan_directory(
+            &mut index,
+            root,
+            root,
+            max_file_bytes,
+            true,
+            exclusions,
+            &cached_files,
+        )?;
         for relative in artifact_paths {
             let relative = validate_relative(relative)?;
             let candidate = root.join(relative);
@@ -174,6 +284,7 @@ impl CodeIndex {
                 &resolved,
                 max_file_bytes,
                 false,
+                exclusions,
                 &cached_files,
             )?;
         }
@@ -186,6 +297,7 @@ impl CodeIndex {
                 root: root_key,
                 max_file_bytes,
                 artifact_paths: artifact_paths.to_vec(),
+                exclude_paths: exclusions.patterns().to_vec(),
                 files: index.files.values().cloned().collect(),
             };
             let temp = cache_file.with_extension("json.tmp");
@@ -338,6 +450,7 @@ impl CodeIndex {
         root: &Path,
         paths: &HashSet<PathBuf>,
         max_file_bytes: usize,
+        exclusions: &WorkspaceExclusions,
     ) -> AppResult<Vec<String>> {
         let mut changed = Vec::new();
         for absolute in paths {
@@ -359,7 +472,7 @@ impl CodeIndex {
                 }
                 continue;
             }
-            if excluded_path(absolute) {
+            if exclusions.is_ignored(absolute, false) || excluded_path(absolute) {
                 continue;
             }
             if let Some(entry) = read_entry(root, absolute, max_file_bytes, &HashMap::new())? {
@@ -1083,6 +1196,7 @@ fn scan_directory(
     scan_root: &Path,
     max_file_bytes: usize,
     respect_ignores: bool,
+    exclusions: &WorkspaceExclusions,
     cached_files: &HashMap<String, FileEntry>,
 ) -> AppResult<()> {
     let mut builder = WalkBuilder::new(scan_root);
@@ -1092,7 +1206,14 @@ fn scan_directory(
         .git_exclude(respect_ignores)
         .ignore(respect_ignores)
         .follow_links(false);
-    builder.filter_entry(|entry| !excluded_dir(entry.path()));
+    let scan_exclusions = exclusions.clone();
+    builder.filter_entry(move |entry| {
+        !excluded_dir(entry.path())
+            && !scan_exclusions.is_ignored(
+                entry.path(),
+                entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false),
+            )
+    });
     let paths: Vec<PathBuf> = builder
         .build()
         .filter_map(Result::ok)
@@ -1103,6 +1224,7 @@ fn scan_directory(
                 .map(|kind| kind.is_file())
                 .unwrap_or(false)
                 && !excluded_path(path)
+                && !exclusions.is_ignored(path, false)
         })
         .map(|entry| entry.into_path())
         .collect();
