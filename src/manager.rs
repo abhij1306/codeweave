@@ -38,9 +38,6 @@ impl SessionKey {
         self.0 == "stateless"
     }
 
-    fn is_http(&self) -> bool {
-        self.0.starts_with("http:")
-    }
 }
 
 impl Default for SessionKey {
@@ -464,9 +461,7 @@ impl WorkspaceManager {
         }
 
         let config = self.config()?;
-        if !session.is_http()
-            && (config.workspace.default_path.is_some() || config.workspaces.len() == 1)
-        {
+        if config.workspace.default_path.is_some() || config.workspaces.len() == 1 {
             self.workspace(session, &json!({"action": "open", "_summary_ids": true}))?;
             if let Some(actor) = self.active_actor_if_open(session) {
                 return Ok(actor);
@@ -1013,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn unbound_http_session_stays_unbound_after_another_session_opens() {
+    fn unbound_http_session_uses_default_after_another_session_opens() {
         let root = tempdir().unwrap();
         let default_workspace = root.path().join("crawlerai");
         let explicit_workspace = root.path().join("codeweave");
@@ -1049,8 +1044,7 @@ mod tests {
         let auto_session = SessionKey::new("http:auto-opened");
         let explicit_session = SessionKey::new("http:explicit-open");
 
-        let error = manager.active_actor(&auto_session).err().unwrap();
-        assert_eq!(error.0.code, "WORKSPACE_NOT_OPEN");
+        assert_eq!(manager.active_actor(&auto_session).unwrap().root_path(), std::fs::canonicalize(&default_workspace).unwrap());
         manager
             .workspace(
                 &explicit_session,
@@ -1058,8 +1052,7 @@ mod tests {
             )
             .unwrap();
 
-        let error = manager.active_actor(&auto_session).err().unwrap();
-        assert_eq!(error.0.code, "WORKSPACE_NOT_OPEN");
+        assert_eq!(manager.active_actor(&auto_session).unwrap().root_path(), std::fs::canonicalize(&default_workspace).unwrap());
         assert_eq!(
             manager.active_actor(&explicit_session).unwrap().root_path(),
             std::fs::canonicalize(&explicit_workspace).unwrap()
