@@ -145,6 +145,23 @@ pub(super) fn build_indexed_terms(
     for symbol in symbols {
         terms.extend(query_terms(&symbol.name));
     }
+    let compound_parts: Vec<_> = terms
+        .iter()
+        .flat_map(|term| {
+            let separated: String = term
+                .chars()
+                .map(|ch| {
+                    if matches!(ch, '_' | '.' | '-') {
+                        ' '
+                    } else {
+                        ch
+                    }
+                })
+                .collect();
+            query_terms(&separated)
+        })
+        .collect();
+    terms.extend(compound_parts);
     terms.sort();
     terms.dedup();
     terms

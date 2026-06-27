@@ -46,6 +46,17 @@ fn hashes_are_stable() {
 }
 
 #[test]
+fn tokenless_query_and_token_miss_have_no_full_corpus_fallback() {
+    let mut index = CodeIndex::default();
+    index.insert_entry(test_entry("lib.rs", "pub fn indexed_symbol() {}\n"));
+
+    assert!(index.candidate_files(&[]).is_empty());
+    assert!(index
+        .candidate_files(&["definitely_missing_token".to_owned()])
+        .is_empty());
+}
+
+#[test]
 fn warm_cache_reuses_persisted_indexed_terms() {
     let workspace = tempfile::tempdir().unwrap();
     let cache_dir = tempfile::tempdir().unwrap();

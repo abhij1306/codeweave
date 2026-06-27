@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const INDEX_SCHEMA: &str = "codeweave-index-v5";
+const INDEX_SCHEMA: &str = "codeweave-index-v6";
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceExclusions {
@@ -405,7 +405,7 @@ impl CodeIndex {
 
     fn candidate_files<'a>(&'a self, terms: &[String]) -> Vec<&'a FileEntry> {
         if terms.is_empty() {
-            return self.files.values().collect();
+            return Vec::new();
         }
         let mut paths = HashSet::new();
         for term in terms {
@@ -413,14 +413,10 @@ impl CodeIndex {
                 paths.extend(matches.iter().cloned());
             }
         }
-        if paths.is_empty() {
-            self.files.values().collect()
-        } else {
-            paths
-                .iter()
-                .filter_map(|path| self.files.get(path))
-                .collect()
-        }
+        paths
+            .iter()
+            .filter_map(|path| self.files.get(path))
+            .collect()
     }
 
     pub fn file_count(&self) -> usize {
@@ -1076,14 +1072,10 @@ impl CodeIndex {
                 paths.extend(matches.iter().cloned());
             }
         }
-        let mut files: Vec<_> = if paths.is_empty() {
-            self.files.values().collect()
-        } else {
-            paths
-                .iter()
-                .filter_map(|path| self.files.get(path))
-                .collect()
-        };
+        let mut files: Vec<_> = paths
+            .iter()
+            .filter_map(|path| self.files.get(path))
+            .collect();
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let per_file_limit = max_results.clamp(1, 3);
         let mut groups: Vec<VecDeque<serde_json::Value>> = Vec::new();

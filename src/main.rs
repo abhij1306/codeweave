@@ -314,6 +314,26 @@ fn tools() -> Value {
         }
       },
       {
+        "name":"code_replace_range",
+        "title":"Replace Fetched Range in One File",
+        "description":"Replace the complete line range selected by a code_fetch handle in exactly one file.",
+        "annotations":write.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "path":{"type":"string"},
+            "handle":{"type":"string"},
+            "new_text":{"type":"string"},
+            "validate":{"type":"array","items":{"type":"string"}},
+            "rollback_on_failure":{"type":"boolean"}
+          },
+          "required":["path","handle","new_text"],
+          "additionalProperties":false,
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
         "name":"code_insert",
         "title":"Insert Text in One File",
         "description":"Insert text before, after, or inside one named symbol in exactly one file.",
@@ -502,7 +522,12 @@ fn split_command_line(input: &str) -> std::result::Result<Vec<String>, model::Ap
 fn is_code_mutation(method: &str) -> bool {
     matches!(
         method,
-        "code_write" | "code_replace" | "code_insert" | "code_delete" | "code_rename"
+        "code_write"
+            | "code_replace"
+            | "code_replace_range"
+            | "code_insert"
+            | "code_delete"
+            | "code_rename"
     )
 }
 
@@ -520,6 +545,7 @@ fn normalize_code_mutation(method: &str, params: &mut Map<String, Value>) {
                 "handle",
             ],
         ),
+        "code_replace_range" => ("replace_range", &["path", "handle", "new_text"]),
         "code_insert" => (
             "insert",
             &[
@@ -779,7 +805,7 @@ mod tests {
     fn public_tool_schemas_are_hosted_client_compatible() {
         let all = tools();
         let items = all.as_array().expect("tools array");
-        assert_eq!(items.len(), 14);
+        assert_eq!(items.len(), 15);
         for name in [
             "workspace",
             "code_context",
@@ -790,6 +816,7 @@ mod tests {
             "code_transaction",
             "code_write",
             "code_replace",
+            "code_replace_range",
             "code_insert",
             "code_delete",
             "code_rename",
@@ -841,6 +868,10 @@ mod tests {
         assert_eq!(
             tool(&all, "code_replace")["inputSchema"]["required"],
             json!(["path", "old_text", "new_text"])
+        );
+        assert_eq!(
+            tool(&all, "code_replace_range")["inputSchema"]["required"],
+            json!(["path", "handle", "new_text"])
         );
         assert_eq!(
             tool(&all, "code_insert")["inputSchema"]["required"],
@@ -922,6 +953,21 @@ mod tests {
         assert_eq!(replace["changes"][0]["kind"], "replace");
         assert_eq!(replace["changes"][0]["path"], "src/main.rs");
         assert!(replace.get("old_text").is_none());
+
+        let replace_range = prepare(
+            &manager,
+            &config,
+            "code_replace_range",
+            json!({
+                "path": "src/main.rs",
+                "handle": "range_handle",
+                "new_text": "replacement"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replace_range["changes"][0]["kind"], "replace_range");
+        assert_eq!(replace_range["changes"][0]["handle"], "range_handle");
 
         let run = prepare(&manager, &config, "run", json!({"command": "cargo test"}))
             .await

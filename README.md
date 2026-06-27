@@ -250,6 +250,7 @@ Never commit `config.json`, `.mcp-token`, tunnel credentials, generated caches, 
 | `code_transaction` | Apply a multi-file edit transaction with preconditions, validation, diff output, and rollback |
 | `code_write` | Create or overwrite exactly one file |
 | `code_replace` | Replace exact text in exactly one file |
+| `code_replace_range` | Replace the complete line range selected by a fetch handle |
 | `code_insert` | Insert text relative to a named symbol in one file |
 | `code_delete` | Delete exactly one file |
 | `code_rename` | Rename exactly one file |

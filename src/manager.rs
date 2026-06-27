@@ -4,7 +4,7 @@ use crate::workspace::WorkspaceActor;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
@@ -53,8 +53,6 @@ impl Default for SessionKey {
 pub struct WorkspaceManager {
     config: RwLock<Option<DaemonConfig>>,
     sessions: RwLock<HashMap<SessionKey, String>>,
-    explicit_sessions: RwLock<HashSet<SessionKey>>,
-    latest_explicit_workspace: RwLock<Option<String>>,
     actors: RwLock<HashMap<String, Arc<WorkspaceActor>>>,
     actor_lru: Mutex<VecDeque<String>>,
     open_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -122,7 +120,6 @@ impl WorkspaceManager {
 
     pub fn close_session(&self, session: &SessionKey) {
         self.sessions.write().remove(session);
-        self.explicit_sessions.write().remove(session);
         self.evict_idle_actors();
     }
 
@@ -169,8 +166,8 @@ impl WorkspaceManager {
                 let actor = self.active_actor(session)?;
                 run_blocking(move || actor.code_capabilities()).await
             }
-            "code_write" | "code_replace" | "code_insert" | "code_delete" | "code_rename"
-            | "code_preview" | "code_transaction" => {
+            "code_write" | "code_replace" | "code_replace_range" | "code_insert"
+            | "code_delete" | "code_rename" | "code_preview" | "code_transaction" => {
                 let actor = self.active_actor(session)?;
                 let mut prepared = params.clone();
                 if prepared.get("snapshot_id").is_none() {
@@ -243,8 +240,6 @@ impl WorkspaceManager {
         let _lifecycle = self.lifecycle.lock();
         *self.config.write() = Some(config.clone());
         self.sessions.write().clear();
-        self.explicit_sessions.write().clear();
-        *self.latest_explicit_workspace.write() = None;
         self.actors.write().clear();
         self.actor_lru.lock().clear();
         self.open_locks.lock().clear();
@@ -341,7 +336,6 @@ impl WorkspaceManager {
         let started = Instant::now();
         let config = self.config()?;
         let requested_path = params.get("path").and_then(Value::as_str);
-        let explicit_open = requested_path.is_some();
         let workspace = if let Some(path) = requested_path {
             self.workspace_for_path(&config, path)?
         } else if let Some(path) = config.workspace.default_path.as_deref() {
@@ -359,7 +353,7 @@ impl WorkspaceManager {
         let canonical_workspace = self.canonicalize_workspace(&config, &workspace)?;
         if let Some(actor) = self.active_actor_if_open(session) {
             if actor.root_path() == Path::new(&canonical_workspace.path) {
-                self.record_session_binding(session, &canonical_workspace.path, explicit_open);
+                self.record_session_binding(session, &canonical_workspace.path);
                 let mut summary = summarize(&actor)?;
                 add_elapsed(&mut summary, started.elapsed().as_millis(), true);
                 add_phase_metrics(
@@ -413,7 +407,7 @@ impl WorkspaceManager {
         };
         self.release_workspace_open_lock(&key, &open_lock);
         let actor = actor_result?;
-        self.record_session_binding(session, &key, explicit_open);
+        self.record_session_binding(session, &key);
         self.touch_actor(&key);
         self.evict_idle_actors();
         let mut summary = summarize(&actor)?;
@@ -449,9 +443,6 @@ impl WorkspaceManager {
 
     fn active_actor_if_open(&self, session: &SessionKey) -> Option<Arc<WorkspaceActor>> {
         let key = self.sessions.read().get(session).cloned()?;
-        if let Some(actor) = self.explicit_workspace_fallback_actor(session, &key) {
-            return Some(actor);
-        }
         let actor = self.actors.read().get(&key).cloned();
         if actor.is_some() {
             self.touch_actor(&key);
@@ -461,36 +452,10 @@ impl WorkspaceManager {
         actor
     }
 
-    fn explicit_workspace_fallback_actor(
-        &self,
-        session: &SessionKey,
-        current_key: &str,
-    ) -> Option<Arc<WorkspaceActor>> {
-        if !session.is_http() || self.explicit_sessions.read().contains(session) {
-            return None;
-        }
-        let fallback = self.latest_explicit_workspace.read().clone()?;
-        if fallback == current_key {
-            return None;
-        }
-        let actor = self.actors.read().get(&fallback).cloned()?;
-        self.sessions
-            .write()
-            .insert(session.clone(), fallback.clone());
-        self.touch_actor(&fallback);
-        Some(actor)
-    }
-
-    fn record_session_binding(&self, session: &SessionKey, key: &str, explicit: bool) {
+    fn record_session_binding(&self, session: &SessionKey, key: &str) {
         self.sessions
             .write()
             .insert(session.clone(), key.to_owned());
-        if explicit {
-            self.explicit_sessions.write().insert(session.clone());
-            *self.latest_explicit_workspace.write() = Some(key.to_owned());
-        } else {
-            self.explicit_sessions.write().remove(session);
-        }
     }
 
     fn active_actor(&self, session: &SessionKey) -> AppResult<Arc<WorkspaceActor>> {
@@ -499,7 +464,9 @@ impl WorkspaceManager {
         }
 
         let config = self.config()?;
-        if config.workspace.default_path.is_some() || config.workspaces.len() == 1 {
+        if !session.is_http()
+            && (config.workspace.default_path.is_some() || config.workspaces.len() == 1)
+        {
             self.workspace(session, &json!({"action": "open", "_summary_ids": true}))?;
             if let Some(actor) = self.active_actor_if_open(session) {
                 return Ok(actor);
@@ -1046,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn non_explicit_http_session_follows_latest_explicit_workspace_open() {
+    fn unbound_http_session_stays_unbound_after_another_session_opens() {
         let root = tempdir().unwrap();
         let default_workspace = root.path().join("crawlerai");
         let explicit_workspace = root.path().join("codeweave");
@@ -1082,10 +1049,8 @@ mod tests {
         let auto_session = SessionKey::new("http:auto-opened");
         let explicit_session = SessionKey::new("http:explicit-open");
 
-        assert_eq!(
-            manager.active_actor(&auto_session).unwrap().root_path(),
-            std::fs::canonicalize(&default_workspace).unwrap()
-        );
+        let error = manager.active_actor(&auto_session).err().unwrap();
+        assert_eq!(error.0.code, "WORKSPACE_NOT_OPEN");
         manager
             .workspace(
                 &explicit_session,
@@ -1093,10 +1058,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            manager.active_actor(&auto_session).unwrap().root_path(),
-            std::fs::canonicalize(&explicit_workspace).unwrap()
-        );
+        let error = manager.active_actor(&auto_session).err().unwrap();
+        assert_eq!(error.0.code, "WORKSPACE_NOT_OPEN");
         assert_eq!(
             manager.active_actor(&explicit_session).unwrap().root_path(),
             std::fs::canonicalize(&explicit_workspace).unwrap()

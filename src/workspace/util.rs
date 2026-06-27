@@ -37,6 +37,34 @@ pub(super) fn line_offset(content: &str, line: usize) -> usize {
     content.len()
 }
 
+pub(super) fn line_ending_label(content: &str) -> &'static str {
+    let crlf = content.matches("\r\n").count();
+    let lf = content.bytes().filter(|byte| *byte == b'\n').count() - crlf;
+    let cr = content.bytes().filter(|byte| *byte == b'\r').count() - crlf;
+    match (crlf, lf, cr) {
+        (0, 0, 0) => "none",
+        (_, 0, 0) if crlf > 0 => "crlf",
+        (0, _, 0) if lf > 0 => "lf",
+        (0, 0, _) if cr > 0 => "cr",
+        _ => "mixed",
+    }
+}
+
+pub(super) fn normalize_line_endings_for_content(content: &str, text: &str) -> String {
+    match line_ending_label(content) {
+        "crlf" => normalize_line_endings(text, "\r\n"),
+        "lf" => normalize_line_endings(text, "\n"),
+        "cr" => normalize_line_endings(text, "\r"),
+        _ => text.to_owned(),
+    }
+}
+
+fn normalize_line_endings(text: &str, replacement: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', replacement)
+}
+
 pub(super) fn stale_snapshot(expected: &str, actual: &str) -> AppError {
     stale_snapshot_for_paths(expected, actual, &[])
 }

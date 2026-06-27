@@ -89,6 +89,103 @@ fn fetch_accepts_direct_path_parameters() {
     assert_eq!(result["truncated"], false);
 }
 
+#[tokio::test]
+async fn fetched_windows_text_can_be_previewed_and_applied_exactly() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("windows.txt");
+    fs::write(&path, b"before\r\nold value\r\nafter\r\n").unwrap();
+    let actor = test_actor(root.path());
+
+    let fetched = actor
+        .code_fetch(&json!({
+            "path": "windows.txt",
+            "start_line": 1,
+            "end_line": 2,
+            "max_chars": 5_000
+        }))
+        .unwrap();
+    let result = &fetched["results"][0];
+    assert_eq!(result["content"], "before\nold value");
+    assert_eq!(result["line_ending"], "crlf");
+    let handle = result["handle"].as_str().unwrap();
+    let changes = json!([{
+        "kind": "replace",
+        "path": "windows.txt",
+        "handle": handle,
+        "old_text": result["content"],
+        "new_text": "before\nnew value"
+    }]);
+
+    let preview = actor
+        .code_edit(
+            "test-session",
+            &json!({"preview": true, "changes": changes.clone()}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["preview"], true);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"before\r\nold value\r\nafter\r\n"
+    );
+
+    let applied = actor
+        .code_edit("test-session", &json!({"changes": changes}))
+        .await
+        .unwrap();
+    assert_eq!(applied["applied"], true);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"before\r\nnew value\r\nafter\r\n"
+    );
+}
+
+#[tokio::test]
+async fn handle_range_replace_preserves_windows_line_endings() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("windows.txt");
+    fs::write(&path, b"first\r\nsecond\r\nthird\r\n").unwrap();
+    let actor = test_actor(root.path());
+
+    let fetched = actor
+        .code_fetch(&json!({
+            "path": "windows.txt",
+            "start_line": 2,
+            "end_line": 2,
+            "max_chars": 5_000
+        }))
+        .unwrap();
+    let result = &fetched["results"][0];
+    assert_eq!(result["content"], "second");
+    assert_eq!(result["line_ending"], "crlf");
+    let handle = result["handle"].as_str().unwrap();
+    let changes = json!([{
+        "kind": "replace_range",
+        "path": "windows.txt",
+        "handle": handle,
+        "new_text": "updated\ncontinued\n"
+    }]);
+
+    let preview = actor
+        .code_edit(
+            "test-session",
+            &json!({"preview": true, "changes": changes.clone()}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["preview"], true);
+    assert_eq!(fs::read(&path).unwrap(), b"first\r\nsecond\r\nthird\r\n");
+
+    actor
+        .code_edit("test-session", &json!({"changes": changes}))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"first\r\nupdated\r\ncontinued\r\nthird\r\n"
+    );
+}
+
 #[test]
 fn outline_accepts_multiple_paths_and_reports_partial_errors() {
     let root = tempdir().unwrap();
@@ -196,6 +293,10 @@ fn code_capabilities_reports_public_contracts() {
         .iter()
         .any(|kind| kind == "metadata"));
     assert_eq!(capabilities["editing"]["supports_transaction"], true);
+    assert_eq!(
+        capabilities["editing"]["supports_handle_range_replace"],
+        true
+    );
 }
 
 #[test]

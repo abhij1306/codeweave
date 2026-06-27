@@ -4,7 +4,7 @@ use super::journal::{
 };
 use super::util::{
     changes_without_independent_preconditions, line_offset, line_range_bytes,
-    stale_snapshot_for_paths,
+    normalize_line_endings_for_content, stale_snapshot_for_paths,
 };
 use super::WorkspaceActor;
 use crate::index::{content_hash, decode_handle, CodeIndex};
@@ -266,12 +266,14 @@ impl WorkspaceActor {
     fn preflight_overlaps(&self, changes: &[Value], index: &CodeIndex) -> AppResult<()> {
         let mut ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
         for change in changes {
-            if change.get("kind").and_then(Value::as_str) != Some("replace") {
+            let kind = change
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !matches!(kind, "replace" | "replace_range") {
                 continue;
             }
             let path = required_str(change, "path")?.replace('\\', "/");
-            let old = required_str(change, "old_text")?;
-            let expected = usize_value(change, "expected_replacements", 1);
             let content = &index
                 .get(&path)
                 .ok_or_else(|| {
@@ -282,10 +284,12 @@ impl WorkspaceActor {
                     )
                 })?
                 .content;
-            let (base_offset, selected) = if let Some(encoded) =
-                change.get("handle").and_then(Value::as_str)
-            {
-                let handle = decode_handle(encoded)?;
+            let handle = change
+                .get("handle")
+                .and_then(Value::as_str)
+                .map(decode_handle)
+                .transpose()?;
+            let (base_offset, selected) = if let Some(handle) = &handle {
                 if handle.workspace_id != self.id || handle.path != path {
                     return Err(AppError::new(
                         "INVALID_HANDLE",
@@ -297,20 +301,33 @@ impl WorkspaceActor {
             } else {
                 (0, content.as_str())
             };
-            let found: Vec<_> = selected
-                .match_indices(old)
-                .map(|(start, text)| {
-                    let start = base_offset + start;
-                    (start, start + text.len())
-                })
-                .collect();
-            if found.len() != expected {
-                return Err(AppError::details(
-                    "EXACT_MATCH_COUNT",
-                    "Exact replacement count did not match",
-                    json!({"path": path, "expected": expected, "actual": found.len()}),
-                ));
-            }
+            let found: Vec<_> = if kind == "replace_range" {
+                if handle.is_none() {
+                    return Err(AppError::new(
+                        "MISSING_HANDLE",
+                        "replace_range requires a fetch handle",
+                    ));
+                }
+                vec![(base_offset, base_offset + selected.len())]
+            } else {
+                let old = required_str(change, "old_text")?;
+                let expected = usize_value(change, "expected_replacements", 1);
+                let (old, actual) = matching_old_text(content, selected, old, expected);
+                if actual != expected {
+                    return Err(AppError::details(
+                        "EXACT_MATCH_COUNT",
+                        "Exact replacement count did not match",
+                        json!({"path": path, "expected": expected, "actual": actual}),
+                    ));
+                }
+                selected
+                    .match_indices(old.as_str())
+                    .map(|(start, text)| {
+                        let start = base_offset + start;
+                        (start, start + text.len())
+                    })
+                    .collect()
+            };
             let existing = ranges.entry(path.clone()).or_default();
             for range in found {
                 if existing
@@ -386,7 +403,7 @@ impl WorkspaceActor {
         match kind {
             "replace" => {
                 let old = required_str(change, "old_text")?;
-                let new = change
+                let new_input = change
                     .get("new_text")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
@@ -398,11 +415,12 @@ impl WorkspaceActor {
                         json!({"path": path}),
                     )
                 })?;
+                let new = normalize_line_endings_for_content(&current, new_input);
                 let after = if let Some(handle) = &edit_handle {
                     let (start, end) =
                         line_range_bytes(&current, handle.start_line, handle.end_line)?;
                     let selected = &current[start..end];
-                    let count = selected.match_indices(old).count();
+                    let (old, count) = matching_old_text(&current, selected, old, expected);
                     if count != expected {
                         return Err(AppError::details(
                             "EXACT_MATCH_COUNT",
@@ -411,10 +429,13 @@ impl WorkspaceActor {
                         ));
                     }
                     let mut value = current.clone();
-                    value.replace_range(start..end, &selected.replacen(old, new, expected));
+                    value.replace_range(
+                        start..end,
+                        &selected.replacen(old.as_str(), &new, expected),
+                    );
                     value
                 } else {
-                    let count = current.match_indices(old).count();
+                    let (old, count) = matching_old_text(&current, &current, old, expected);
                     if count != expected {
                         return Err(AppError::details(
                             "EXACT_MATCH_COUNT",
@@ -422,16 +443,38 @@ impl WorkspaceActor {
                             json!({"path": path, "expected": expected, "actual": count}),
                         ));
                     }
-                    current.replacen(old, new, expected)
+                    current.replacen(old.as_str(), &new, expected)
                 };
+                put_plan(plan, path, Some(current), Some(after));
+            }
+            "replace_range" => {
+                let handle = edit_handle.as_ref().ok_or_else(|| {
+                    AppError::new("MISSING_HANDLE", "replace_range requires a fetch handle")
+                })?;
+                let new_input = change
+                    .get("new_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let current = before.ok_or_else(|| {
+                    AppError::details(
+                        "PATH_NOT_FOUND",
+                        "Replace path does not exist",
+                        json!({"path": path}),
+                    )
+                })?;
+                let new = normalize_line_endings_for_content(&current, new_input);
+                let (start, end) = line_range_bytes(&current, handle.start_line, handle.end_line)?;
+                let mut after = current.clone();
+                after.replace_range(start..end, &new);
                 put_plan(plan, path, Some(current), Some(after));
             }
             "insert" => {
                 let symbol_name = required_str(change, "anchor_symbol")?;
                 let position = required_str(change, "position")?;
-                let insert = required_str(change, "content")?;
+                let insert_input = required_str(change, "content")?;
                 let current = before
                     .ok_or_else(|| AppError::new("PATH_NOT_FOUND", "Insert path does not exist"))?;
+                let insert = normalize_line_endings_for_content(&current, insert_input);
                 let absolute = self.root.join(&path);
                 let symbol = extract_symbols(&absolute, &current)
                     .into_iter()
@@ -454,11 +497,11 @@ impl WorkspaceActor {
                     },
                 );
                 let mut after = current.clone();
-                after.insert_str(offset, insert);
+                after.insert_str(offset, &insert);
                 put_plan(plan, path, Some(current), Some(after));
             }
             "create" => {
-                let content = change
+                let content_input = change
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
@@ -471,6 +514,10 @@ impl WorkspaceActor {
                         json!({"path": path}),
                     ));
                 }
+                let content = before
+                    .as_ref()
+                    .map(|current| normalize_line_endings_for_content(current, &content_input))
+                    .unwrap_or(content_input);
                 put_plan(plan, path, before, Some(content));
             }
             "delete" => {
@@ -860,4 +907,17 @@ fn put_plan(
             },
         );
     }
+}
+
+fn matching_old_text(content: &str, selected: &str, old: &str, expected: usize) -> (String, usize) {
+    let count = selected.match_indices(old).count();
+    if count == expected {
+        return (old.to_owned(), count);
+    }
+    let normalized = normalize_line_endings_for_content(content, old);
+    if normalized != old {
+        let normalized_count = selected.match_indices(&normalized).count();
+        return (normalized, normalized_count);
+    }
+    (old.to_owned(), count)
 }

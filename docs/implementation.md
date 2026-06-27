@@ -36,6 +36,7 @@ CodeWeave exposes narrow write tools:
 
 - `code_write` for one whole-file write;
 - `code_replace` for one exact replacement;
+- `code_replace_range` for replacing the complete line range selected by a fetch handle;
 - `code_insert` for one symbol-relative insertion;
 - `code_delete` for one deletion;
 - `code_rename` for one rename.

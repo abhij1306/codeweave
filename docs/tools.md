@@ -69,6 +69,18 @@ Replaces exact text in exactly one file:
 }
 ```
 
+### `code_replace_range`
+
+Replaces the complete line range selected by a `code_fetch` handle while preserving the target file's line endings:
+
+```json
+{
+  "path": "src/example.rs",
+  "handle": "<fetch handle>",
+  "new_text": "pub fn replacement() {}\n"
+}
+```
+
 ### `code_insert`
 
 Inserts content before, after, or inside one named symbol.

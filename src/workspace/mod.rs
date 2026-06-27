@@ -413,6 +413,7 @@ impl WorkspaceActor {
                 "supports_preview": true,
                 "supports_transaction": true,
                 "supports_single_file_wrappers": true,
+                "supports_handle_range_replace": true,
                 "supports_validation_profiles": !self.tasks.profile_names().is_empty(),
                 "supports_rollback_on_failure": true
             },

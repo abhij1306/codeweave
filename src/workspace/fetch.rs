@@ -1,4 +1,4 @@
-use super::util::stale_snapshot;
+use super::util::{line_ending_label, stale_snapshot};
 use super::WorkspaceActor;
 use crate::index::{decode_handle, encode_handle, slice_lines, FileEntry, RangeHandle};
 use crate::model::{bool_value, required_str, usize_value, AppError, AppResult};
@@ -376,6 +376,7 @@ impl WorkspaceActor {
         let base = json!({
             "path": file.path,
             "hash": file.hash,
+            "line_ending": line_ending_label(&file.content),
             "start_line": start_line,
             "end_line": end_line,
             "handle": handle
@@ -416,6 +417,7 @@ fn compact_fetch_result(result: &Value) -> Value {
         "path",
         "hash",
         "content",
+        "line_ending",
         "task_id",
         "status",
         "exit_code",
