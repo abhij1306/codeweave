@@ -4,7 +4,7 @@ use crate::workspace::WorkspaceActor;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
@@ -37,6 +37,10 @@ impl SessionKey {
     pub fn is_stateless(&self) -> bool {
         self.0 == "stateless"
     }
+
+    fn is_http(&self) -> bool {
+        self.0.starts_with("http:")
+    }
 }
 
 impl Default for SessionKey {
@@ -49,6 +53,8 @@ impl Default for SessionKey {
 pub struct WorkspaceManager {
     config: RwLock<Option<DaemonConfig>>,
     sessions: RwLock<HashMap<SessionKey, String>>,
+    explicit_sessions: RwLock<HashSet<SessionKey>>,
+    latest_explicit_workspace: RwLock<Option<String>>,
     actors: RwLock<HashMap<String, Arc<WorkspaceActor>>>,
     actor_lru: Mutex<VecDeque<String>>,
     open_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -116,6 +122,7 @@ impl WorkspaceManager {
 
     pub fn close_session(&self, session: &SessionKey) {
         self.sessions.write().remove(session);
+        self.explicit_sessions.write().remove(session);
         self.evict_idle_actors();
     }
 
@@ -236,6 +243,8 @@ impl WorkspaceManager {
         let _lifecycle = self.lifecycle.lock();
         *self.config.write() = Some(config.clone());
         self.sessions.write().clear();
+        self.explicit_sessions.write().clear();
+        *self.latest_explicit_workspace.write() = None;
         self.actors.write().clear();
         self.actor_lru.lock().clear();
         self.open_locks.lock().clear();
@@ -332,6 +341,7 @@ impl WorkspaceManager {
         let started = Instant::now();
         let config = self.config()?;
         let requested_path = params.get("path").and_then(Value::as_str);
+        let explicit_open = requested_path.is_some();
         let workspace = if let Some(path) = requested_path {
             self.workspace_for_path(&config, path)?
         } else if let Some(path) = config.workspace.default_path.as_deref() {
@@ -349,6 +359,7 @@ impl WorkspaceManager {
         let canonical_workspace = self.canonicalize_workspace(&config, &workspace)?;
         if let Some(actor) = self.active_actor_if_open(session) {
             if actor.root_path() == Path::new(&canonical_workspace.path) {
+                self.record_session_binding(session, &canonical_workspace.path, explicit_open);
                 let mut summary = summarize(&actor)?;
                 add_elapsed(&mut summary, started.elapsed().as_millis(), true);
                 add_phase_metrics(
@@ -402,7 +413,7 @@ impl WorkspaceManager {
         };
         self.release_workspace_open_lock(&key, &open_lock);
         let actor = actor_result?;
-        self.sessions.write().insert(session.clone(), key.clone());
+        self.record_session_binding(session, &key, explicit_open);
         self.touch_actor(&key);
         self.evict_idle_actors();
         let mut summary = summarize(&actor)?;
@@ -438,6 +449,9 @@ impl WorkspaceManager {
 
     fn active_actor_if_open(&self, session: &SessionKey) -> Option<Arc<WorkspaceActor>> {
         let key = self.sessions.read().get(session).cloned()?;
+        if let Some(actor) = self.explicit_workspace_fallback_actor(session, &key) {
+            return Some(actor);
+        }
         let actor = self.actors.read().get(&key).cloned();
         if actor.is_some() {
             self.touch_actor(&key);
@@ -445,6 +459,38 @@ impl WorkspaceManager {
             self.sessions.write().remove(session);
         }
         actor
+    }
+
+    fn explicit_workspace_fallback_actor(
+        &self,
+        session: &SessionKey,
+        current_key: &str,
+    ) -> Option<Arc<WorkspaceActor>> {
+        if !session.is_http() || self.explicit_sessions.read().contains(session) {
+            return None;
+        }
+        let fallback = self.latest_explicit_workspace.read().clone()?;
+        if fallback == current_key {
+            return None;
+        }
+        let actor = self.actors.read().get(&fallback).cloned()?;
+        self.sessions
+            .write()
+            .insert(session.clone(), fallback.clone());
+        self.touch_actor(&fallback);
+        Some(actor)
+    }
+
+    fn record_session_binding(&self, session: &SessionKey, key: &str, explicit: bool) {
+        self.sessions
+            .write()
+            .insert(session.clone(), key.to_owned());
+        if explicit {
+            self.explicit_sessions.write().insert(session.clone());
+            *self.latest_explicit_workspace.write() = Some(key.to_owned());
+        } else {
+            self.explicit_sessions.write().remove(session);
+        }
     }
 
     fn active_actor(&self, session: &SessionKey) -> AppResult<Arc<WorkspaceActor>> {
@@ -996,6 +1042,64 @@ mod tests {
         assert_eq!(
             manager.active_actor(&session_b).unwrap().root_path(),
             std::fs::canonicalize(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn non_explicit_http_session_follows_latest_explicit_workspace_open() {
+        let root = tempdir().unwrap();
+        let default_workspace = root.path().join("crawlerai");
+        let explicit_workspace = root.path().join("codeweave");
+        let cache = root.path().join("cache");
+        std::fs::create_dir_all(&default_workspace).unwrap();
+        std::fs::create_dir_all(&explicit_workspace).unwrap();
+        std::fs::write(default_workspace.join("main.rs"), "fn crawlerai() {}\n").unwrap();
+        std::fs::write(explicit_workspace.join("main.rs"), "fn codeweave() {}\n").unwrap();
+        let manager = WorkspaceManager::default();
+        let config = serde_json::to_value(DaemonConfig {
+            workspaces: Vec::new(),
+            workspace: WorkspaceSettings {
+                default_path: Some(default_workspace.to_string_lossy().into_owned()),
+                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
+                artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
+            },
+            skills: SkillsConfig::default(),
+            policy: PolicyConfig {
+                max_file_bytes: 1_000_000,
+                max_context_chars: 50_000,
+                max_search_results: 100,
+                max_task_output_chars: 30_000,
+                shell_enabled: false,
+                allowed_commands: vec!["cargo".to_owned()],
+                task_retention_hours: None,
+            },
+            tasks: HashMap::new(),
+            cache_root: cache.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+        manager.initialize(&config).unwrap();
+        let auto_session = SessionKey::new("http:auto-opened");
+        let explicit_session = SessionKey::new("http:explicit-open");
+
+        assert_eq!(
+            manager.active_actor(&auto_session).unwrap().root_path(),
+            std::fs::canonicalize(&default_workspace).unwrap()
+        );
+        manager
+            .workspace(
+                &explicit_session,
+                &json!({"action": "open", "path": explicit_workspace}),
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager.active_actor(&auto_session).unwrap().root_path(),
+            std::fs::canonicalize(&explicit_workspace).unwrap()
+        );
+        assert_eq!(
+            manager.active_actor(&explicit_session).unwrap().root_path(),
+            std::fs::canonicalize(&explicit_workspace).unwrap()
         );
     }
 
