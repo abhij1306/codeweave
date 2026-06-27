@@ -57,10 +57,16 @@ pub struct WorkspaceActor {
     journal_file: Mutex<Option<fs::File>>,
     journal_path: PathBuf,
     tasks: TaskSupervisor,
-    task_generations: Mutex<HashMap<String, u64>>,
+    task_generations: Mutex<HashMap<String, TaskBaseline>>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
     open_diagnostics: Value,
     _watcher: Mutex<RecommendedWatcher>,
+}
+
+#[derive(Debug, Clone)]
+struct TaskBaseline {
+    generation: u64,
+    dirty_files: HashSet<String>,
 }
 
 impl WorkspaceActor {
@@ -153,6 +159,12 @@ impl WorkspaceActor {
         let journal_path = workspace_cache.join("mutations.jsonl");
         rotate_journal_if_needed(&journal_path)?;
         let mutations = load_journal(&journal_path);
+        let persisted_generation = mutations
+            .iter()
+            .map(|mutation| mutation.generation)
+            .max()
+            .unwrap_or(1);
+        generation.store(persisted_generation.max(1), Ordering::Release);
         let journal_file = open_journal(&journal_path)?;
         let tasks = TaskSupervisor::new(workspace_cache, policy.clone(), tasks)?;
         let journal_ms = journal_started.elapsed().as_millis();
@@ -356,6 +368,68 @@ impl WorkspaceActor {
         }))
     }
 
+    pub fn diagnostics(&self) -> AppResult<Value> {
+        let index = self.index.read();
+        Ok(json!({
+            "workspace_id": self.id,
+            "root": self.root,
+            "generation": self.generation(),
+            "snapshot_id": self.snapshot(),
+            "file_count": index.file_count(),
+            "languages": index.languages(),
+            "reconcile_pending": self.read_reconcile_pending(),
+            "pending_path_count": self.pending_paths.lock().len(),
+            "running_task_count": self.tasks.running_count(),
+            "task_profiles": self.tasks.profile_diagnostics(&self.root),
+            "policy": {
+                "max_file_bytes": self.policy.max_file_bytes,
+                "max_context_chars": self.policy.max_context_chars,
+                "max_search_results": self.policy.max_search_results,
+                "max_task_output_chars": self.policy.max_task_output_chars,
+                "shell_enabled": self.policy.shell_enabled,
+                "allowed_commands": self.policy.allowed_commands,
+            }
+        }))
+    }
+
+    pub fn code_capabilities(&self) -> AppResult<Value> {
+        Ok(json!({
+            "workspace_id": self.id,
+            "root": self.root,
+            "generation": self.generation(),
+            "snapshot_id": self.snapshot(),
+            "search_modes": ["literal", "regex", "filename", "symbol", "references", "outline", "repo_map"],
+            "fetch_kinds": ["path", "handle", "symbol", "metadata", "task_status", "task_log", "continuation"],
+            "context": {
+                "supports_required_terms": true,
+                "supports_optional_terms": true,
+                "supports_exclude_terms": true,
+                "supports_document_types": true,
+                "supports_min_score": true,
+                "returns_scores": true,
+                "returns_groups": true
+            },
+            "editing": {
+                "supports_preview": true,
+                "supports_transaction": true,
+                "supports_single_file_wrappers": true,
+                "supports_validation_profiles": !self.tasks.profile_names().is_empty(),
+                "supports_rollback_on_failure": true
+            },
+            "limits": {
+                "max_file_bytes": self.policy.max_file_bytes,
+                "max_context_chars": self.policy.max_context_chars,
+                "max_search_results": self.policy.max_search_results,
+                "max_task_output_chars": self.policy.max_task_output_chars
+            },
+            "known_limitations": [
+                "regex mode is raw text search; use references mode for indexed symbol call-site discovery",
+                "include_imports returns lexical import prelude only, not inferred dependency usage",
+                "hosted connector lazy-loading behavior is outside the server-side MCP list_tools contract"
+            ]
+        }))
+    }
+
     pub fn summary(&self, session_id: &str, stateless_session: bool) -> AppResult<Value> {
         let started = Instant::now();
         let reconcile_started = Instant::now();
@@ -491,7 +565,7 @@ impl WorkspaceActor {
     pub fn code_context(&self, params: &Value) -> AppResult<Value> {
         let started = Instant::now();
         let reconcile_pending = self.read_reconcile_pending();
-        let query = required_str(params, "query")?;
+        let query = params.get("query").and_then(Value::as_str).unwrap_or("");
         if let Some(expected) = params.get("snapshot_id").and_then(Value::as_str) {
             let current = self.snapshot();
             if expected != current {
@@ -509,6 +583,14 @@ impl WorkspaceActor {
         };
         let paths = string_list(params, "paths");
         let evidence = string_list(params, "evidence");
+        let required_terms = string_list(params, "required_terms");
+        let optional_terms = string_list(params, "optional_terms");
+        let exclude_terms = string_list(params, "exclude_terms");
+        let document_types = string_list(params, "document_types");
+        let min_score = params
+            .get("min_score")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         let max_results = usize_value(params, "max_results", 10).min(50);
         let mut dirty: HashSet<String> = self
             .repo_status
@@ -534,6 +616,11 @@ impl WorkspaceActor {
             workspace_id: &self.id,
             snapshot_id: &snapshot,
             query,
+            required_terms: &required_terms,
+            optional_terms: &optional_terms,
+            exclude_terms: &exclude_terms,
+            document_types: &document_types,
+            min_score,
             path_filters: &paths,
             evidence: &evidence,
             dirty: &dirty,
@@ -542,9 +629,15 @@ impl WorkspaceActor {
             max_results,
         })?;
         let index_ms = index_started.elapsed().as_millis();
-        let task_failures = self.tasks.recent_failures(query, 3);
         if let Some(object) = result.as_object_mut() {
-            object.insert("recent_task_failures".to_owned(), json!(task_failures));
+            if bool_value(params, "include_task_failures", false)
+                || evidence.iter().any(|item| item == "task_failures")
+            {
+                object.insert(
+                    "recent_task_failures".to_owned(),
+                    json!(self.tasks.recent_failures(query, 3)),
+                );
+            }
             object.insert("reconcile_pending".to_owned(), json!(reconcile_pending));
         }
         add_phase_metrics(
@@ -585,6 +678,49 @@ impl WorkspaceActor {
         let paths = string_list(params, "paths");
         let snapshot = self.snapshot();
         let index = self.index.read();
+        if mode == "outline" && queries.len() == 1 && queries[0].is_empty() && paths.len() > 1 {
+            let search_started = Instant::now();
+            let mut results = Vec::new();
+            let mut errors = Vec::new();
+            for (index_number, path) in paths.iter().enumerate() {
+                match index.search(SearchParams {
+                    workspace_id: &self.id,
+                    snapshot_id: &snapshot,
+                    mode,
+                    query: path,
+                    path_filters: &[],
+                    case_sensitive: bool_value(params, "case_sensitive", false),
+                    max_results: usize_value(params, "max_results", 20)
+                        .min(self.policy.max_search_results),
+                    context_lines: usize_value(params, "context_lines", 2).min(20),
+                }) {
+                    Ok(result) => results.push(result),
+                    Err(error) => errors.push(json!({
+                        "index": index_number,
+                        "path": path,
+                        "error": error.0
+                    })),
+                }
+            }
+            let mut result = json!({
+                "mode": mode,
+                "snapshot_id": snapshot,
+                "result_count": results.len(),
+                "error_count": errors.len(),
+                "partial_success": !results.is_empty() && !errors.is_empty(),
+                "results": results,
+                "errors": errors,
+            });
+            add_reconcile_pending(&mut result, reconcile_pending);
+            add_phase_metrics(
+                &mut result,
+                &[
+                    ("index_search", search_started.elapsed().as_millis()),
+                    ("total_local", started.elapsed().as_millis()),
+                ],
+            );
+            return Ok(result);
+        }
         let run_search = |query: &str| {
             let effective_query = if mode == "outline" && query.is_empty() {
                 if paths.len() == 1 {
@@ -593,7 +729,15 @@ impl WorkspaceActor {
                     return Err(AppError::details(
                         "INVALID_OUTLINE_PATH",
                         "Outline requires a file path in query or exactly one paths entry",
-                        json!({"paths_count": paths.len()}),
+                        json!({
+                            "paths_count": paths.len(),
+                            "retryable": true,
+                            "retry_kind": "retry_with_changes",
+                            "suggested_calls": paths.iter().map(|path| json!({
+                                "mode": "outline",
+                                "paths": [path]
+                            })).collect::<Vec<_>>()
+                        }),
                     ));
                 }
             } else {
@@ -805,7 +949,7 @@ impl WorkspaceActor {
         Ok(response)
     }
 
-    pub async fn run(self: &Arc<Self>, session_id: &str, params: &Value) -> AppResult<Value> {
+    pub async fn run(self: &Arc<Self>, _session_id: &str, params: &Value) -> AppResult<Value> {
         let started = Instant::now();
         let reconcile_started = Instant::now();
         self.reconcile_pending_async().await?;
@@ -818,6 +962,13 @@ impl WorkspaceActor {
         let mut result = match action {
             "start" => {
                 let before = self.generation();
+                let before_dirty: HashSet<String> = self
+                    .repo_status
+                    .read()
+                    .dirty_files
+                    .iter()
+                    .cloned()
+                    .collect();
                 let command = params
                     .get("command")
                     .and_then(Value::as_array)
@@ -851,7 +1002,13 @@ impl WorkspaceActor {
                     let retained = self.tasks.retained_task_ids();
                     let mut generations = self.task_generations.lock();
                     generations.retain(|known_task, _| retained.contains(known_task));
-                    generations.insert(task_id.to_owned(), before);
+                    generations.insert(
+                        task_id.to_owned(),
+                        TaskBaseline {
+                            generation: before,
+                            dirty_files: before_dirty,
+                        },
+                    );
                 }
                 value
             }
@@ -900,25 +1057,29 @@ impl WorkspaceActor {
         self.reconcile_pending_async().await?;
         let reconcile_after_ms = reconcile_after_started.elapsed().as_millis();
         if let Some(task_id) = result.get("task_id").and_then(Value::as_str) {
-            let start = self
+            let current_dirty: HashSet<String> = self
+                .repo_status
+                .read()
+                .dirty_files
+                .iter()
+                .cloned()
+                .collect();
+            let baseline = self
                 .task_generations
                 .lock()
                 .get(task_id)
-                .copied()
-                .unwrap_or(self.generation());
-            let paths: HashSet<String> = self
-                .mutations
-                .lock()
-                .iter()
-                .filter(|item| {
-                    item.generation > start
-                        && (item.session_id == session_id || item.source == "external")
-                })
-                .map(|item| item.path.clone())
-                .collect();
+                .cloned()
+                .unwrap_or_else(|| TaskBaseline {
+                    generation: self.generation(),
+                    dirty_files: current_dirty.clone(),
+                });
+            let paths = self.observed_task_changed_paths(&baseline, &current_dirty);
             let changed = summarize_changed_paths(paths);
             if let Some(object) = result.as_object_mut() {
-                object.insert("workspace_generation_before".to_owned(), json!(start));
+                object.insert(
+                    "workspace_generation_before".to_owned(),
+                    json!(baseline.generation),
+                );
                 object.insert(
                     "workspace_generation_after".to_owned(),
                     json!(self.generation()),
@@ -956,6 +1117,26 @@ impl WorkspaceActor {
             object.insert("phase_ms".to_owned(), Value::Object(phases));
         }
         Ok(result)
+    }
+
+    fn observed_task_changed_paths(
+        &self,
+        baseline: &TaskBaseline,
+        current_dirty: &HashSet<String>,
+    ) -> HashSet<String> {
+        let mut paths: HashSet<String> = current_dirty
+            .symmetric_difference(&baseline.dirty_files)
+            .cloned()
+            .collect();
+        paths.extend(
+            self.mutations
+                .lock()
+                .iter()
+                .filter(|mutation| mutation.generation > baseline.generation)
+                .map(|mutation| mutation.path.clone()),
+        );
+        paths.retain(|path| !self.exclusions.is_ignored(Path::new(path), false));
+        paths
     }
 }
 

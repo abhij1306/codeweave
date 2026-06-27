@@ -114,6 +114,7 @@ pub(super) fn compact_reason_codes(mut reasons: Vec<String>) -> Vec<String> {
         "exact_symbol",
         "exact_phrase",
         "full_term_coverage",
+        "required_term",
         "path_match",
         "runtime_evidence",
         "dirty_file",

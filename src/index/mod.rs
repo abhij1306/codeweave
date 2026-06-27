@@ -138,6 +138,8 @@ pub struct SearchMatch {
     pub end_line: usize,
     pub preview: String,
     pub document_type: String,
+    pub score: f64,
+    pub group: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reason_codes: Vec<String>,
     pub handle: String,
@@ -169,6 +171,11 @@ pub struct ContextParams<'a> {
     pub workspace_id: &'a str,
     pub snapshot_id: &'a str,
     pub query: &'a str,
+    pub required_terms: &'a [String],
+    pub optional_terms: &'a [String],
+    pub exclude_terms: &'a [String],
+    pub document_types: &'a [String],
+    pub min_score: f64,
     pub path_filters: &'a [String],
     pub evidence: &'a [String],
     pub dirty: &'a HashSet<String>,
@@ -571,7 +578,14 @@ impl CodeIndex {
                     .values()
                     .filter(|file| path_filters.allows(&file.path))
                     .filter(|file| matcher.matches(file))
-                    .map(|file| json!({"path": file.path}))
+                    .map(|file| {
+                        json!({
+                            "path": file.path,
+                            "match_type": matcher.semantics(),
+                            "score": 1.0,
+                            "reason_codes": ["filename_match"]
+                        })
+                    })
                     .collect();
                 paths.sort_by_key(|value| {
                     value
@@ -722,7 +736,10 @@ impl CodeIndex {
                     "start_line": start,
                     "end_line": end,
                     "preview": slice_lines(&file.content, start, end),
-                    "handle": handle
+                    "handle": handle,
+                    "match_type": if regex.is_some() {"regex"} else {"literal"},
+                    "score": 1.0,
+                    "reason_codes": [if regex.is_some() {"regex_match"} else {"literal_match"}]
                 }));
             }
             if !file_results.is_empty() {
@@ -760,6 +777,11 @@ impl CodeIndex {
             workspace_id,
             snapshot_id,
             query,
+            required_terms,
+            optional_terms,
+            exclude_terms,
+            document_types,
+            min_score,
             path_filters,
             evidence,
             dirty,
@@ -767,17 +789,33 @@ impl CodeIndex {
             budget_chars,
             max_results,
         } = params;
-        let terms = query_terms(query);
-        if terms.is_empty() {
+        let legacy_terms = query_terms(query);
+        let required = normalized_terms(required_terms);
+        let optional = if optional_terms.is_empty() {
+            legacy_terms.clone()
+        } else {
+            normalized_terms(optional_terms)
+        };
+        let excluded = normalized_terms(exclude_terms);
+        let mut candidate_terms = required.clone();
+        candidate_terms.extend(optional.iter().cloned());
+        candidate_terms.sort();
+        candidate_terms.dedup();
+        if candidate_terms.is_empty() {
             return Err(AppError::details(
                 "QUERY_REJECTED",
                 "Query has no searchable terms",
-                json!({"field": "query", "reason": "empty_after_normalization", "retryable": true}),
+                json!({
+                    "field": "query",
+                    "reason": "empty_after_normalization",
+                    "retryable": true,
+                    "retry_kind": "retry_with_changes"
+                }),
             ));
         }
         let query_lower = query.to_ascii_lowercase();
         let path_filters = PathFilterSet::new(path_filters);
-        let mut candidate_files = self.candidate_files(&terms);
+        let mut candidate_files = self.candidate_files(&candidate_terms);
         let mut candidate_paths: HashSet<&str> = candidate_files
             .iter()
             .map(|file| file.path.as_str())
@@ -794,9 +832,22 @@ impl CodeIndex {
             if !path_filters.allows(&file.path) {
                 continue;
             }
+            if !document_types.is_empty()
+                && !document_types
+                    .iter()
+                    .any(|document_type| document_type == &file.document_type)
+            {
+                continue;
+            }
             if low_signal_context_path(&file.path)
                 && !path_filters.explicitly_requests(&file.path, &query_lower)
             {
+                continue;
+            }
+            if excluded.iter().any(|term| file_matches_term(file, term)) {
+                continue;
+            }
+            if !required.iter().all(|term| file_matches_term(file, term)) {
                 continue;
             }
             let changed = dirty.contains(&file.path) || recent_mutations.contains(&file.path);
@@ -811,16 +862,23 @@ impl CodeIndex {
             let mut score = 0.0;
             let mut first = None;
             let mut reasons = Vec::new();
-            let mut matched_terms = 0usize;
-            if lower.contains(&query_lower) {
+            let mut matched_optional_terms = 0usize;
+            if !query_lower.is_empty() && lower.contains(&query_lower) {
                 score += 12.0;
                 reasons.push("exact_phrase".to_owned());
                 first = lower.find(&query_lower);
             }
-            for term in &terms {
+            for term in &required {
+                if file_matches_term(file, term) {
+                    score += 15.0;
+                    reasons.push("required_term".to_owned());
+                    first = first.or_else(|| lower.find(term).or_else(|| path_lower.find(term)));
+                }
+            }
+            for term in &optional {
                 let count = lower.match_indices(term).take(50).count();
                 if count > 0 {
-                    matched_terms += 1;
+                    matched_optional_terms += 1;
                     score += (count as f64).ln_1p() * 3.0;
                     first = first.or_else(|| lower.find(term));
                 }
@@ -847,10 +905,10 @@ impl CodeIndex {
                         first.or_else(|| Some(line_start_byte(&file.content, symbol.start_line)));
                 }
             }
-            if matched_terms > 0 {
-                let coverage = matched_terms as f64 / terms.len() as f64;
+            if matched_optional_terms > 0 {
+                let coverage = matched_optional_terms as f64 / optional.len().max(1) as f64;
                 score += coverage * 10.0;
-                if matched_terms == terms.len() {
+                if matched_optional_terms == optional.len() {
                     reasons.push("full_term_coverage".to_owned());
                 }
             }
@@ -876,12 +934,16 @@ impl CodeIndex {
             }
             let size_units = file.content.len().max(100) as f64 / 8_192.0;
             score /= 1.0 + size_units.ln_1p().min(4.0) * 0.18;
+            if score < min_score {
+                continue;
+            }
             candidates.push((score, file, first.unwrap_or(0), reasons));
         }
         candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
         let mut results = Vec::new();
         let mut used = 0usize;
-        for (_score, file, byte_offset, mut reasons) in
+        let mut groups: BTreeMap<String, usize> = BTreeMap::new();
+        for (score, file, byte_offset, mut reasons) in
             candidates.into_iter().take(max_results.saturating_mul(3))
         {
             let (start_line, proposed_end) = excerpt_lines(&file.content, byte_offset, 6);
@@ -916,12 +978,16 @@ impl CodeIndex {
                 content_hash: file.hash.clone(),
                 symbol,
             })?;
+            let group = context_group(&file.document_type, &reasons);
+            *groups.entry(group.clone()).or_default() += 1;
             results.push(SearchMatch {
                 path: file.path.clone(),
                 start_line,
                 end_line,
                 preview: excerpt,
                 document_type: file.document_type.clone(),
+                score,
+                group,
                 reason_codes: reasons,
                 handle,
             });
@@ -934,6 +1000,7 @@ impl CodeIndex {
             "budget_chars": budget_chars,
             "used_chars": used,
             "result_count": results.len(),
+            "groups": groups.into_iter().map(|(group, count)| json!({"group": group, "count": count})).collect::<Vec<_>>(),
             "results": results,
             "guidance": if results.is_empty() { "Try literal, filename, or symbol search." } else { "Fetch only ranges needing more detail." }
         }))
@@ -953,11 +1020,14 @@ impl CodeIndex {
             return Err(AppError::invalid("query is required for reference search"));
         }
         let mut definitions = Vec::new();
-        let mut declaration_lines = HashSet::new();
+        let mut declaration_lines: HashMap<String, HashSet<usize>> = HashMap::new();
         for file in self.files.values() {
             for symbol in &file.symbols {
                 if symbol.name == symbol_name {
-                    declaration_lines.insert((file.path.clone(), symbol.start_line));
+                    declaration_lines
+                        .entry(file.path.clone())
+                        .or_default()
+                        .insert(symbol.start_line);
                     definitions.push(json!({
                         "path": file.path,
                         "symbol": symbol,
@@ -984,21 +1054,40 @@ impl CodeIndex {
             .map_err(AppError::internal)?;
         let mut files: Vec<_> = self.files.values().collect();
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        let mut results = Vec::new();
-        'files: for file in files {
+        let per_file_limit = max_results.clamp(1, 3);
+        let mut groups: Vec<VecDeque<serde_json::Value>> = Vec::new();
+        let mut total_windows = 0usize;
+        for file in files {
             if !path_filters.allows(&file.path) {
                 continue;
             }
             let lines: Vec<&str> = file.content.lines().collect();
+            let mut windows: Vec<(usize, usize, usize)> = Vec::new();
+            let mut lines_in_current_window = 0usize;
             for (index, line) in lines.iter().enumerate() {
                 let line_number = index + 1;
-                if declaration_lines.contains(&(file.path.clone(), line_number))
+                if declaration_lines
+                    .get(&file.path)
+                    .is_some_and(|lines| lines.contains(&line_number))
                     || !identifier.is_match(line)
                 {
                     continue;
                 }
                 let start = index.saturating_sub(context_lines) + 1;
                 let end = (index + context_lines + 1).min(lines.len());
+                if let Some((_, _, previous_end)) = windows.last_mut() {
+                    if start <= previous_end.saturating_add(1) && lines_in_current_window < 3 {
+                        *previous_end = (*previous_end).max(end);
+                        lines_in_current_window += 1;
+                        continue;
+                    }
+                }
+                windows.push((line_number, start, end));
+                lines_in_current_window = 1;
+            }
+            total_windows += windows.len();
+            let mut file_results = VecDeque::new();
+            for (line_number, start, end) in windows.into_iter().take(per_file_limit) {
                 let handle = encode_handle(&RangeHandle {
                     version: 1,
                     workspace_id: workspace_id.to_owned(),
@@ -1009,17 +1098,36 @@ impl CodeIndex {
                     content_hash: file.hash.clone(),
                     symbol: Some(symbol_name.to_owned()),
                 })?;
-                results.push(json!({
+                file_results.push_back(json!({
                     "path": file.path,
                     "line": line_number,
                     "start_line": start,
                     "end_line": end,
                     "preview": slice_lines(&file.content, start, end),
                     "handle": handle,
+                    "match_type": "reference",
+                    "score": 1.0,
+                    "reason_codes": ["reference_match"]
                 }));
-                if results.len() >= max_results {
-                    break 'files;
+            }
+            if !file_results.is_empty() {
+                groups.push(file_results);
+            }
+        }
+        let mut results = Vec::new();
+        while results.len() < max_results {
+            let mut added = false;
+            for group in &mut groups {
+                if let Some(result) = group.pop_front() {
+                    results.push(result);
+                    added = true;
+                    if results.len() >= max_results {
+                        break;
+                    }
                 }
+            }
+            if !added {
+                break;
             }
         }
         Ok(json!({
@@ -1028,6 +1136,7 @@ impl CodeIndex {
             "snapshot_id": snapshot_id,
             "definition_count": definitions.len(),
             "result_count": results.len(),
+            "truncated": total_windows > results.len(),
             "definitions": definitions,
             "results": results,
         }))
@@ -1064,13 +1173,43 @@ impl CodeIndex {
                     symbol: Some(symbol.name.clone()),
                 })
                 .unwrap_or_default();
-                results.push(json!({"path": file.path, "symbol": symbol, "handle": handle}));
-                if results.len() >= max_results {
-                    return results;
-                }
+                let rank = if name == needle {
+                    0
+                } else if name.starts_with(&needle) {
+                    1
+                } else {
+                    2
+                };
+                results.push((
+                    rank,
+                    file.path.clone(),
+                    symbol.start_line,
+                    json!({
+                        "path": file.path,
+                        "symbol": symbol,
+                        "handle": handle,
+                        "match_type": if rank == 0 {"exact_symbol"} else if rank == 1 {"prefix_symbol"} else {"contains_symbol"},
+                        "score": match rank {
+                            0 => 1.0,
+                            1 => 0.8,
+                            _ => 0.6,
+                        },
+                        "reason_codes": [if rank == 0 {"exact_symbol"} else {"symbol_match"}]
+                    }),
+                ));
             }
         }
+        results.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
         results
+            .into_iter()
+            .take(max_results)
+            .map(|(_, _, _, value)| value)
+            .collect()
     }
 
     fn repo_map(
@@ -1115,6 +1254,32 @@ impl CodeIndex {
             "total_file_count": self.file_count(),
             "scope_applied": path_filters.len() > 0
         })
+    }
+}
+
+fn normalized_terms(values: &[String]) -> Vec<String> {
+    let mut terms: Vec<_> = values.iter().flat_map(|value| query_terms(value)).collect();
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn file_matches_term(file: &FileEntry, term: &str) -> bool {
+    file.search_content.contains(term)
+        || file.path_lower.contains(term)
+        || file
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name.to_ascii_lowercase().contains(term))
+}
+
+fn context_group(document_type: &str, reasons: &[String]) -> String {
+    if reasons.iter().any(|reason| reason == "exact_symbol") {
+        "symbol".to_owned()
+    } else if reasons.iter().any(|reason| reason == "required_term") {
+        "required".to_owned()
+    } else {
+        document_type.to_owned()
     }
 }
 

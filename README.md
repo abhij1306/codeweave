@@ -241,10 +241,13 @@ Never commit `config.json`, `.mcp-token`, tunnel credentials, generated caches, 
 
 | Tool | Purpose |
 | --- | --- |
-| `workspace` | Open or switch this MCP session's active repository, summarize state, refresh, and inspect session changes |
+| `workspace` | Open or switch this MCP session's active repository, summarize state, refresh, diagnostics, and inspect session changes |
 | `code_context` | Retrieve ranked semantic and syntax-aware context |
+| `code_capabilities` | Inspect supported search modes, fetch kinds, edit capabilities, limits, and known limitations |
 | `code_search` | Search text, regex, filenames, symbols, references, outlines, or the repository map |
-| `code_fetch` | Read exact files, line ranges, symbols, handles, continuations, and task logs |
+| `code_fetch` | Read exact files, line ranges, symbols, handles, continuations, task status, and task logs |
+| `code_preview` | Preview a multi-file edit transaction and return the diff without writing files |
+| `code_transaction` | Apply a multi-file edit transaction with preconditions, validation, diff output, and rollback |
 | `code_write` | Create or overwrite exactly one file |
 | `code_replace` | Replace exact text in exactly one file |
 | `code_insert` | Insert text relative to a named symbol in one file |
@@ -257,9 +260,9 @@ A typical coding-agent workflow is:
 
 1. Open an approved repository with `workspace`.
 2. Use `code_context` for unfamiliar code.
-3. Locate exact definitions with `code_search`.
-4. Read only the required ranges with `code_fetch`.
-5. Apply one scoped change with `code_write`, `code_replace`, `code_insert`, `code_delete`, or `code_rename`.
+3. Locate exact definitions with `code_search`; use `references` for indexed symbol call-site discovery rather than regex.
+4. Read only the required ranges with `code_fetch`; use `response_detail: "compact"` or `metadata` items when full debug fields or content are unnecessary.
+5. Preview multi-file edits with `code_preview`, then apply with `code_transaction` or a narrow write wrapper.
 6. Run checks with `run`.
 7. Review the final diff with `git`.
 

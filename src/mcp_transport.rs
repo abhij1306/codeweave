@@ -35,7 +35,7 @@ use crate::{
     SERVER_NAME,
 };
 
-const INSTRUCTIONS: &str = "Use code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, the single-operation code_write/code_replace/code_insert/code_delete/code_rename tools for changes, run for builds/tests, and git for repository operations. CodeWeave manages one active repository per MCP session; call workspace with an absolute path to switch this session explicitly.";
+const INSTRUCTIONS: &str = "Use code_capabilities to inspect supported contracts, code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, code_preview/code_transaction for multi-file edits, the single-operation code_write/code_replace/code_insert/code_delete/code_rename tools for narrow changes, run for builds/tests, and git for repository operations. CodeWeave manages one active repository per MCP session; call workspace with an absolute path to switch this session explicitly.";
 
 #[derive(Clone)]
 pub(crate) struct CodeWeaveMcp {
@@ -81,8 +81,11 @@ impl ServerHandler for CodeWeaveMcp {
         if ![
             "workspace",
             "code_context",
+            "code_capabilities",
             "code_fetch",
             "code_search",
+            "code_preview",
+            "code_transaction",
             "code_write",
             "code_replace",
             "code_insert",

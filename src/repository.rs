@@ -2,6 +2,8 @@ use crate::model::{AppError, AppResult};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashSet;
+use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -57,7 +59,7 @@ impl CliGitBackend {
 
     fn run(&self, root: &Path, args: &[String], max_chars: usize) -> AppResult<String> {
         let output = self.run_raw(root, args)?;
-        let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {
             return Err(AppError::details(
@@ -69,16 +71,117 @@ impl CliGitBackend {
         if !stderr.trim().is_empty() {
             eprintln!("git warning for {:?}: {}", args, stderr.trim());
         }
-        if text.len() > max_chars {
-            let mut end = max_chars;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-            text.push_str("\n… output truncated …");
-        }
-        Ok(text)
+        Ok(truncate_output(text, max_chars))
     }
+
+    fn untracked_diff(&self, root: &Path, paths: &[String], max_chars: usize) -> AppResult<String> {
+        let mut args = vec![
+            "ls-files".to_owned(),
+            "--others".to_owned(),
+            "--exclude-standard".to_owned(),
+            "-z".to_owned(),
+            "--".to_owned(),
+        ];
+        args.extend(paths.iter().filter_map(|path| normalized_path(path)));
+        let untracked = self.run(root, &args, usize::MAX)?;
+        let mut diff = String::new();
+        for path in untracked.split('\0').filter(|path| !path.is_empty()) {
+            let Some(normalized) = normalized_path(path) else {
+                continue;
+            };
+            let full_path = root.join(&normalized);
+            let Ok(metadata) = fs::symlink_metadata(&full_path) else {
+                continue;
+            };
+            let is_symlink = metadata.file_type().is_symlink();
+            if !is_symlink && !metadata.is_file() {
+                continue;
+            }
+            let mode = if is_symlink { "120000" } else { "100644" };
+            let header = format!(
+                "diff --git a/{0} b/{0}\nnew file mode {1}\n--- /dev/null\n+++ b/{0}\n",
+                normalized, mode
+            );
+            let remaining = max_chars.saturating_sub(diff.len().saturating_add(header.len()));
+            let content = if is_symlink {
+                let Ok(target) = fs::read_link(&full_path) else {
+                    continue;
+                };
+                string_prefix(&target.to_string_lossy(), remaining)
+            } else {
+                let Some(content) = read_utf8_prefix(&full_path, remaining) else {
+                    continue;
+                };
+                content
+            };
+            let (content, content_truncated) = content;
+            diff.push_str(&header);
+            for line in content.lines() {
+                diff.push('+');
+                diff.push_str(line);
+                diff.push('\n');
+            }
+            if !content_truncated && !content.ends_with('\n') {
+                diff.push_str("\\ No newline at end of file\n");
+            }
+            if content_truncated || diff.len() > max_chars {
+                if diff.len() <= max_chars {
+                    diff.push('\n');
+                }
+                return Ok(truncate_output(diff, max_chars));
+            }
+        }
+        Ok(diff)
+    }
+}
+
+fn string_prefix(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_owned(), false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true)
+}
+
+fn read_utf8_prefix(path: &Path, max_bytes: usize) -> Option<(String, bool)> {
+    let file = fs::File::open(path).ok()?;
+    let limit = u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX);
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes).ok()?;
+    let truncated = bytes.len() > max_bytes;
+    if truncated {
+        bytes.truncate(max_bytes);
+    }
+    let valid_len = match std::str::from_utf8(&bytes) {
+        Ok(_) => bytes.len(),
+        Err(error) if truncated && error.error_len().is_none() => error.valid_up_to(),
+        Err(_) => return None,
+    };
+    bytes.truncate(valid_len);
+    Some((String::from_utf8(bytes).ok()?, truncated))
+}
+
+fn truncate_output(mut text: String, max_chars: usize) -> String {
+    const MARKER: &str = "\n… output truncated …";
+    if text.len() <= max_chars {
+        return text;
+    }
+
+    let marker = if MARKER.len() <= max_chars {
+        MARKER
+    } else {
+        ""
+    };
+    let mut end = max_chars.saturating_sub(marker.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(marker);
+    text
 }
 
 fn normalized_path(path: &str) -> Option<String> {
@@ -202,7 +305,16 @@ impl RepositoryBackend for CliGitBackend {
             args.push("--".to_owned());
             args.extend(paths.iter().cloned());
         }
-        self.run(root, &args, max_chars)
+        let mut diff = self.run(root, &args, max_chars)?;
+        if staged || paths.is_empty() || diff.len() >= max_chars {
+            return Ok(diff);
+        }
+        let untracked = self.untracked_diff(root, paths, max_chars - diff.len())?;
+        if !diff.is_empty() && !untracked.is_empty() && !diff.ends_with('\n') {
+            diff.push('\n');
+        }
+        diff.push_str(&untracked);
+        Ok(truncate_output(diff, max_chars))
     }
     fn log(&self, root: &Path, limit: usize) -> AppResult<String> {
         self.run(
@@ -281,6 +393,7 @@ impl RepositoryBackend for CliGitBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn parses_porcelain_v2_branch_and_dirty_paths() {
@@ -320,5 +433,96 @@ mod tests {
         assert!(status.head.is_empty());
         assert!(status.branch.is_empty());
         assert_eq!(status.dirty_files, vec!["new.rs"]);
+    }
+
+    #[test]
+    fn diff_returns_synthetic_patch_for_untracked_scoped_file() {
+        let root = tempdir().unwrap();
+        let backend = CliGitBackend;
+        backend
+            .run(root.path(), &["init".to_owned()], 20_000)
+            .unwrap();
+        fs::write(root.path().join("new.py"), "print('hello')\n").unwrap();
+
+        let diff = backend
+            .diff(root.path(), false, &["new.py".to_owned()], 20_000)
+            .unwrap();
+
+        assert!(diff.contains("new file mode 100644"));
+        assert!(diff.contains("+++ b/new.py"));
+        assert!(diff.contains("+print('hello')"));
+    }
+
+    #[test]
+    fn diff_combines_tracked_and_untracked_scoped_files() {
+        let root = tempdir().unwrap();
+        let backend = CliGitBackend;
+        backend
+            .run(root.path(), &["init".to_owned()], 20_000)
+            .unwrap();
+        fs::write(root.path().join("tracked.py"), "print('before')\n").unwrap();
+        backend
+            .run(
+                root.path(),
+                &["add".to_owned(), "--".to_owned(), "tracked.py".to_owned()],
+                20_000,
+            )
+            .unwrap();
+        fs::write(root.path().join("tracked.py"), "print('after')\n").unwrap();
+        fs::write(root.path().join("new.py"), "print('new')\n").unwrap();
+
+        let diff = backend
+            .diff(
+                root.path(),
+                false,
+                &["tracked.py".to_owned(), "new.py".to_owned()],
+                20_000,
+            )
+            .unwrap();
+
+        assert!(diff.contains("+++ b/tracked.py"));
+        assert!(diff.contains("+++ b/new.py"));
+        assert!(diff.contains("+print('new')"));
+    }
+
+    #[test]
+    fn untracked_diff_reads_and_returns_only_the_bounded_prefix() {
+        let root = tempdir().unwrap();
+        let backend = CliGitBackend;
+        backend
+            .run(root.path(), &["init".to_owned()], 20_000)
+            .unwrap();
+        fs::write(root.path().join("large.txt"), "x".repeat(10_000)).unwrap();
+
+        let diff = backend
+            .diff(root.path(), false, &["large.txt".to_owned()], 200)
+            .unwrap();
+
+        assert!(diff.len() <= 200);
+        assert!(diff.ends_with("… output truncated …"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_diff_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let backend = CliGitBackend;
+        backend
+            .run(root.path(), &["init".to_owned()], 20_000)
+            .unwrap();
+        let secret = outside.path().join("secret.txt");
+        fs::write(&secret, "outside secret").unwrap();
+        symlink(&secret, root.path().join("linked.txt")).unwrap();
+
+        let diff = backend
+            .diff(root.path(), false, &["linked.txt".to_owned()], 20_000)
+            .unwrap();
+
+        assert!(diff.contains("new file mode 120000"));
+        assert!(diff.contains(&secret.to_string_lossy().replace('\\', "/")));
+        assert!(!diff.contains("outside secret"));
     }
 }

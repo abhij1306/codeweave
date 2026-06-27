@@ -40,21 +40,27 @@ CodeWeave exposes narrow write tools:
 - `code_delete` for one deletion;
 - `code_rename` for one rename.
 
-Each public call changes exactly one file operation. The internal edit pipeline still plans the change, checks preconditions, writes atomically, records mutations, runs optional validation profiles, and restores the prior state when validation fails.
+For coordinated changes, `code_preview` accepts a `changes` array and returns the planned diff without writing files. `code_transaction` accepts the same `changes` array and applies it through the same edit engine.
+
+The internal edit pipeline plans changes, checks preconditions, runs syntax preflight, writes atomically, records mutations, runs optional validation profiles, and restores the prior state when validation fails.
 
 Existing-file changes require a current snapshot, expected content hash, or provenance handle.
 
+Tool errors include the stable `code` and `message` fields plus retry metadata when recovery is possible. `retry_kind` distinguishes `retry_same_request`, `retry_with_changes`, and `not_retryable`; argument-correctable failures may include `suggested_calls`.
+
 ## Command execution
 
-The `run` tool executes configured task profiles or executables listed in `policy.allowedCommands`. Shell execution is disabled by default. Keep task working directories relative to the active workspace and avoid adding broad command interpreters unless required.
+The `run` tool executes configured task profiles or executables listed in `policy.allowedCommands`. Configured profiles are trusted server configuration and may resolve explicit repository-local executable paths such as a virtual-environment Python. Ad-hoc `command` requests still require `policy.allowedCommands`. Shell execution is disabled by default. Keep task working directories relative to the active workspace and avoid adding broad command interpreters unless required.
+
+If a hosted client blocks `run(action="status")` because the same tool can also start commands, use the `status_fetch` descriptor returned when the task starts. It maps to `code_fetch` with `{"kind":"task_status","value":"task_..."}` and provides a read-only polling path that hosted safety classifiers can distinguish from command execution.
 
 ## Recommended agent workflow
 
 1. Open the repository.
-2. Retrieve ranked context.
-3. Search for precise definitions and references.
-4. Fetch exact file ranges.
-5. Apply the smallest coherent edit.
+2. Retrieve ranked context, using required, optional, excluded, and document-type filters for broad scopes.
+3. Search for precise definitions and references; regex is raw text search, while `references` is the symbol call-site mode.
+4. Fetch exact file ranges, metadata, or compact responses as needed.
+5. Preview multi-file edits when useful, then apply the smallest coherent edit.
 6. Run formatting, tests, and builds.
 7. Inspect Git status and diff.
 8. Commit only after human review.

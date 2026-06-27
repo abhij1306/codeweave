@@ -1,7 +1,7 @@
 use super::util::stale_snapshot;
 use super::WorkspaceActor;
 use crate::index::{decode_handle, encode_handle, slice_lines, FileEntry, RangeHandle};
-use crate::model::{required_str, usize_value, AppError, AppResult};
+use crate::model::{bool_value, required_str, usize_value, AppError, AppResult};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -62,6 +62,10 @@ impl WorkspaceActor {
                 .ok_or_else(|| AppError::invalid("Provide 'path' or an 'items' array"))?
         };
         let max_chars = usize_value(params, "max_chars", 30_000).min(200_000);
+        let response_detail = params
+            .get("response_detail")
+            .and_then(Value::as_str)
+            .unwrap_or("standard");
         let mut remaining = max_chars;
         let mut results = Vec::new();
         let mut errors = Vec::new();
@@ -72,13 +76,7 @@ impl WorkspaceActor {
             }
             match self.fetch_item(item, remaining) {
                 Ok(result) => {
-                    remaining = remaining.saturating_sub(
-                        result
-                            .get("content")
-                            .and_then(Value::as_str)
-                            .map(str::len)
-                            .unwrap_or(0),
-                    );
+                    remaining = remaining.saturating_sub(result_text_len(&result));
                     results.push(result);
                 }
                 Err(error) => errors.push(json!({
@@ -94,6 +92,10 @@ impl WorkspaceActor {
             result
                 .get("continuation")
                 .is_some_and(|value| !value.is_null())
+                || result
+                    .get("output_truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
                 || result
                     .get("content")
                     .and_then(Value::as_str)
@@ -111,6 +113,19 @@ impl WorkspaceActor {
             "results": results,
             "errors": errors,
         });
+        if response_detail == "compact" {
+            if let Some(object) = result.as_object_mut() {
+                object.insert(
+                    "results".to_owned(),
+                    Value::Array(results.iter().map(compact_fetch_result).collect::<Vec<_>>()),
+                );
+                object.insert("response_detail".to_owned(), json!("compact"));
+            }
+        } else if response_detail == "debug" {
+            if let Some(object) = result.as_object_mut() {
+                object.insert("response_detail".to_owned(), json!("debug"));
+            }
+        }
         super::add_reconcile_pending(&mut result, reconcile_pending);
         super::add_phase_metrics(
             &mut result,
@@ -162,7 +177,17 @@ impl WorkspaceActor {
                     }),
                 )
             }
-            "symbol" => self.fetch_symbol(value, remaining),
+            "symbol" => self.fetch_symbol(
+                value,
+                remaining,
+                usize_value(item, "context_lines", 0).min(200),
+                bool_value(item, "include_imports", false),
+            ),
+            "metadata" => self.fetch_metadata(value),
+            "task_status" => {
+                let task_id = value.strip_prefix("task:").unwrap_or(value);
+                self.tasks.status_with_limit(task_id, remaining)
+            }
             "task_log" => {
                 let task_id = value.strip_prefix("task-log:").unwrap_or(value);
                 let content = self.tasks.read_log(task_id)?;
@@ -204,7 +229,13 @@ impl WorkspaceActor {
         }
     }
 
-    fn fetch_symbol(&self, symbol_name: &str, limit: usize) -> AppResult<Value> {
+    fn fetch_symbol(
+        &self,
+        symbol_name: &str,
+        limit: usize,
+        context_lines: usize,
+        include_imports: bool,
+    ) -> AppResult<Value> {
         let index = self.index.read();
         let (path, symbol, _) = index.find_symbol(None, symbol_name).ok_or_else(|| {
             AppError::details(
@@ -220,15 +251,52 @@ impl WorkspaceActor {
                 json!({"path": path, "symbol": symbol_name}),
             )
         })?;
-        self.build_fetch_response(
+        let line_count = file.content.lines().count().max(1);
+        let start_line = symbol.start_line.saturating_sub(context_lines).max(1);
+        let end_line = symbol
+            .end_line
+            .saturating_add(context_lines)
+            .min(line_count);
+        let mut result = self.build_fetch_response(
             file,
             FetchScope::Lines {
-                start_line: symbol.start_line,
-                end_line: symbol.end_line,
+                start_line,
+                end_line,
             },
             0,
             limit,
-        )
+        )?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert("symbol".to_owned(), json!(symbol));
+            if include_imports {
+                object.insert(
+                    "imports".to_owned(),
+                    json!(lexical_import_prelude(file, start_line)),
+                );
+            }
+        }
+        Ok(result)
+    }
+
+    fn fetch_metadata(&self, path: &str) -> AppResult<Value> {
+        let index = self.index.read();
+        let file = index.get(path).ok_or_else(|| {
+            AppError::details(
+                "PATH_NOT_INDEXED",
+                "File is not indexed",
+                json!({"path": path}),
+            )
+        })?;
+        Ok(json!({
+            "kind": "metadata",
+            "path": file.path,
+            "hash": file.hash,
+            "size": file.size,
+            "language": file.language,
+            "document_type": file.document_type,
+            "line_count": file.content.lines().count().max(1),
+            "modified_ns": file.modified_ns
+        }))
     }
 
     fn fetch_indexed_path(
@@ -331,6 +399,63 @@ impl WorkspaceActor {
             Some(&continuation),
         ))
     }
+}
+
+fn result_text_len(result: &Value) -> usize {
+    ["content", "output"]
+        .into_iter()
+        .filter_map(|field| result.get(field).and_then(Value::as_str))
+        .map(str::len)
+        .sum()
+}
+
+fn compact_fetch_result(result: &Value) -> Value {
+    let mut compact = serde_json::Map::new();
+    for field in [
+        "kind",
+        "path",
+        "hash",
+        "content",
+        "task_id",
+        "status",
+        "exit_code",
+        "output",
+        "output_truncated",
+        "language",
+        "document_type",
+        "line_count",
+        "size",
+        "modified_ns",
+        "imports",
+    ] {
+        if let Some(value) = result.get(field) {
+            compact.insert(field.to_owned(), value.clone());
+        }
+    }
+    Value::Object(compact)
+}
+
+fn lexical_import_prelude(file: &FileEntry, before_line: usize) -> Vec<Value> {
+    file.content
+        .lines()
+        .take(before_line.saturating_sub(1))
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim_start();
+            let is_import = trimmed.starts_with("use ")
+                || trimmed.starts_with("pub use ")
+                || trimmed.starts_with("extern crate ")
+                || trimmed.starts_with("import ")
+                || trimmed.starts_with("from ")
+                || trimmed.starts_with("package ");
+            is_import.then(|| {
+                json!({
+                    "line": index + 1,
+                    "text": line
+                })
+            })
+        })
+        .collect()
 }
 
 fn scope_from_bounds(start: Option<usize>, end: Option<usize>) -> FetchScope {

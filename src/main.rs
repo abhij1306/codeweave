@@ -180,7 +180,7 @@ fn tools() -> Value {
         "inputSchema":{
           "type":"object",
           "properties":{
-            "action":{"default":"open","type":"string","enum":["open","summary","refresh","changes","skills","skill"]},
+            "action":{"default":"open","type":"string","enum":["open","summary","refresh","changes","diagnostics","skills","skill"]},
             "path":{"type":"string","description":"Absolute repository path to make active. Must be within configured allowed roots."},
             "skill_name":{"type":"string","description":"Skill directory name. Use only after an explicit user request to use that skill."},
             "force":{"type":"boolean"}
@@ -191,16 +191,33 @@ fn tools() -> Value {
       {
         "name":"code_context",
         "title":"Ranked Code Context",
-        "description":"Find relevant code for a task. Pass a short list of identifiers or concepts in terms, not the full user request.",
+        "description":"Find relevant code for a task. Pass short identifiers or concepts using terms, required_terms, optional_terms, exclude_terms, and document_types.",
         "annotations":read.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
           "properties":{
             "terms":{"minItems":1,"maxItems":12,"type":"array","items":{"type":"string","minLength":1,"maxLength":80}},
-            "paths":{"type":"array","items":{"type":"string"}}
+            "paths":{"type":"array","items":{"type":"string"}},
+            "required_terms":{"type":"array","items":{"type":"string","minLength":1,"maxLength":80}},
+            "optional_terms":{"type":"array","items":{"type":"string","minLength":1,"maxLength":80}},
+            "exclude_terms":{"type":"array","items":{"type":"string","minLength":1,"maxLength":80}},
+            "document_types":{"type":"array","items":{"type":"string","enum":["source","test","instruction","artifact","runtime_evidence","log"]}},
+            "min_score":{"type":"number","minimum":0},
+            "include_task_failures":{"type":"boolean","default":false,"description":"Include up to three recent task failures relevant to this query."}
           },
-          "required":["terms"],
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"code_capabilities",
+        "title":"CodeWeave Capabilities",
+        "description":"Return supported search modes, fetch kinds, edit capabilities, limits, workspace identity, and known limitations.",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{},
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
       },
@@ -216,7 +233,8 @@ fn tools() -> Value {
             "path":{"type":"string"},
             "start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
             "end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
-            "items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["path","handle","symbol","task_log","continuation"]},"value":{"type":"string","minLength":1},"start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},"end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64}},"required":["kind","value"],"additionalProperties":false}},
+            "items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["path","handle","symbol","metadata","task_status","task_log","continuation"]},"value":{"type":"string","minLength":1},"start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},"end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},"context_lines":{"type":"integer","minimum":0,"maximum":200},"include_imports":{"type":"boolean"}},"required":["kind","value"],"additionalProperties":false}},
+            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"},
             "max_chars":{"type":"integer","minimum":1,"maximum":200000}
           },
           "$schema":"http://json-schema.org/draft-07/schema#"
@@ -343,6 +361,40 @@ fn tools() -> Value {
           },
           "required":["path","to"],
           "additionalProperties":false,
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"code_preview",
+        "title":"Preview Code Transaction",
+        "description":"Preview a multi-file edit transaction and return the diff without writing files.",
+        "annotations":read.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "changes":{"type":"array","items":{"type":"object"}},
+            "snapshot_id":{"type":"string"}
+          },
+          "required":["changes"],
+          "$schema":"http://json-schema.org/draft-07/schema#"
+        }
+      },
+      {
+        "name":"code_transaction",
+        "title":"Apply Code Transaction",
+        "description":"Apply a multi-file edit transaction through the same precondition, validation, diff, and rollback engine as the narrow write tools.",
+        "annotations":write.clone(),
+        "execution":execution.clone(),
+        "inputSchema":{
+          "type":"object",
+          "properties":{
+            "changes":{"type":"array","items":{"type":"object"}},
+            "snapshot_id":{"type":"string"},
+            "validate":{"type":"array","items":{"type":"string"}},
+            "rollback_on_failure":{"type":"boolean"}
+          },
+          "required":["changes"],
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
       },
@@ -549,6 +601,9 @@ async fn prepare(
             params.insert("command".into(), json!(split_command_line(command)?));
         }
     }
+    if method == "code_preview" {
+        params.insert("preview".into(), Value::Bool(true));
+    }
     if is_code_mutation(method) {
         normalize_code_mutation(method, &mut params);
     }
@@ -580,11 +635,30 @@ fn tool_failure(error: model::AppError) -> Value {
             body.code.as_str(),
             "STALE_SNAPSHOT" | "STALE_FILE" | "STALE_HANDLE" | "STALE_CONTINUATION"
         );
+    let retry_kind = body
+        .details
+        .as_ref()
+        .and_then(|details| details.get("retry_kind"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if matches!(
+                body.code.as_str(),
+                "STALE_SNAPSHOT" | "STALE_FILE" | "STALE_HANDLE" | "STALE_CONTINUATION"
+            ) {
+                "retry_same_request".to_owned()
+            } else if retryable {
+                "retry_with_changes".to_owned()
+            } else {
+                "not_retryable".to_owned()
+            }
+        });
     let structured = json!({
         "error": {
             "code": body.code,
             "message": body.message,
             "retryable": retryable,
+            "retry_kind": retry_kind,
             "details": body.details
         }
     });
@@ -694,7 +768,25 @@ mod tests {
     fn public_tool_schemas_are_hosted_client_compatible() {
         let all = tools();
         let items = all.as_array().expect("tools array");
-        assert_eq!(items.len(), 11);
+        assert_eq!(items.len(), 14);
+        for name in [
+            "workspace",
+            "code_context",
+            "code_capabilities",
+            "code_fetch",
+            "code_search",
+            "code_preview",
+            "code_transaction",
+            "code_write",
+            "code_replace",
+            "code_insert",
+            "code_delete",
+            "code_rename",
+            "git",
+            "run",
+        ] {
+            let _ = tool(&all, name);
+        }
 
         for item in items {
             let schema = &item["inputSchema"];
@@ -708,10 +800,9 @@ mod tests {
             assert_eq!(item["execution"]["taskSupport"], "forbidden");
         }
 
-        assert_eq!(
-            tool(&all, "code_context")["inputSchema"]["required"],
-            json!(["terms"])
-        );
+        assert!(tool(&all, "code_context")["inputSchema"]
+            .get("required")
+            .is_none());
         assert_eq!(
             tool(&all, "git")["inputSchema"]["required"],
             json!(["action"])
@@ -721,7 +812,15 @@ mod tests {
         assert_eq!(fetch_item["required"], json!(["kind", "value"]));
         assert_eq!(
             fetch_item["properties"]["kind"]["enum"],
-            json!(["path", "handle", "symbol", "task_log", "continuation"])
+            json!([
+                "path",
+                "handle",
+                "symbol",
+                "metadata",
+                "task_status",
+                "task_log",
+                "continuation"
+            ])
         );
         assert_eq!(fetch_item["additionalProperties"], false);
         assert_eq!(
@@ -743,6 +842,14 @@ mod tests {
         assert_eq!(
             tool(&all, "code_rename")["inputSchema"]["required"],
             json!(["path", "to"])
+        );
+        assert_eq!(
+            tool(&all, "code_preview")["inputSchema"]["required"],
+            json!(["changes"])
+        );
+        assert_eq!(
+            tool(&all, "code_transaction")["inputSchema"]["required"],
+            json!(["changes"])
         );
     }
 
@@ -863,6 +970,84 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.path().join("created.txt")).unwrap(),
             "created through code_write\n"
+        );
+
+        let preview = prepare(
+            &manager,
+            &config,
+            "code_preview",
+            json!({
+                "changes": [{
+                    "kind": "create",
+                    "path": "preview.txt",
+                    "content": "preview only\n"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(preview["preview"], true);
+        let preview_result = manager
+            .dispatch(SessionKey::stdio(), "code_preview", &preview)
+            .await
+            .unwrap();
+        assert_eq!(preview_result["preview"], true);
+        assert!(!root.path().join("preview.txt").exists());
+
+        let syntax_error = prepare(
+            &manager,
+            &config,
+            "code_preview",
+            json!({
+                "changes": [{
+                    "kind": "create",
+                    "path": "broken.rs",
+                    "content": "fn broken(\n"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        let syntax_result = manager
+            .dispatch(SessionKey::stdio(), "code_preview", &syntax_error)
+            .await
+            .unwrap_err();
+        assert_eq!(syntax_result.0.code, "SYNTAX_ERROR");
+        assert!(!root.path().join("broken.rs").exists());
+
+        let transaction = prepare(
+            &manager,
+            &config,
+            "code_transaction",
+            json!({
+                "changes": [
+                    {
+                        "kind": "create",
+                        "path": "tx-one.txt",
+                        "content": "one\n"
+                    },
+                    {
+                        "kind": "create",
+                        "path": "tx-two.txt",
+                        "content": "two\n"
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        let transaction_result = manager
+            .dispatch(SessionKey::stdio(), "code_transaction", &transaction)
+            .await
+            .unwrap();
+        assert_eq!(transaction_result["applied"], true);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("tx-one.txt")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("tx-two.txt")).unwrap(),
+            "two\n"
         );
     }
 

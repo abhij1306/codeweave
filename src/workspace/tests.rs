@@ -1,7 +1,7 @@
 use super::edit::PlannedFile;
 use super::journal::{rotate_journal_if_needed, MutationRecord, MAX_JOURNAL_BYTES};
 use super::util::{line_range_bytes, summarize_changed_paths, MAX_OBSERVED_CHANGED_PATHS};
-use super::WorkspaceActor;
+use super::{TaskBaseline, WorkspaceActor};
 use crate::index::content_hash;
 use crate::model::{PolicyConfig, WorkspaceConfig};
 use chrono::Utc;
@@ -88,6 +88,225 @@ fn fetch_accepts_direct_path_parameters() {
 }
 
 #[test]
+fn outline_accepts_multiple_paths_and_reports_partial_errors() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("one.rs"), "pub fn one() {}\n").unwrap();
+    fs::write(root.path().join("two.rs"), "pub fn two() {}\n").unwrap();
+    let actor = test_actor(root.path());
+
+    let single = actor
+        .code_search(&json!({"mode": "outline", "paths": ["one.rs"]}))
+        .unwrap();
+    assert_eq!(single["path"], "one.rs");
+    assert!(single["symbols"].is_array());
+
+    let batch = actor
+        .code_search(&json!({
+            "mode": "outline",
+            "paths": ["one.rs", "missing.rs", "two.rs"]
+        }))
+        .unwrap();
+    assert_eq!(batch["result_count"], 2);
+    assert_eq!(batch["error_count"], 1);
+    assert_eq!(batch["partial_success"], true);
+    assert_eq!(batch["results"][0]["path"], "one.rs");
+    assert_eq!(batch["results"][1]["path"], "two.rs");
+}
+
+#[test]
+fn fetch_supports_compact_metadata_and_symbol_import_context() {
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("lib.rs"),
+        "use std::fmt;\n\nfn helper() {}\n\npub fn render() {\n    helper();\n}\n",
+    )
+    .unwrap();
+    let actor = test_actor(root.path());
+
+    let metadata = actor
+        .code_fetch(&json!({"items": [{"kind": "metadata", "value": "lib.rs"}]}))
+        .unwrap();
+    assert_eq!(metadata["results"][0]["kind"], "metadata");
+    assert_eq!(metadata["results"][0]["language"], "rust");
+    assert_eq!(metadata["results"][0]["line_count"], 7);
+    assert!(metadata["results"][0].get("content").is_none());
+
+    let symbol = actor
+        .code_fetch(&json!({
+            "items": [{
+                "kind": "symbol",
+                "value": "render",
+                "context_lines": 1,
+                "include_imports": true
+            }]
+        }))
+        .unwrap();
+    assert_eq!(symbol["results"][0]["start_line"], 4);
+    assert_eq!(symbol["results"][0]["end_line"], 7);
+    assert_eq!(symbol["results"][0]["imports"][0]["text"], "use std::fmt;");
+
+    let compact = actor
+        .code_fetch(&json!({
+            "path": "lib.rs",
+            "response_detail": "compact"
+        }))
+        .unwrap();
+    assert_eq!(compact["response_detail"], "compact");
+    assert_eq!(compact["results"][0]["path"], "lib.rs");
+    assert!(compact["results"][0].get("handle").is_none());
+    assert!(compact["results"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("render"));
+}
+
+#[test]
+fn workspace_diagnostics_exposes_profiles_and_limits() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let actor = test_actor(root.path());
+
+    let diagnostics = actor.diagnostics().unwrap();
+
+    assert_eq!(diagnostics["workspace_id"], "main");
+    assert_eq!(diagnostics["file_count"], 1);
+    assert_eq!(diagnostics["policy"]["max_search_results"], 100);
+    assert!(diagnostics["task_profiles"].is_array());
+}
+
+#[test]
+fn code_capabilities_reports_public_contracts() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let actor = test_actor(root.path());
+
+    let capabilities = actor.code_capabilities().unwrap();
+
+    assert_eq!(capabilities["workspace_id"], "main");
+    assert!(capabilities["search_modes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|mode| mode == "outline"));
+    assert!(capabilities["fetch_kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|kind| kind == "metadata"));
+    assert_eq!(capabilities["editing"]["supports_transaction"], true);
+}
+
+#[test]
+fn code_context_accepts_weighted_terms_without_legacy_query() {
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("mcp.rs"),
+        "pub fn register_mcp_tools() { map_structured_errors(); }\nfn map_structured_errors() {}\n",
+    )
+    .unwrap();
+    let actor = test_actor(root.path());
+
+    let context = actor
+        .code_context(&json!({
+            "required_terms": ["mcp"],
+            "optional_terms": ["structured errors"],
+            "document_types": ["source"]
+        }))
+        .unwrap();
+
+    assert_eq!(context["result_count"], 1);
+    assert_eq!(context["results"][0]["path"], "mcp.rs");
+    assert!(context["results"][0]["score"].is_number());
+}
+
+#[tokio::test]
+async fn task_status_fetch_and_task_local_changed_paths_are_bounded() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let actor = test_actor(root.path());
+    actor.mutations.lock().push_back(MutationRecord {
+        mutation_id: "historical".to_owned(),
+        session_id: "external".to_owned(),
+        path: "unrelated/generated.txt".to_owned(),
+        before_hash: None,
+        after_hash: Some("hash".to_owned()),
+        source: "external".to_owned(),
+        request_id: "test".to_owned(),
+        timestamp: Utc::now(),
+        generation: actor.generation(),
+    });
+
+    let started = actor
+        .run(
+            "session",
+            &json!({
+                "command": ["cargo", "--version"],
+                "background": false
+            }),
+        )
+        .await
+        .unwrap();
+    let task_id = started["task_id"].as_str().unwrap();
+    assert_eq!(started["status_fetch"]["kind"], "task_status");
+    assert_eq!(started["status_fetch"]["value"], task_id);
+
+    let fetched = actor
+        .code_fetch(&json!({
+            "items": [{"kind": "task_status", "value": task_id}]
+        }))
+        .unwrap();
+
+    assert_eq!(fetched["result_count"], 1);
+    assert_eq!(fetched["results"][0]["task_id"], task_id);
+    assert_eq!(started["observed_changed_path_count"], 0);
+    assert_eq!(fetched["results"][0]["status"], "succeeded");
+
+    let bounded = actor
+        .code_fetch(&json!({
+            "items": [
+                {"kind": "task_status", "value": task_id},
+                {"kind": "task_status", "value": task_id}
+            ],
+            "max_chars": 5
+        }))
+        .unwrap();
+    assert!(bounded["results"][0]["output"].as_str().unwrap().len() <= 5);
+    assert_eq!(bounded["results"][0]["output_truncated"], true);
+    assert_eq!(bounded["result_count"], 1);
+    assert_eq!(bounded["items_truncated"], true);
+    assert_eq!(bounded["chars_truncated"], true);
+    assert_eq!(bounded["truncated"], true);
+}
+
+#[test]
+fn task_change_detection_includes_new_mutations_to_already_dirty_files() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("existing.rs"), "fn existing() {}\n").unwrap();
+    let actor = test_actor(root.path());
+    let generation = actor.generation();
+    let dirty_files = HashSet::from(["existing.rs".to_owned()]);
+    let baseline = TaskBaseline {
+        generation,
+        dirty_files: dirty_files.clone(),
+    };
+    actor.mutations.lock().push_back(MutationRecord {
+        mutation_id: "during-task".to_owned(),
+        session_id: "external".to_owned(),
+        path: "existing.rs".to_owned(),
+        before_hash: Some("before".to_owned()),
+        after_hash: Some("after".to_owned()),
+        source: "external".to_owned(),
+        request_id: "watcher".to_owned(),
+        timestamp: Utc::now(),
+        generation: generation + 1,
+    });
+
+    let observed = actor.observed_task_changed_paths(&baseline, &dirty_files);
+
+    assert_eq!(observed, HashSet::from(["existing.rs".to_owned()]));
+}
+
+#[test]
 fn search_accepts_multiple_queries() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("alpha.rs"), "fn alpha() {}\n").unwrap();
@@ -136,7 +355,16 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
         .unwrap();
     assert_eq!(context["reconcile_pending"], true);
     assert_eq!(context["result_count"], 1);
+    assert!(context.get("recent_task_failures").is_none());
     assert!(context["phase_ms"]["index_context"].is_number());
+
+    let context_with_failures = actor
+        .code_context(&json!({
+            "query": "existing_symbol",
+            "include_task_failures": true
+        }))
+        .unwrap();
+    assert!(context_with_failures["recent_task_failures"].is_array());
     assert!(actor
         .needs_reconcile
         .load(std::sync::atomic::Ordering::Acquire));
@@ -591,6 +819,51 @@ fn historical_journal_records_are_not_current_session_changes() {
         .changes("test-session", &json!({"since_generation": 0}))
         .unwrap();
     assert!(result["mutations"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn workspace_generation_resumes_after_persisted_journal_records() {
+    let root = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    fs::write(root.path().join("value.rs"), "fn value() {}\n").unwrap();
+    let canonical_root = root.path().canonicalize().unwrap();
+    let repo_cache = cache
+        .path()
+        .join("repos")
+        .join(content_hash(&canonical_root.to_string_lossy()));
+    fs::create_dir_all(&repo_cache).unwrap();
+    let record = MutationRecord {
+        mutation_id: "persisted".to_owned(),
+        session_id: "previous-session".to_owned(),
+        path: "value.rs".to_owned(),
+        before_hash: None,
+        after_hash: Some("hash".to_owned()),
+        source: "external".to_owned(),
+        request_id: "old-request".to_owned(),
+        timestamp: Utc::now(),
+        generation: 99,
+    };
+    fs::write(
+        repo_cache.join("mutations.jsonl"),
+        format!("{}\n", serde_json::to_string(&record).unwrap()),
+    )
+    .unwrap();
+
+    let actor = WorkspaceActor::open(
+        &WorkspaceConfig {
+            id: "main".to_owned(),
+            name: "Main".to_owned(),
+            path: root.path().to_string_lossy().into_owned(),
+            artifact_paths: Vec::new(),
+            exclude_paths: Vec::new(),
+        },
+        test_policy(),
+        HashMap::new(),
+        cache.path().to_path_buf(),
+    )
+    .unwrap();
+
+    assert_eq!(actor.generation(), 99);
 }
 
 #[test]

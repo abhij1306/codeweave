@@ -32,6 +32,7 @@ pub struct TaskView {
     pub output: String,
     pub output_truncated: bool,
     pub log_handle: String,
+    pub status_fetch: serde_json::Value,
     pub pid: Option<u32>,
 }
 
@@ -224,6 +225,72 @@ fn authorize_executable(
     Ok(Some(canonical))
 }
 
+fn authorize_profile_executable(requested: &str, cwd: &Path) -> AppResult<Option<PathBuf>> {
+    if !command_uses_path(requested) {
+        return Ok(None);
+    }
+
+    let requested_path = Path::new(requested);
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        cwd.join(requested_path)
+    };
+    let canonical = candidate.canonicalize().map_err(|error| {
+        AppError::details(
+            "COMMAND_NOT_FOUND",
+            "Configured task profile executable path could not be resolved",
+            json!({"command": requested, "error": error.to_string()}),
+        )
+    })?;
+    if !canonical.is_file() {
+        return Err(AppError::details(
+            "COMMAND_NOT_FOUND",
+            "Configured task profile executable path is not a file",
+            json!({"command": requested, "resolved": canonical}),
+        ));
+    }
+    Ok(Some(canonical))
+}
+
+fn profile_diagnostic(name: &str, profile: &TaskProfile, root: &Path) -> serde_json::Value {
+    let cwd = match profile
+        .cwd
+        .as_deref()
+        .map_or_else(|| Ok(root.to_path_buf()), |cwd| resolve_existing(root, cwd))
+    {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            return json!({
+                "name": name,
+                "valid": false,
+                "cwd": profile.cwd,
+                "command": profile.command,
+                "error": error.0
+            });
+        }
+    };
+    let executable = profile.command.first().cloned().unwrap_or_default();
+    match authorize_profile_executable(&executable, &cwd) {
+        Ok(resolved) => json!({
+            "name": name,
+            "valid": !profile.command.is_empty(),
+            "cwd": cwd,
+            "command": profile.command,
+            "resolved_executable": resolved.unwrap_or_else(|| PathBuf::from(&executable)),
+            "background": profile.background,
+            "timeout_ms": profile.timeout_ms
+        }),
+        Err(error) => json!({
+            "name": name,
+            "valid": false,
+            "cwd": cwd,
+            "command": profile.command,
+            "error": error.0
+        }),
+    }
+}
+
 impl TaskSupervisor {
     pub fn new(
         cache_root: PathBuf,
@@ -255,6 +322,15 @@ impl TaskSupervisor {
         let mut names: Vec<_> = self.profiles.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    pub fn profile_diagnostics(&self, root: &Path) -> Vec<serde_json::Value> {
+        let mut profiles: Vec<_> = self.profiles.iter().collect();
+        profiles.sort_by(|left, right| left.0.cmp(right.0));
+        profiles
+            .into_iter()
+            .map(|(name, profile)| profile_diagnostic(name, profile, root))
+            .collect()
     }
 
     pub fn running_count(&self) -> usize {
@@ -293,9 +369,15 @@ impl TaskSupervisor {
     }
 
     pub async fn start(&self, root: &Path, request: StartRequest) -> AppResult<serde_json::Value> {
-        let (mut command, profile_cwd, profile_timeout, profile_background, output_filter) =
-            if let Some(profile) = &request.profile {
-                let value = self.profiles.get(profile).ok_or_else(|| {
+        let (
+            mut command,
+            profile_cwd,
+            profile_timeout,
+            profile_background,
+            output_filter,
+            is_profile,
+        ) = if let Some(profile) = &request.profile {
+            let value = self.profiles.get(profile).ok_or_else(|| {
                     AppError::details(
                         "UNKNOWN_TASK_PROFILE",
                         "Unknown task profile",
@@ -306,25 +388,27 @@ impl TaskSupervisor {
                         }),
                     )
                 })?;
-                (
-                    value.command.clone(),
-                    value.cwd.clone(),
-                    Some(value.timeout_ms),
-                    value.background,
-                    value.output_filter.clone(),
-                )
-            } else {
-                (
-                    request
-                        .command
-                        .clone()
-                        .ok_or_else(|| AppError::invalid("Provide profile or command"))?,
-                    None,
-                    None,
-                    false,
-                    OutputFilter::Raw,
-                )
-            };
+            (
+                value.command.clone(),
+                value.cwd.clone(),
+                Some(value.timeout_ms),
+                value.background,
+                value.output_filter.clone(),
+                true,
+            )
+        } else {
+            (
+                request
+                    .command
+                    .clone()
+                    .ok_or_else(|| AppError::invalid("Provide profile or command"))?,
+                None,
+                None,
+                false,
+                OutputFilter::Raw,
+                false,
+            )
+        };
         if command.is_empty() {
             return Err(AppError::invalid("Command cannot be empty"));
         }
@@ -346,9 +430,12 @@ impl TaskSupervisor {
         if !cwd.is_dir() {
             return Err(AppError::new("INVALID_CWD", "Task cwd is not a directory"));
         }
-        if let Some(resolved) =
+        let resolved = if is_profile {
+            authorize_profile_executable(&command[0], &cwd)?
+        } else {
             authorize_executable(&command[0], &cwd, &self.policy.allowed_commands)?
-        {
+        };
+        if let Some(resolved) = resolved {
             command[0] = resolved.to_string_lossy().into_owned();
         }
         let run_permit = self
@@ -415,7 +502,8 @@ impl TaskSupervisor {
                 "task_id": task_id,
                 "status": "queued",
                 "background": true,
-                "log_handle": format!("task-log:{task_id}")
+                "log_handle": format!("task-log:{task_id}"),
+                "status_fetch": {"kind": "task_status", "value": task_id}
             }))
         } else {
             let _run_permit = run_permit;
@@ -425,6 +513,14 @@ impl TaskSupervisor {
     }
 
     pub fn status(&self, task_id: &str) -> AppResult<serde_json::Value> {
+        self.status_with_limit(task_id, self.policy.max_task_output_chars)
+    }
+
+    pub fn status_with_limit(
+        &self,
+        task_id: &str,
+        max_output: usize,
+    ) -> AppResult<serde_json::Value> {
         let record = self.tasks.lock().get(task_id).cloned().ok_or_else(|| {
             AppError::details(
                 "TASK_NOT_FOUND",
@@ -433,10 +529,7 @@ impl TaskSupervisor {
             )
         })?;
         let record = record.lock();
-        Ok(serde_json::to_value(view(
-            &record,
-            self.policy.max_task_output_chars,
-        ))?)
+        Ok(serde_json::to_value(view(&record, max_output))?)
     }
 
     pub fn output_stream(
@@ -476,6 +569,7 @@ impl TaskSupervisor {
         Ok(json!({
             "task_id": task_id,
             "status": record.status,
+            "exit_code": record.exit_code,
             "stream": stream.as_str(),
             "output": strip_ansi(&full[offset..end]),
             "continuation": next,
@@ -911,6 +1005,7 @@ fn view(record: &TaskRecord, max_output: usize) -> TaskView {
         output,
         output_truncated: record.output_truncated || record.output.chars().count() > max_output,
         log_handle: format!("task-log:{}", record.task_id),
+        status_fetch: json!({"kind": "task_status", "value": record.task_id}),
         pid: record.pid,
     }
 }
@@ -1040,6 +1135,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(allowed, Some(executable.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn configured_profiles_may_use_relative_executable_paths() {
+        let root = tempdir().unwrap();
+        let executable_name = if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        };
+        let scripts = root.path().join(".venv").join("Scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let executable = scripts.join(executable_name);
+        fs::write(&executable, b"not actually executed").unwrap();
+        let requested = format!(".venv/Scripts/{executable_name}");
+
+        let direct_error =
+            authorize_executable(&requested, root.path(), &["python".to_owned()]).unwrap_err();
+        assert_eq!(direct_error.0.code, "COMMAND_NOT_ALLOWED");
+
+        let profile_allowed = authorize_profile_executable(&requested, root.path()).unwrap();
+        assert_eq!(profile_allowed, Some(executable.canonicalize().unwrap()));
     }
 
     #[test]

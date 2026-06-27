@@ -158,7 +158,12 @@ impl WorkspaceManager {
                 let params = params.clone();
                 run_blocking(move || actor.code_fetch(&params)).await
             }
-            "code_write" | "code_replace" | "code_insert" | "code_delete" | "code_rename" => {
+            "code_capabilities" => {
+                let actor = self.active_actor(session)?;
+                run_blocking(move || actor.code_capabilities()).await
+            }
+            "code_write" | "code_replace" | "code_insert" | "code_delete" | "code_rename"
+            | "code_preview" | "code_transaction" => {
                 let actor = self.active_actor(session)?;
                 let mut prepared = params.clone();
                 if prepared.get("snapshot_id").is_none() {
@@ -301,6 +306,7 @@ impl WorkspaceManager {
             "changes" => self
                 .active_actor(session)?
                 .changes(session.as_str(), params),
+            "diagnostics" => self.active_actor(session)?.diagnostics(),
             "skills" => self.list_skills(),
             "skill" => self.read_skill(params),
             action => Err(AppError::details(
