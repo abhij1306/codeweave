@@ -83,7 +83,7 @@ pub(super) fn changes_without_independent_preconditions(changes: &[Value]) -> Ve
 }
 
 pub(super) const MAX_OBSERVED_CHANGED_PATHS: usize = 30;
-const MAX_CHANGED_PATH_GROUPS: usize = 20;
+pub(super) const MAX_CHANGED_PATH_GROUPS: usize = 20;
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct ChangedPathGroup {
@@ -121,11 +121,9 @@ pub(super) fn summarize_changed_paths(paths: HashSet<String>) -> ChangedPathSumm
             .then_with(|| left.path.cmp(&right.path))
     });
     if groups.len() > MAX_CHANGED_PATH_GROUPS {
-        let other_count = groups[MAX_CHANGED_PATH_GROUPS..]
-            .iter()
-            .map(|group| group.count)
-            .sum();
-        groups.truncate(MAX_CHANGED_PATH_GROUPS);
+        let other_index = MAX_CHANGED_PATH_GROUPS.saturating_sub(1);
+        let other_count = groups[other_index..].iter().map(|group| group.count).sum();
+        groups.truncate(other_index);
         groups.push(ChangedPathGroup {
             path: "(other)".to_owned(),
             count: other_count,

@@ -506,7 +506,7 @@ impl WorkspaceActor {
             "warnings": warnings,
             "open_diagnostics": self.open_diagnostics,
             "dirty_ownership": {
-                "preexisting_at_open": preexisting.paths,
+                "preexisting_at_open": &preexisting.paths,
                 "changed_by_mcp": mcp_changed.paths,
                 "observed_external": external.paths,
                 "counts": {
@@ -520,7 +520,7 @@ impl WorkspaceActor {
                     "observed_external": external.truncated
                 },
                 "groups": {
-                    "preexisting_at_open": preexisting.groups,
+                    "preexisting_at_open": &preexisting.groups,
                     "changed_by_mcp": mcp_changed.groups,
                     "observed_external": external.groups
                 }

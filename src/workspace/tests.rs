@@ -1,6 +1,8 @@
 use super::edit::PlannedFile;
 use super::journal::{rotate_journal_if_needed, MutationRecord, MAX_JOURNAL_BYTES};
-use super::util::{line_range_bytes, summarize_changed_paths, MAX_OBSERVED_CHANGED_PATHS};
+use super::util::{
+    line_range_bytes, summarize_changed_paths, MAX_CHANGED_PATH_GROUPS, MAX_OBSERVED_CHANGED_PATHS,
+};
 use super::{TaskBaseline, WorkspaceActor};
 use crate::index::content_hash;
 use crate::model::{PolicyConfig, WorkspaceConfig};
@@ -923,6 +925,19 @@ fn changed_paths_are_filtered_and_capped() {
     assert_eq!(summary.groups.len(), 1);
     assert_eq!(summary.groups[0].path, "src");
     assert_eq!(summary.groups[0].count, 150);
+}
+
+#[test]
+fn changed_path_groups_reserve_slot_for_other_bucket() {
+    let paths: HashSet<String> = (0..(MAX_CHANGED_PATH_GROUPS + 5))
+        .map(|index| format!("dir_{index}/file.rs"))
+        .collect();
+
+    let summary = summarize_changed_paths(paths);
+
+    assert_eq!(summary.groups.len(), MAX_CHANGED_PATH_GROUPS);
+    assert_eq!(summary.groups.last().unwrap().path, "(other)");
+    assert_eq!(summary.groups.last().unwrap().count, 6);
 }
 
 #[test]
