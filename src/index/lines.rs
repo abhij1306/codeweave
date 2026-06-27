@@ -21,17 +21,26 @@ pub(super) fn fit_excerpt(
     }
 }
 
-pub(super) fn excerpt_lines(content: &str, byte_offset: usize, radius: usize) -> (usize, usize) {
-    let line = content[..byte_offset.min(content.len())]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count()
-        + 1;
-    let total = content.lines().count().max(1);
+pub(super) fn excerpt_lines_with_count(
+    line: usize,
+    total_lines: usize,
+    radius: usize,
+) -> (usize, usize) {
     (
         line.saturating_sub(radius).max(1),
-        (line + radius).min(total),
+        (line + radius).min(total_lines.max(1)),
     )
+}
+
+pub(super) fn line_starts(content: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(content.match_indices('\n').map(|(index, _)| index + 1));
+    starts
+}
+
+pub(super) fn byte_to_line(line_starts: &[usize], byte_offset: usize) -> usize {
+    let offset = byte_offset.min(*line_starts.last().unwrap_or(&0));
+    line_starts.partition_point(|start| *start <= offset).max(1)
 }
 
 pub(super) fn line_start_byte(content: &str, line: usize) -> usize {

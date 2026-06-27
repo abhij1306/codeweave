@@ -11,7 +11,9 @@ use crate::security::{relative_string, validate_relative};
 use crate::symbols::{extract_symbols, language_name, Symbol};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
-use lines::{excerpt_lines, fit_excerpt, hex, line_start_byte};
+use lines::{
+    byte_to_line, excerpt_lines_with_count, fit_excerpt, hex, line_start_byte, line_starts,
+};
 use metadata::{
     build_indexed_terms, classify_document, compact_reason_codes, evidence_allowed,
     low_signal_context_path, normalize_entry, query_terms,
@@ -119,6 +121,10 @@ pub struct FileEntry {
     pub content: String,
     #[serde(skip, default)]
     pub search_content: String,
+    #[serde(default)]
+    pub line_count: usize,
+    #[serde(skip, default)]
+    line_starts: Vec<usize>,
     #[serde(default)]
     indexed_terms: Vec<String>,
     pub hash: String,
@@ -256,7 +262,7 @@ impl CodeIndex {
                     .files
                     .into_iter()
                     .map(|mut file| {
-                        file.search_content = file.content.to_ascii_lowercase();
+                        normalize_entry(&mut file);
                         (file.path.clone(), file)
                     })
                     .collect()
@@ -450,6 +456,21 @@ impl CodeIndex {
             return Some((file.path.clone(), symbol.clone(), file.hash.clone()));
         }
         None
+    }
+
+    fn indexed_symbols<'a>(
+        &'a self,
+        name: &str,
+    ) -> impl Iterator<Item = (&'a FileEntry, &'a Symbol)> + 'a {
+        self.symbol_index
+            .get(name)
+            .into_iter()
+            .flat_map(|entries| entries.iter())
+            .filter_map(|(path, symbol_index)| {
+                let file = self.files.get(path)?;
+                let symbol = file.symbols.get(*symbol_index)?;
+                Some((file, symbol))
+            })
     }
 
     pub fn refresh_paths(
@@ -689,33 +710,36 @@ impl CodeIndex {
             if !path_filters.allows(&file.path) {
                 continue;
             }
-            let lines: Vec<&str> = file.content.lines().collect();
-            let normalized_lines: Vec<&str> = if case_sensitive || regex.is_some() {
-                Vec::new()
-            } else {
-                file.search_content.lines().collect()
-            };
             let mut windows: Vec<(usize, usize, usize)> = Vec::new();
-            for (index, line) in lines.iter().enumerate() {
-                let matched = if let Some(regex) = regex {
-                    regex.is_match(line)
-                } else if case_sensitive {
-                    line.contains(&needle)
-                } else {
-                    normalized_lines[index].contains(&needle)
-                };
-                if !matched {
-                    continue;
-                }
+            let mut record_match = |index: usize| {
                 let start = index.saturating_sub(context_lines) + 1;
-                let end = (index + context_lines + 1).min(lines.len());
+                let end = (index + context_lines + 1).min(file.line_count);
                 if let Some((_, _, previous_end)) = windows.last_mut() {
                     if start <= previous_end.saturating_add(1) {
                         *previous_end = (*previous_end).max(end);
-                        continue;
+                        return;
                     }
                 }
                 windows.push((index + 1, start, end));
+            };
+            if let Some(regex) = regex {
+                for (index, line) in file.content.lines().enumerate() {
+                    if regex.is_match(line) {
+                        record_match(index);
+                    }
+                }
+            } else if case_sensitive {
+                for (index, line) in file.content.lines().enumerate() {
+                    if line.contains(&needle) {
+                        record_match(index);
+                    }
+                }
+            } else {
+                for (index, line) in file.search_content.lines().enumerate() {
+                    if line.contains(&needle) {
+                        record_match(index);
+                    }
+                }
             }
             total_windows += windows.len();
             let mut file_results = Vec::new();
@@ -946,7 +970,9 @@ impl CodeIndex {
         for (score, file, byte_offset, mut reasons) in
             candidates.into_iter().take(max_results.saturating_mul(3))
         {
-            let (start_line, proposed_end) = excerpt_lines(&file.content, byte_offset, 6);
+            let match_line = byte_to_line(&file.line_starts, byte_offset);
+            let (start_line, proposed_end) =
+                excerpt_lines_with_count(match_line, file.line_count, 6);
             let remaining = budget_chars.saturating_sub(used);
             if remaining == 0 {
                 break;
@@ -958,11 +984,6 @@ impl CodeIndex {
             }
             used += excerpt.len();
             reasons = compact_reason_codes(reasons);
-            let match_line = file.content[..byte_offset.min(file.content.len())]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count()
-                + 1;
             let symbol = file
                 .symbols
                 .iter()
@@ -1021,19 +1042,15 @@ impl CodeIndex {
         }
         let mut definitions = Vec::new();
         let mut declaration_lines: HashMap<String, HashSet<usize>> = HashMap::new();
-        for file in self.files.values() {
-            for symbol in &file.symbols {
-                if symbol.name == symbol_name {
-                    declaration_lines
-                        .entry(file.path.clone())
-                        .or_default()
-                        .insert(symbol.start_line);
-                    definitions.push(json!({
-                        "path": file.path,
-                        "symbol": symbol,
-                    }));
-                }
-            }
+        for (file, symbol) in self.indexed_symbols(symbol_name) {
+            declaration_lines
+                .entry(file.path.clone())
+                .or_default()
+                .insert(symbol.start_line);
+            definitions.push(json!({
+                "path": file.path,
+                "symbol": symbol,
+            }));
         }
         if definitions.is_empty() {
             return Err(AppError::details(
@@ -1052,7 +1069,21 @@ impl CodeIndex {
         });
         let identifier = Regex::new(&format!(r"\b{}\b", regex::escape(symbol_name)))
             .map_err(AppError::internal)?;
-        let mut files: Vec<_> = self.files.values().collect();
+        let terms = query_terms(symbol_name);
+        let mut paths = HashSet::new();
+        for term in &terms {
+            if let Some(matches) = self.token_index.get(term) {
+                paths.extend(matches.iter().cloned());
+            }
+        }
+        let mut files: Vec<_> = if paths.is_empty() {
+            self.files.values().collect()
+        } else {
+            paths
+                .iter()
+                .filter_map(|path| self.files.get(path))
+                .collect()
+        };
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let per_file_limit = max_results.clamp(1, 3);
         let mut groups: Vec<VecDeque<serde_json::Value>> = Vec::new();
@@ -1061,10 +1092,9 @@ impl CodeIndex {
             if !path_filters.allows(&file.path) {
                 continue;
             }
-            let lines: Vec<&str> = file.content.lines().collect();
             let mut windows: Vec<(usize, usize, usize)> = Vec::new();
             let mut lines_in_current_window = 0usize;
-            for (index, line) in lines.iter().enumerate() {
+            for (index, line) in file.content.lines().enumerate() {
                 let line_number = index + 1;
                 if declaration_lines
                     .get(&file.path)
@@ -1074,7 +1104,7 @@ impl CodeIndex {
                     continue;
                 }
                 let start = index.saturating_sub(context_lines) + 1;
-                let end = (index + context_lines + 1).min(lines.len());
+                let end = (index + context_lines + 1).min(file.line_count);
                 if let Some((_, _, previous_end)) = windows.last_mut() {
                     if start <= previous_end.saturating_add(1) && lines_in_current_window < 3 {
                         *previous_end = (*previous_end).max(end);
@@ -1153,13 +1183,22 @@ impl CodeIndex {
     ) -> Vec<serde_json::Value> {
         let needle = query.to_ascii_lowercase();
         let mut results = Vec::new();
-        for file in self.files.values() {
-            if !path_filters.allows(&file.path) {
+        for name in self.symbol_index.keys() {
+            let normalized_name = name.to_ascii_lowercase();
+            if (exact && normalized_name != needle)
+                || (!exact && !normalized_name.contains(&needle))
+            {
                 continue;
             }
-            for symbol in &file.symbols {
-                let name = symbol.name.to_ascii_lowercase();
-                if (exact && name != needle) || (!exact && !name.contains(&needle)) {
+            let rank = if normalized_name == needle {
+                0
+            } else if normalized_name.starts_with(&needle) {
+                1
+            } else {
+                2
+            };
+            for (file, symbol) in self.indexed_symbols(name) {
+                if !path_filters.allows(&file.path) {
                     continue;
                 }
                 let handle = encode_handle(&RangeHandle {
@@ -1173,13 +1212,6 @@ impl CodeIndex {
                     symbol: Some(symbol.name.clone()),
                 })
                 .unwrap_or_default();
-                let rank = if name == needle {
-                    0
-                } else if name.starts_with(&needle) {
-                    1
-                } else {
-                    2
-                };
                 results.push((
                     rank,
                     file.path.clone(),
@@ -1454,11 +1486,15 @@ fn read_entry(
     let symbols = extract_symbols(path, &content);
     let search_content = content.to_ascii_lowercase();
     let indexed_terms = build_indexed_terms(&search_content, &path_lower, &symbols);
+    let line_count = content.lines().count().max(1);
+    let line_starts = line_starts(&content);
     Ok(Some(FileEntry {
         path: relative,
         path_lower,
         content,
         search_content,
+        line_count,
+        line_starts,
         indexed_terms,
         hash,
         language,

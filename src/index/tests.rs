@@ -6,6 +6,8 @@ fn test_entry(path: &str, content: &str) -> FileEntry {
         path_lower: path.to_ascii_lowercase(),
         content: content.to_owned(),
         search_content: content.to_ascii_lowercase(),
+        line_count: content.lines().count().max(1),
+        line_starts: line_starts(content),
         indexed_terms: build_indexed_terms(
             content,
             path,

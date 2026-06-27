@@ -157,6 +157,12 @@ pub(super) fn normalize_entry(entry: &mut FileEntry) {
     if entry.path_lower.is_empty() {
         entry.path_lower = entry.path.to_ascii_lowercase();
     }
+    if entry.line_count == 0 {
+        entry.line_count = entry.content.lines().count().max(1);
+    }
+    if entry.line_starts.is_empty() {
+        entry.line_starts = super::lines::line_starts(&entry.content);
+    }
     if entry.indexed_terms.is_empty() {
         entry.indexed_terms =
             build_indexed_terms(&entry.search_content, &entry.path_lower, &entry.symbols);
