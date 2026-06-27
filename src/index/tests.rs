@@ -46,11 +46,10 @@ fn hashes_are_stable() {
 }
 
 #[test]
-fn tokenless_query_and_token_miss_have_no_full_corpus_fallback() {
+fn token_miss_has_no_full_corpus_fallback() {
     let mut index = CodeIndex::default();
     index.insert_entry(test_entry("lib.rs", "pub fn indexed_symbol() {}\n"));
 
-    assert!(index.candidate_files(&[]).is_empty());
     assert!(index
         .candidate_files(&["definitely_missing_token".to_owned()])
         .is_empty());
@@ -246,6 +245,29 @@ fn reference_search_is_explicit_and_excludes_the_declaration() {
     assert_eq!(result["mode"], "references");
     assert_eq!(result["definitions"][0]["path"], "src/workspace.rs");
     assert_eq!(result["results"][0]["path"], "src/main.rs");
+}
+
+#[test]
+fn reference_search_finds_usages_for_single_character_symbols() {
+    let mut index = CodeIndex::default();
+    index.insert_entry(test_entry("src/owner.rs", "pub fn x() {}\n"));
+    index.insert_entry(test_entry("src/caller.rs", "fn call() { x(); }\n"));
+
+    let result = index
+        .search(SearchParams {
+            workspace_id: "main",
+            snapshot_id: "snap_test",
+            mode: "references",
+            query: "x",
+            path_filters: &[],
+            case_sensitive: true,
+            max_results: 10,
+            context_lines: 0,
+        })
+        .unwrap();
+
+    assert_eq!(result["definitions"][0]["path"], "src/owner.rs");
+    assert_eq!(result["results"][0]["path"], "src/caller.rs");
 }
 
 #[test]
@@ -451,6 +473,30 @@ fn literal_search_merges_overlapping_hits_and_distributes_files() {
 }
 
 #[test]
+fn literal_search_scans_for_short_and_stop_word_queries() {
+    let mut index = CodeIndex::default();
+    index.insert_entry(test_entry("src/value.rs", "let x = to();\n"));
+
+    for query in ["x", "to"] {
+        let result = index
+            .search(SearchParams {
+                workspace_id: "main",
+                snapshot_id: "snap_test",
+                mode: "literal",
+                query,
+                path_filters: &[],
+                case_sensitive: true,
+                max_results: 10,
+                context_lines: 0,
+            })
+            .unwrap();
+
+        assert_eq!(result["result_count"], 1, "query: {query}");
+        assert_eq!(result["results"][0]["path"], "src/value.rs");
+    }
+}
+
+#[test]
 fn regex_search_honors_case_sensitivity() {
     let mut index = CodeIndex::default();
     index.insert_entry(test_entry("src/value.rs", "Alpha\nmiddle\nalpha\n"));
@@ -644,6 +690,25 @@ fn configured_exclusions_apply_to_scans_and_incremental_refreshes() {
         .unwrap();
     assert!(changed.is_empty());
     assert!(index.get("backend/artifacts/new.json").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_exclusions_resolve_noncanonical_absolute_paths() {
+    let workspace = tempfile::tempdir().unwrap();
+    let canonical_workspace = workspace.path().canonicalize().unwrap();
+    let excluded_dir = canonical_workspace.join("backend/artifacts");
+    fs::create_dir_all(&excluded_dir).unwrap();
+    fs::write(excluded_dir.join("result.json"), "generated result").unwrap();
+    let alias_parent = tempfile::tempdir().unwrap();
+    let aliased_workspace = alias_parent.path().join("workspace");
+    std::os::unix::fs::symlink(&canonical_workspace, &aliased_workspace).unwrap();
+    let aliased_file = aliased_workspace.join("backend/artifacts/result.json");
+    let exclusions =
+        WorkspaceExclusions::new(&canonical_workspace, &["backend/artifacts/".to_owned()]).unwrap();
+
+    assert!(aliased_file.exists());
+    assert!(exclusions.is_ignored(&aliased_file, false));
 }
 
 #[test]

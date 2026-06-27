@@ -1,7 +1,8 @@
 use super::edit::PlannedFile;
 use super::journal::{rotate_journal_if_needed, MutationRecord, MAX_JOURNAL_BYTES};
 use super::util::{
-    line_range_bytes, summarize_changed_paths, MAX_CHANGED_PATH_GROUPS, MAX_OBSERVED_CHANGED_PATHS,
+    line_ending_label, line_range_bytes, normalize_line_endings_for_content,
+    summarize_changed_paths, MAX_CHANGED_PATH_GROUPS, MAX_OBSERVED_CHANGED_PATHS,
 };
 use super::{TaskBaseline, WorkspaceActor};
 use crate::index::content_hash;
@@ -134,6 +135,44 @@ async fn fetched_windows_text_can_be_previewed_and_applied_exactly() {
         .await
         .unwrap();
     assert_eq!(applied["applied"], true);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"before\r\nnew value\r\nafter\r\n"
+    );
+}
+
+#[tokio::test]
+async fn exact_replace_prefers_normalized_crlf_match_over_raw_lf_suffix() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("windows.txt");
+    fs::write(&path, b"before\r\nold value\r\nafter\r\n").unwrap();
+    let actor = test_actor(root.path());
+    let fetched = actor
+        .code_fetch(&json!({
+            "path": "windows.txt",
+            "start_line": 1,
+            "end_line": 2,
+            "max_chars": 5_000
+        }))
+        .unwrap();
+    let handle = fetched["results"][0]["handle"].as_str().unwrap();
+
+    actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [{
+                    "kind": "replace",
+                    "path": "windows.txt",
+                    "handle": handle,
+                    "old_text": "\nold value",
+                    "new_text": "\nnew value"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
     assert_eq!(
         fs::read(&path).unwrap(),
         b"before\r\nnew value\r\nafter\r\n"
@@ -842,6 +881,21 @@ async fn unknown_validation_profile_fails_before_mutation() {
 fn reversed_handle_ranges_are_rejected() {
     let error = line_range_bytes("first\nsecond\n", 3, 2).unwrap_err();
     assert_eq!(error.0.code, "INVALID_HANDLE_RANGE");
+}
+
+#[test]
+fn cr_only_content_is_not_treated_as_supported_multiline_text() {
+    let content = "first\rsecond\r";
+
+    assert_eq!(line_ending_label(content), "mixed");
+    assert_eq!(
+        normalize_line_endings_for_content(content, "replacement\ntext"),
+        "replacement\ntext"
+    );
+    assert_eq!(
+        line_range_bytes(content, 2, 2).unwrap(),
+        (content.len(), content.len())
+    );
 }
 
 #[test]

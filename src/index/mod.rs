@@ -87,6 +87,15 @@ impl WorkspaceExclusions {
             return Some(path.to_string_lossy().replace('\\', "/"));
         }
         let normalized = normalized_absolute_path(path);
+        if let Some(relative) = self.relative_from_normalized(&normalized) {
+            return Some(relative);
+        }
+        let canonical = path.canonicalize().ok()?;
+        let normalized = normalized_absolute_path(&canonical);
+        self.relative_from_normalized(&normalized)
+    }
+
+    fn relative_from_normalized(&self, normalized: &str) -> Option<String> {
         let root_len = self.normalized_root.len();
         if normalized.len() < root_len
             || !normalized.as_bytes()[..root_len]
@@ -405,7 +414,7 @@ impl CodeIndex {
 
     fn candidate_files<'a>(&'a self, terms: &[String]) -> Vec<&'a FileEntry> {
         if terms.is_empty() {
-            return Vec::new();
+            return self.files.values().collect();
         }
         let mut paths = HashSet::new();
         for term in terms {
@@ -1066,16 +1075,20 @@ impl CodeIndex {
         let identifier = Regex::new(&format!(r"\b{}\b", regex::escape(symbol_name)))
             .map_err(AppError::internal)?;
         let terms = query_terms(symbol_name);
-        let mut paths = HashSet::new();
-        for term in &terms {
-            if let Some(matches) = self.token_index.get(term) {
-                paths.extend(matches.iter().cloned());
+        let mut files: Vec<_> = if terms.is_empty() {
+            self.files.values().collect()
+        } else {
+            let mut paths = HashSet::new();
+            for term in &terms {
+                if let Some(matches) = self.token_index.get(term) {
+                    paths.extend(matches.iter().cloned());
+                }
             }
-        }
-        let mut files: Vec<_> = paths
-            .iter()
-            .filter_map(|path| self.files.get(path))
-            .collect();
+            paths
+                .iter()
+                .filter_map(|path| self.files.get(path))
+                .collect()
+        };
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let per_file_limit = max_results.clamp(1, 3);
         let mut groups: Vec<VecDeque<serde_json::Value>> = Vec::new();

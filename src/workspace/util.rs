@@ -45,7 +45,6 @@ pub(super) fn line_ending_label(content: &str) -> &'static str {
         (0, 0, 0) => "none",
         (_, 0, 0) if crlf > 0 => "crlf",
         (0, _, 0) if lf > 0 => "lf",
-        (0, 0, _) if cr > 0 => "cr",
         _ => "mixed",
     }
 }
@@ -54,7 +53,6 @@ pub(super) fn normalize_line_endings_for_content(content: &str, text: &str) -> S
     match line_ending_label(content) {
         "crlf" => normalize_line_endings(text, "\r\n"),
         "lf" => normalize_line_endings(text, "\n"),
-        "cr" => normalize_line_endings(text, "\r"),
         _ => text.to_owned(),
     }
 }

@@ -910,14 +910,13 @@ fn put_plan(
 }
 
 fn matching_old_text(content: &str, selected: &str, old: &str, expected: usize) -> (String, usize) {
-    let count = selected.match_indices(old).count();
-    if count == expected {
-        return (old.to_owned(), count);
-    }
     let normalized = normalize_line_endings_for_content(content, old);
     if normalized != old {
         let normalized_count = selected.match_indices(&normalized).count();
-        return (normalized, normalized_count);
+        if normalized_count == expected {
+            return (normalized, normalized_count);
+        }
     }
+    let count = selected.match_indices(old).count();
     (old.to_owned(), count)
 }
