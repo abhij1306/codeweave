@@ -25,6 +25,7 @@ use std::{
     sync::Arc,
 };
 use subtle::ConstantTimeEq;
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const SERVER_NAME: &str = "codeweave-rust";
@@ -120,6 +121,15 @@ fn load_config(path: &Path) -> Result<(ServerConfig, Value)> {
     object.remove("server");
     object.remove("rust");
     Ok((server, root))
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("codeweave_rust=info,tower_http=info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .init();
 }
 
 fn config_relative_path(config_path: &Path, configured_path: &str) -> PathBuf {
@@ -723,6 +733,7 @@ fn load_or_create_bearer_token(path: &Path) -> Result<String> {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    init_tracing();
     let cli = Cli::parse();
     let (server, config) = load_config(&cli.config)?;
     validate_auth_mode(&server.auth_mode)?;
