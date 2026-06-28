@@ -37,73 +37,13 @@
     "maxFileBytes": 2000000,
     "maxContextChars": 50000,
     "maxSearchResults": 100,
-    "maxTaskOutputChars": 30000,
-    "shellEnabled": false,
-    "allowedCommands": [
-      "git",
-      "rg",
-      "node",
-      "npm",
-      "npx",
-      "pnpm",
-      "python",
-      "pytest",
-      "cargo"
-    ]
-  },
-  "tasks": {
-    "test": {
-      "command": [
-        ".venv\\Scripts\\python.exe",
-        "-m",
-        "pytest",
-        "tests",
-        "-q",
-        "--tb=short"
-      ],
-      "cwd": "backend",
-      "timeoutMs": 300000,
-      "background": false,
-      "outputFilter": {
-        "type": "failedTail",
-        "chars": 30000
-      }
-    },
-    "check": {
-      "command": [
-        ".venv\\Scripts\\python.exe",
-        "-m",
-        "ruff",
-        "check",
-        "app"
-      ],
-      "cwd": "backend",
-      "timeoutMs": 120000
-    },
-    "vp-check": {
-      "command": [
-        "vp",
-        "check"
-      ],
-      "timeoutMs": 120000
-    },
-    "vp-test": {
-      "command": [
-        "vp",
-        "test"
-      ],
-      "timeoutMs": 300000,
-      "outputFilter": {
-        "type": "failedTail",
-        "chars": 30000
-      }
-    },
-    "vp-build": {
-      "command": [
-        "vp",
-        "build"
-      ],
-      "timeoutMs": 300000
+    "bash": {
+      "enabled": true,
+      "executable": "bash",
+      "defaultTimeoutMs": 120000,
+      "maxTimeoutMs": 300000,
+      "maxOutputChars": 30000,
+      "retentionHours": 1
     }
   }
 }

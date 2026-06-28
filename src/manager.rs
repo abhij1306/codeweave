@@ -98,6 +98,37 @@ fn validate_skill_name(name: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn reject_legacy_execution_config(config: &Value) -> AppResult<()> {
+    let mut keys = Vec::new();
+    if config.get("tasks").is_some() {
+        keys.push("tasks");
+    }
+    if let Some(policy) = config.get("policy").and_then(Value::as_object) {
+        for key in [
+            "allowedCommands",
+            "allowed_commands",
+            "shellEnabled",
+            "shell_enabled",
+            "maxTaskOutputChars",
+            "max_task_output_chars",
+            "taskRetentionHours",
+            "task_retention_hours",
+        ] {
+            if policy.contains_key(key) {
+                keys.push(key);
+            }
+        }
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::details(
+        "LEGACY_EXECUTION_CONFIG",
+        "Task profile execution configuration is no longer supported; migrate to policy.bash",
+        json!({"legacy_keys": keys, "migration_target": "policy.bash"}),
+    ))
+}
+
 impl WorkspaceManager {
     pub async fn dispatch(
         self: &Arc<Self>,
@@ -179,31 +210,48 @@ impl WorkspaceManager {
                 let params = params.clone();
                 run_blocking(move || actor.git(&params)).await
             }
-            "task_run" | "task_status" | "task_output" | "task_cancel" => {
+            "bash" | "bash_status" | "bash_output" | "bash_cancel" => {
                 let action = match method {
-                    "task_run" => "start",
-                    "task_status" => "status",
-                    "task_output" => "output",
-                    "task_cancel" => "cancel",
-                    _ => unreachable!("matched task method"),
+                    "bash" => "start",
+                    "bash_status" => "status",
+                    "bash_output" => "output",
+                    "bash_cancel" => "cancel",
+                    _ => unreachable!("matched Bash method"),
                 };
                 let mut prepared = params.clone();
-                if method == "task_run" {
-                    let valid_profile = prepared
-                        .get("profile")
+                let allowed_fields: &[&str] = match method {
+                    "bash" => &["command", "cwd", "background", "timeout_ms"],
+                    "bash_status" | "bash_cancel" => &["run_id"],
+                    "bash_output" => &["run_id", "stream", "continuation"],
+                    _ => unreachable!("matched Bash method"),
+                };
+                let has_disallowed_field = match prepared.as_object() {
+                    Some(object) => object
+                        .keys()
+                        .any(|field| !allowed_fields.contains(&field.as_str())),
+                    None => true,
+                };
+                if has_disallowed_field {
+                    return Err(AppError::invalid(format!(
+                        "{method} received an unknown or spoofed field"
+                    )));
+                }
+                if method == "bash" {
+                    let valid_command = prepared
+                        .get("command")
                         .and_then(Value::as_str)
-                        .is_some_and(|profile| !profile.is_empty());
-                    let has_disallowed_field = match prepared.as_object() {
-                        Some(object) => object
-                            .keys()
-                            .any(|field| !matches!(field.as_str(), "profile" | "action")),
-                        None => true,
-                    };
-                    if !valid_profile || has_disallowed_field {
-                        return Err(AppError::invalid(
-                            "task_run requires exactly one non-empty profile and accepts no command overrides",
-                        ));
+                        .is_some_and(|command| !command.trim().is_empty());
+                    if !valid_command {
+                        return Err(AppError::invalid("bash requires a non-empty command"));
                     }
+                } else if prepared
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(AppError::invalid(format!(
+                        "{method} requires a non-empty run_id"
+                    )));
                 }
                 prepared["action"] = Value::String(action.to_owned());
                 self.active_actor(session)?
@@ -226,14 +274,15 @@ impl WorkspaceManager {
     }
 
     fn initialize(&self, params: &Value) -> AppResult<Value> {
+        reject_legacy_execution_config(params)?;
         let config: DaemonConfig = serde_json::from_value(params.clone())?;
         for actor in self.actors.read().values() {
-            let running_tasks = actor.running_task_count();
-            if running_tasks > 0 {
+            let running_runs = actor.running_bash_count();
+            if running_runs > 0 {
                 return Err(AppError::details(
                     "WORKSPACE_BUSY",
-                    "Cannot reinitialize while tasks are running",
-                    json!({"running_tasks": running_tasks}),
+                    "Cannot reinitialize while Bash runs are active",
+                    json!({"running_runs": running_runs}),
                 ));
             }
         }
@@ -388,12 +437,12 @@ impl WorkspaceManager {
                 );
                 return Ok(summary);
             }
-            let running_tasks = actor.running_task_count();
-            if running_tasks > 0 {
+            let running_runs = actor.running_bash_count();
+            if running_runs > 0 {
                 return Err(AppError::details(
                     "WORKSPACE_BUSY",
-                    "Cannot switch repositories while tasks are running in this session",
-                    json!({"running_tasks": running_tasks, "suggested_action": "Wait for or cancel active tasks before switching repositories"}),
+                    "Cannot switch repositories while Bash runs are active in this session",
+                    json!({"running_runs": running_runs, "suggested_action": "Wait for or cancel active Bash runs before switching repositories"}),
                 ));
             }
         }
@@ -414,7 +463,6 @@ impl WorkspaceManager {
                 match WorkspaceActor::open(
                     &canonical_workspace,
                     config.policy.clone(),
-                    config.tasks.clone(),
                     PathBuf::from(config.cache_root),
                 ) {
                     Ok(actor) => {
@@ -535,7 +583,7 @@ impl WorkspaceManager {
                 .actors
                 .read()
                 .get(&candidate)
-                .map(|actor| actor.running_task_count() == 0)
+                .map(|actor| actor.running_bash_count() == 0)
                 .unwrap_or(false);
             if can_remove {
                 self.actors.write().remove(&candidate);
@@ -786,9 +834,21 @@ fn add_phase_metrics(value: &mut Value, phases: &[(&str, u128)]) {
 mod tests {
     use super::*;
     use crate::model::{
-        PolicyConfig, SkillsConfig, TaskProfile, WorkspaceConfig, WorkspaceSettings,
+        test_bash_executable, BashConfig, PolicyConfig, SkillsConfig, WorkspaceConfig,
+        WorkspaceSettings,
     };
     use tempfile::tempdir;
+
+    fn test_bash_config() -> BashConfig {
+        BashConfig {
+            enabled: true,
+            executable: test_bash_executable(),
+            default_timeout_ms: 120_000,
+            max_timeout_ms: 300_000,
+            max_output_chars: 30_000,
+            retention_hours: 1,
+        }
+    }
 
     fn daemon_config(
         root: &std::path::Path,
@@ -809,53 +869,45 @@ mod tests {
                 max_file_bytes,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks: HashMap::new(),
             cache_root: cache.to_string_lossy().into_owned(),
         })
         .unwrap()
     }
 
-    #[cfg(windows)]
-    fn sleep_command() -> (Vec<String>, String) {
-        (
-            vec![
-                "powershell".to_owned(),
-                "-NoProfile".to_owned(),
-                "-Command".to_owned(),
-                "Start-Sleep -Seconds 30".to_owned(),
-            ],
-            "powershell".to_owned(),
-        )
+    #[test]
+    fn initialize_accepts_bash_policy_and_rejects_legacy_execution_keys() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let valid = daemon_config(root.path(), cache.path(), 1_000_000);
+        WorkspaceManager::default().initialize(&valid).unwrap();
+
+        for (key, value) in [
+            ("allowedCommands", json!(["cargo"])),
+            ("shellEnabled", json!(false)),
+            ("maxTaskOutputChars", json!(30_000)),
+            ("taskRetentionHours", json!(1)),
+        ] {
+            let mut legacy = valid.clone();
+            legacy["policy"][key] = value;
+            let error = WorkspaceManager::default().initialize(&legacy).unwrap_err();
+            assert_eq!(error.0.code, "LEGACY_EXECUTION_CONFIG", "{key}");
+            assert!(error.0.message.contains("policy.bash"));
+        }
+
+        let mut legacy_tasks = valid;
+        legacy_tasks["tasks"] = json!({});
+        let error = WorkspaceManager::default()
+            .initialize(&legacy_tasks)
+            .unwrap_err();
+        assert_eq!(error.0.code, "LEGACY_EXECUTION_CONFIG");
+        assert!(error.0.message.contains("policy.bash"));
     }
 
-    #[cfg(not(windows))]
-    fn sleep_command() -> (Vec<String>, String) {
-        (
-            vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
-            "sh".to_owned(),
-        )
-    }
-
-    fn sleep_task() -> (HashMap<String, TaskProfile>, String) {
-        let (command, allowed_command) = sleep_command();
-        (
-            HashMap::from([(
-                "sleep".to_owned(),
-                TaskProfile {
-                    command,
-                    cwd: None,
-                    timeout_ms: 60_000,
-                    background: true,
-                    output_filter: Default::default(),
-                },
-            )]),
-            allowed_command,
-        )
+    fn sleep_command() -> &'static str {
+        "echo started; sleep 30"
     }
 
     #[test]
@@ -877,12 +929,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks: HashMap::new(),
             cache_root: cache.path().to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -925,12 +973,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks: HashMap::new(),
             cache_root: cache.path().to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -968,12 +1012,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks: HashMap::new(),
             cache_root: cache.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1022,12 +1062,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks: HashMap::new(),
             cache_root: cache.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1076,12 +1112,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks: HashMap::new(),
             cache_root: cache.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1134,12 +1166,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks: HashMap::new(),
             cache_root: cache.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1187,12 +1215,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks: HashMap::new(),
             cache_root: cache.path().to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1244,12 +1268,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks: HashMap::new(),
             cache_root: cache.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1294,7 +1314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn running_task_blocks_only_owning_session_switch_and_global_reinitialize() {
+    async fn running_bash_blocks_only_owning_session_switch_and_global_reinitialize() {
         let root = tempdir().unwrap();
         let first = root.path().join("first");
         let second = root.path().join("second");
@@ -1303,7 +1323,6 @@ mod tests {
         std::fs::create_dir_all(&second).unwrap();
         std::fs::write(first.join("main.rs"), "fn first() {}\n").unwrap();
         std::fs::write(second.join("main.rs"), "fn second() {}\n").unwrap();
-        let (tasks, allowed_command) = sleep_task();
         let manager = Arc::new(WorkspaceManager::default());
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
@@ -1318,12 +1337,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec![allowed_command],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks,
             cache_root: cache.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1342,7 +1357,11 @@ mod tests {
             .await
             .unwrap();
         let started = manager
-            .dispatch(session_a.clone(), "task_run", &json!({"profile": "sleep"}))
+            .dispatch(
+                session_a.clone(),
+                "bash",
+                &json!({"command": sleep_command(), "background": true}),
+            )
             .await
             .unwrap();
         assert_eq!(started["background"], true);
@@ -1372,9 +1391,9 @@ mod tests {
             .unwrap_err();
         assert_eq!(reinitialize_error.0.code, "WORKSPACE_BUSY");
 
-        let task_id = started["task_id"].as_str().unwrap();
+        let run_id = started["run_id"].as_str().unwrap();
         let _ = manager
-            .dispatch(session_a, "task_cancel", &json!({"task_id": task_id}))
+            .dispatch(session_a, "bash_cancel", &json!({"run_id": run_id}))
             .await;
     }
 
@@ -1461,12 +1480,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks: HashMap::new(),
             cache_root: cache_file.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1502,12 +1517,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks: HashMap::new(),
             cache_root: allowed.path().join("cache").to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1555,12 +1566,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec!["cargo".to_owned()],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks: HashMap::new(),
             cache_root: cache.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1590,7 +1597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_run_dispatch_requires_only_a_profile_and_forces_start_action() {
+    async fn bash_dispatch_validates_command_fields_and_forces_start_action() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
@@ -1608,8 +1615,8 @@ mod tests {
         let raw_command = manager
             .dispatch(
                 SessionKey::stdio(),
-                "task_run",
-                &json!({"command": ["not-allowed"]}),
+                "bash",
+                &json!({"command": ["not-a-string"]}),
             )
             .await
             .unwrap_err();
@@ -1618,12 +1625,18 @@ mod tests {
         let spoofed_action = manager
             .dispatch(
                 SessionKey::stdio(),
-                "task_run",
-                &json!({"profile": "missing", "action": "cancel"}),
+                "bash",
+                &json!({"command": "printf test", "action": "cancel"}),
             )
             .await
             .unwrap_err();
-        assert_eq!(spoofed_action.0.code, "UNKNOWN_TASK_PROFILE");
+        assert_eq!(spoofed_action.0.code, "INVALID_ARGUMENT");
+
+        let removed = manager
+            .dispatch(SessionKey::stdio(), "task_run", &json!({"profile": "test"}))
+            .await
+            .unwrap_err();
+        assert_eq!(removed.0.code, "METHOD_NOT_FOUND");
     }
 
     #[tokio::test]
@@ -1641,7 +1654,6 @@ mod tests {
             .unwrap();
             workspaces.push(workspace);
         }
-        let (tasks, allowed_command) = sleep_task();
         let manager = Arc::new(WorkspaceManager::default());
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
@@ -1656,12 +1668,8 @@ mod tests {
                 max_file_bytes: 1_000_000,
                 max_context_chars: 50_000,
                 max_search_results: 100,
-                max_task_output_chars: 30_000,
-                shell_enabled: false,
-                allowed_commands: vec![allowed_command],
-                task_retention_hours: None,
+                bash: test_bash_config(),
             },
-            tasks,
             cache_root: cache.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1681,8 +1689,8 @@ mod tests {
         let started = manager
             .dispatch(
                 running_session.clone(),
-                "task_run",
-                &json!({"profile": "sleep"}),
+                "bash",
+                &json!({"command": sleep_command(), "background": true}),
             )
             .await
             .unwrap();
@@ -1707,15 +1715,15 @@ mod tests {
         assert!(manager.actors.read().contains_key(&running_key));
         assert!(manager.actors.read().len() > MAX_CACHED_WORKSPACES);
 
-        let task_id = started["task_id"].as_str().unwrap();
+        let run_id = started["run_id"].as_str().unwrap();
         let _ = running_actor
             .run(
                 running_session.as_str(),
-                &json!({"action": "cancel", "task_id": task_id}),
+                &json!({"action": "cancel", "run_id": run_id}),
             )
             .await;
         for _ in 0..50 {
-            if running_actor.running_task_count() == 0 {
+            if running_actor.running_bash_count() == 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

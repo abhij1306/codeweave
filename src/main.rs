@@ -1,12 +1,12 @@
+mod bash;
 mod index;
 mod manager;
 mod mcp_transport;
 mod model;
+mod process_runtime;
 mod repository;
 mod security;
 mod symbols;
-mod task_runtime;
-mod tasks;
 mod workspace;
 
 use anyhow::{Context, Result};
@@ -166,8 +166,7 @@ fn tools() -> Value {
     // reads these per advertised tool, so every tool must map to exactly one level.
     // READ: no side effects. WRITE_CLOSED: mutates local state only.
     // DESTRUCTIVE_CLOSED: may discard local state. WRITE_OPEN reaches the network.
-    // There is no open-world execution level
-    // because all command execution is constrained to configured task profiles.
+    // DESTRUCTIVE_OPEN can run arbitrary commands as the CodeWeave OS user.
     let read = json!({
         "readOnlyHint": true,
         "destructiveHint": false,
@@ -189,6 +188,12 @@ fn tools() -> Value {
     let write_open = json!({
         "readOnlyHint": false,
         "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+    });
+    let destructive_open = json!({
+        "readOnlyHint": false,
+        "destructiveHint": true,
         "idempotentHint": false,
         "openWorldHint": true
     });
@@ -232,7 +237,7 @@ fn tools() -> Value {
             "exclude_terms":{"type":"array","items":{"type":"string","minLength":1,"maxLength":80}},
             "document_types":{"type":"array","items":{"type":"string","enum":["source","test","instruction","artifact","runtime_evidence","log"]}},
             "min_score":{"type":"number","minimum":0},
-            "include_task_failures":{"type":"boolean","default":false,"description":"Include up to three recent task failures relevant to this query."}
+            "include_bash_failures":{"type":"boolean","default":false,"description":"Include up to three recent Bash failures relevant to this query."}
           },
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
@@ -252,7 +257,7 @@ fn tools() -> Value {
       {
         "name":"code_fetch",
         "title":"Fetch Exact Code or Logs",
-        "description":"Read a file, file range, symbol, task log, or previous continuation. For a single file, pass path directly; use items to batch reads.",
+        "description":"Read a file, file range, symbol, Bash log, or previous continuation. For a single file, pass path directly; use items to batch reads.",
         "annotations":read.clone(),
         "execution":execution.clone(),
         "inputSchema":{
@@ -261,7 +266,7 @@ fn tools() -> Value {
             "path":{"type":"string"},
             "start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
             "end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
-            "items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["path","handle","symbol","metadata","task_status","task_log","continuation"]},"value":{"type":"string","minLength":1},"start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},"end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},"context_lines":{"type":"integer","minimum":0,"maximum":200},"include_imports":{"type":"boolean"}},"required":["kind","value"],"additionalProperties":false}},
+            "items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["path","handle","symbol","metadata","bash_status","bash_log","continuation"]},"value":{"type":"string","minLength":1},"start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},"end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},"context_lines":{"type":"integer","minimum":0,"maximum":200},"include_imports":{"type":"boolean"}},"required":["kind","value"],"additionalProperties":false}},
             "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"},
             "max_chars":{"type":"integer","minimum":1,"maximum":200000}
           },
@@ -598,66 +603,69 @@ fn tools() -> Value {
         }
       }
     ]);
-    let mut task_tools = json!([
+    let mut bash_tools = json!([
       {
-        "name":"task_run",
-        "title":"Run Configured Task",
-        "description":"Run a configured task profile such as tests, type checks, or builds. The profile defines the exact command; no arbitrary commands are accepted.",
-        "annotations":write_closed.clone(),
+        "name":"bash",
+        "title":"Run Bash Command",
+        "description":"Run a Bash command as the CodeWeave OS user. This is trusted-client functionality, not a sandbox.",
+        "annotations":destructive_open.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
           "properties":{
-            "profile":{"type":"string","minLength":1,"description":"Configured task profile name."}
+            "command":{"type":"string","minLength":1,"description":"Command string passed to the configured Bash executable with -c."},
+            "cwd":{"type":"string","description":"Existing workspace-relative directory. Defaults to the workspace root."},
+            "background":{"type":"boolean","default":false},
+            "timeout_ms":{"type":"integer","minimum":1}
           },
-          "required":["profile"],
+          "required":["command"],
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
       },
       {
-        "name":"task_status",
-        "title":"Task Status",
-        "description":"Return the live status and tail for a background task.",
+        "name":"bash_status",
+        "title":"Bash Run Status",
+        "description":"Return live or completed state and the retained output tail for a Bash run.",
         "annotations":read.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
           "properties":{
-            "task_id":{"type":"string"}
+            "run_id":{"type":"string","minLength":1}
           },
-          "required":["task_id"],
+          "required":["run_id"],
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
       },
       {
-        "name":"task_output",
-        "title":"Task Output",
-        "description":"Return retained output for a background task. Page with the returned continuation token.",
+        "name":"bash_output",
+        "title":"Bash Run Output",
+        "description":"Page retained combined, stdout, or stderr output for a Bash run.",
         "annotations":read.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
           "properties":{
-            "task_id":{"type":"string"},
+            "run_id":{"type":"string","minLength":1},
             "stream":{"type":"string","enum":["combined","stdout","stderr"]},
             "continuation":{"type":"string"}
           },
-          "required":["task_id"],
+          "required":["run_id"],
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
       },
       {
-        "name":"task_cancel",
-        "title":"Cancel Task",
-        "description":"Cancel a running background task. Partial output is retained.",
+        "name":"bash_cancel",
+        "title":"Cancel Bash Run",
+        "description":"Cancel a running background Bash run. Partial output is retained.",
         "annotations":write_closed.clone(),
         "execution":execution.clone(),
         "inputSchema":{
           "type":"object",
           "properties":{
-            "task_id":{"type":"string"}
+            "run_id":{"type":"string","minLength":1}
           },
-          "required":["task_id"],
+          "required":["run_id"],
           "$schema":"http://json-schema.org/draft-07/schema#"
         }
       }
@@ -668,9 +676,9 @@ fn tools() -> Value {
         .expect("git tools must be an array")
         .iter_mut()
         .chain(
-            task_tools
+            bash_tools
                 .as_array_mut()
-                .expect("task tools must be an array")
+                .expect("Bash tools must be an array")
                 .iter_mut(),
         )
     {
@@ -689,9 +697,9 @@ fn tools() -> Value {
         .as_array_mut()
         .expect("core tools must be an array")
         .append(
-            task_tools
+            bash_tools
                 .as_array_mut()
-                .expect("task tools must be an array"),
+                .expect("Bash tools must be an array"),
         );
     advertised
 }
@@ -767,10 +775,6 @@ fn tool_action(method: &str) -> Option<&'static str> {
         "git_commit" => Some("commit"),
         "git_restore" => Some("restore"),
         "git_push" => Some("push"),
-        "task_run" => Some("start"),
-        "task_status" => Some("status"),
-        "task_output" => Some("output"),
-        "task_cancel" => Some("cancel"),
         _ => None,
     }
 }
@@ -781,6 +785,16 @@ async fn prepare(
     method: &str,
     input: Value,
 ) -> Result<Value, model::AppError> {
+    if matches!(
+        method,
+        "task_run" | "task_status" | "task_output" | "task_cancel"
+    ) {
+        return Err(model::AppError::details(
+            "METHOD_NOT_FOUND",
+            "Task profile tools were removed; use bash, bash_status, bash_output, or bash_cancel",
+            json!({"method": method}),
+        ));
+    }
     let mut params = object(input);
     if method == "code_context" {
         if let Some(terms) = params.remove("terms").and_then(|v| v.as_array().cloned()) {
@@ -839,14 +853,33 @@ async fn prepare(
     if is_code_mutation(method) {
         normalize_code_mutation(method, &mut params);
     }
-    if method == "task_run" {
-        let has_profile = params
-            .get("profile")
+    if matches!(
+        method,
+        "bash" | "bash_status" | "bash_output" | "bash_cancel"
+    ) {
+        let allowed_fields: &[&str] = match method {
+            "bash" => &["command", "cwd", "background", "timeout_ms"],
+            "bash_status" | "bash_cancel" => &["run_id"],
+            "bash_output" => &["run_id", "stream", "continuation"],
+            _ => unreachable!("matched Bash tool"),
+        };
+        if params
+            .keys()
+            .any(|field| !allowed_fields.contains(&field.as_str()))
+        {
+            return Err(model::AppError::invalid(format!(
+                "{method} received an unknown or spoofed field"
+            )));
+        }
+    }
+    if method == "bash" {
+        let has_command = params
+            .get("command")
             .and_then(Value::as_str)
-            .is_some_and(|profile| !profile.is_empty());
-        if !has_profile || params.keys().any(|field| field != "profile") {
+            .is_some_and(|command| !command.trim().is_empty());
+        if !has_command {
             return Err(model::AppError::invalid(
-                "task_run requires exactly one non-empty profile and accepts no command overrides",
+                "bash requires a non-empty command",
             ));
         }
     }
@@ -1039,10 +1072,10 @@ mod tests {
             ("git_commit", false, false, false, false),
             ("git_restore", false, true, false, false),
             ("git_push", false, false, false, true),
-            ("task_run", false, false, false, false),
-            ("task_status", true, false, true, false),
-            ("task_output", true, false, true, false),
-            ("task_cancel", false, false, false, false),
+            ("bash", false, true, false, true),
+            ("bash_status", true, false, true, false),
+            ("bash_output", true, false, true, false),
+            ("bash_cancel", false, false, false, false),
         ];
         assert_eq!(items.len(), expected_annotations.len());
         for (name, read_only, destructive, idempotent, open_world) in expected_annotations {
@@ -1075,7 +1108,7 @@ mod tests {
         for item in items.iter().filter(|item| {
             item["name"]
                 .as_str()
-                .is_some_and(|name| name.starts_with("git_") || name.starts_with("task_"))
+                .is_some_and(|name| name.starts_with("git_") || name.starts_with("bash"))
         }) {
             assert_eq!(item["inputSchema"]["additionalProperties"], false);
         }
@@ -1095,8 +1128,8 @@ mod tests {
                 "handle",
                 "symbol",
                 "metadata",
-                "task_status",
-                "task_log",
+                "bash_status",
+                "bash_log",
                 "continuation"
             ])
         );
@@ -1134,16 +1167,16 @@ mod tests {
             json!(["changes"])
         );
         assert_eq!(
-            tool(&all, "task_run")["inputSchema"]["required"],
-            json!(["profile"])
+            tool(&all, "bash")["inputSchema"]["required"],
+            json!(["command"])
         );
         assert_eq!(
-            tool(&all, "task_run")["inputSchema"]["properties"]["profile"]["minLength"],
+            tool(&all, "bash")["inputSchema"]["properties"]["command"]["minLength"],
             1
         );
-        assert!(tool(&all, "task_run")["inputSchema"]["properties"]
-            .get("command")
-            .is_none());
+        assert!(items
+            .iter()
+            .all(|item| !item["name"].as_str().unwrap().starts_with("task_")));
         assert_eq!(
             tool(&all, "git_restore")["inputSchema"]["required"],
             json!(["paths", "confirm"])
@@ -1221,33 +1254,100 @@ mod tests {
             ("git_commit", "commit"),
             ("git_restore", "restore"),
             ("git_push", "push"),
-            ("task_status", "status"),
-            ("task_output", "output"),
-            ("task_cancel", "cancel"),
         ] {
-            let prepared = prepare(
-                &manager,
-                &config,
-                method,
-                json!({"action": "spoofed", "profile": "test"}),
-            )
-            .await
-            .unwrap();
+            let prepared = prepare(&manager, &config, method, json!({"action": "spoofed"}))
+                .await
+                .unwrap();
             assert_eq!(prepared["action"], action, "{method}");
         }
 
-        let task_run = prepare(&manager, &config, "task_run", json!({"profile": "test"}))
+        let bash = prepare(&manager, &config, "bash", json!({"command": "printf test"}))
             .await
             .unwrap();
-        assert_eq!(task_run["action"], "start");
+        assert!(bash.get("action").is_none());
+        for (method, input) in [
+            ("bash_status", json!({"run_id": "run_test"})),
+            (
+                "bash_output",
+                json!({"run_id": "run_test", "stream": "stderr"}),
+            ),
+            ("bash_cancel", json!({"run_id": "run_test"})),
+        ] {
+            let prepared = prepare(&manager, &config, method, input).await.unwrap();
+            assert!(prepared.get("action").is_none(), "{method}");
+        }
+        assert!(prepare(&manager, &config, "bash", json!({"command": "  "}))
+            .await
+            .is_err());
         assert!(prepare(
             &manager,
             &config,
-            "task_run",
-            json!({"command": ["cargo", "test"]})
+            "bash",
+            json!({"command": "printf test", "unknown": true})
         )
         .await
         .is_err());
+        assert!(prepare(
+            &manager,
+            &config,
+            "bash_status",
+            json!({"run_id": "run_test", "action": "cancel"})
+        )
+        .await
+        .is_err());
+        let removed = prepare(&manager, &config, "task_run", json!({"profile": "test"}))
+            .await
+            .unwrap_err();
+        assert_eq!(removed.0.code, "METHOD_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn public_bash_payloads_dispatch_after_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let manager = Arc::new(WorkspaceManager::default());
+        let config = json!({
+            "workspaces": [{
+                "id": "main",
+                "name": "Main",
+                "path": root.path(),
+                "artifactPaths": []
+            }],
+            "workspace": {"allowedRoots": [root.path()]},
+            "skills": {"enabled": false, "roots": [], "explicitOnly": true},
+            "policy": {
+                "maxFileBytes": 1000000,
+                "maxContextChars": 50000,
+                "maxSearchResults": 100,
+                "bash": {
+                    "enabled": true,
+                    "executable": crate::model::test_bash_executable(),
+                    "defaultTimeoutMs": 120000,
+                    "maxTimeoutMs": 300000,
+                    "maxOutputChars": 30000,
+                    "retentionHours": 1
+                }
+            },
+            "cache_root": cache.path()
+        });
+        manager
+            .dispatch(SessionKey::stdio(), "initialize", &config)
+            .await
+            .unwrap();
+
+        for input in [
+            json!({"command": "printf command-only"}),
+            json!({"command": "printf command-with-timeout", "timeout_ms": 5000}),
+        ] {
+            let prepared = prepare(&manager, &config, "bash", input).await.unwrap();
+            let result = manager
+                .dispatch(SessionKey::stdio(), "bash", &prepared)
+                .await
+                .unwrap();
+
+            assert_eq!(result["status"], "succeeded");
+            assert_eq!(result["exit_code"], 0);
+        }
     }
 
     #[tokio::test]
@@ -1268,11 +1368,8 @@ mod tests {
                 "maxFileBytes": 1000000,
                 "maxContextChars": 50000,
                 "maxSearchResults": 100,
-                "maxTaskOutputChars": 30000,
-                "shellEnabled": false,
-                "allowedCommands": ["cargo"]
+                "bash": {"enabled": false}
             },
-            "tasks": {},
             "cache_root": cache.path()
         });
         manager
@@ -1399,8 +1496,7 @@ mod tests {
             "workspaces": [{"id": "main", "name": "Configured", "path": configured.path(), "artifactPaths": []}],
             "workspace": {"allowedRoots": [configured.path().parent().unwrap()]},
             "skills": {"enabled": false, "roots": [], "explicitOnly": true},
-            "policy": {"maxFileBytes": 1000000, "maxContextChars": 50000, "maxSearchResults": 100, "maxTaskOutputChars": 30000, "shellEnabled": false, "allowedCommands": ["cargo"]},
-            "tasks": {},
+            "policy": {"maxFileBytes": 1000000, "maxContextChars": 50000, "maxSearchResults": 100, "bash": {"enabled": false}},
             "cache_root": cache.path()
         });
         manager

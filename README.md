@@ -12,7 +12,7 @@ CodeWeave is a fast, local-first Model Context Protocol (MCP) server for AI-assi
 - **Single Rust process** — no Node.js gateway or companion daemon.
 - **Repository-aware retrieval** — ranked context, symbols, references, outlines, regex, filename search, and repository maps.
 - **Safe edits** — narrow single-operation tools with snapshot and content-hash preconditions, validation, and rollback.
-- **Controlled execution** — configured task profiles, timeouts, cancellation, and retained task logs.
+- **Supervised Bash execution** — focused commands, timeouts, cancellation, retained logs, and process-tree cleanup.
 - **Git integration** — status, diff, log, show, blame, staging, commits, and confirmed restores.
 - **Session-isolated dynamic workspaces** — each MCP session can switch repositories without restarting while cached repository actors are reused by canonical path.
 - **Remote MCP** — expose the local server through ngrok, Cloudflare Tunnel, or another trusted HTTPS reverse proxy.
@@ -195,21 +195,13 @@ Detailed guides:
     "maxFileBytes": 2000000,
     "maxContextChars": 50000,
     "maxSearchResults": 100,
-    "maxTaskOutputChars": 30000,
-    "shellEnabled": false,
-    "allowedCommands": ["git", "rg", "node", "npm", "npx", "pnpm", "python", "pytest", "cargo"]
-  },
-  "tasks": {
-    "test": {
-      "command": ["cargo", "test"],
-      "timeoutMs": 120000,
-      "outputFilter": { "type": "failedTail", "chars": 30000 }
-    },
-    "check": {
-      "command": ["cargo", "check", "--message-format=json"],
-      "timeoutMs": 120000,
-      "background": true,
-      "outputFilter": { "type": "cargoJson", "includeWarnings": true }
+    "bash": {
+      "enabled": true,
+      "executable": "bash",
+      "defaultTimeoutMs": 120000,
+      "maxTimeoutMs": 300000,
+      "maxOutputChars": 30000,
+      "retentionHours": 1
     }
   }
 }
@@ -219,21 +211,17 @@ Detailed guides:
 
 `workspace.artifactPaths` has the opposite purpose: it explicitly indexes configured paths even when normal Git ignore rules would skip them. Do not list the same directory in both settings. Configured entries under `workspaces` may define their own `artifactPaths` and `excludePaths`; dynamically opened repositories inherit the values under `workspace`.
 
-`task_run` accepts a configured profile name only. Profiles can set `background: true` and `timeoutMs` for long builds, browser smoke tests, and acceptance suites. The example configuration includes `vp-check`, `vp-test`, and `vp-build` profiles for CrawlerAI's Vite+ frontend; these intentionally use the required `vp` CLI rather than `npm`. Profile `outputFilter` values are:
+`bash` executes a command string through the configured executable as `bash -c <command>`. For example, a focused Windows repository test can run as `cd backend && ./.venv/Scripts/python.exe -m pytest tests/unit/test_file.py -q`. `cwd` may select an existing workspace-relative directory, `background` returns immediately with a `run_id`, and `timeout_ms` may override the configured default up to `maxTimeoutMs`.
 
-- `{ "type": "raw" }` - successful tasks show the head; failed, cancelled, and timed-out tasks show the tail.
-- `{ "type": "failedTail", "chars": 30000 }` - use a specific failure-tail budget.
-- `{ "type": "tailLines", "lines": 40 }` - useful when a Python or Node script prints its summary last.
-- `{ "type": "cargoJson", "includeWarnings": true }` - extracts Cargo compiler diagnostics from `--message-format=json`.
-- `{ "type": "jsonSummary", "marker": "CODEWEAVE_SUMMARY:" }` - returns a script-emitted JSON summary after the marker.
+Bash output is written incrementally. Use `bash_status` for the live tail or `bash_output` with `stream: "combined"`, `"stdout"`, or `"stderr"`; pass the returned continuation token to page through a stream. `bash_cancel` and timeouts retain partial logs. On Windows, runs are assigned to a kill-on-close Job Object so descendant processes such as `rustc`, Node, and Chromium are cleaned up with the run.
 
-Task output is written incrementally. While a background task is running, call `task_status` for its live tail or `task_output` with `stream: "combined"`, `"stdout"`, or `"stderr"`. Reuse the returned continuation token to page through the selected stream. `task_cancel` and timeouts retain partial logs. On Windows, task processes are assigned to a kill-on-close Job Object so descendant processes such as `rustc`, Node, and Chromium are cleaned up with the task.
+This execution surface is trusted-client functionality, not a sandbox. `workspace.allowedRoots` constrains repository selection, file tools, and the `cwd` argument, but a Bash command can access anything available to the operating-system account running CodeWeave. Windows requires an explicitly configured Bash-compatible executable such as Git Bash, WSL Bash, MSYS2, or Cygwin Bash; CodeWeave does not auto-detect one.
 
 `server.statefulMode` defaults to `true` so independent chats or LLM clients receive isolated active-workspace state through the MCP session id. Stateful streamable HTTP uses long-lived SSE requests; ngrok's p50/p90 dashboard can include those request durations, so it may show high values even when tool responses report low `elapsed_ms`. `server.jsonResponse` defaults to `false` and only applies when `statefulMode` is disabled. Stateless HTTP remains supported for legacy direct JSON responses, but all stateless requests share one fallback workspace key.
 
 `server.allowedHosts` extends rmcp's Host-header validation. Set it to exact public hostnames for fixed domains, or to `["*"]` for trusted local tunnels such as random ngrok URLs where bearer auth is injected before requests reach CodeWeave.
 
-`workspace.allowedRoots` is a security boundary. CodeWeave canonicalizes requested repository paths and rejects paths outside those roots, including junction and symlink escapes.
+`workspace.allowedRoots` is a boundary for repository selection and file tools. CodeWeave canonicalizes requested repository paths and rejects paths outside those roots, including junction and symlink escapes. It is not a boundary for commands run through `bash`.
 
 Never commit `config.json`, `.mcp-token`, tunnel credentials, generated caches, or private repository paths.
 
@@ -245,7 +233,7 @@ Never commit `config.json`, `.mcp-token`, tunnel credentials, generated caches, 
 | `code_context` | Retrieve ranked semantic and syntax-aware context |
 | `code_capabilities` | Inspect supported search modes, fetch kinds, edit capabilities, limits, and known limitations |
 | `code_search` | Search text, regex, filenames, symbols, references, outlines, or the repository map |
-| `code_fetch` | Read exact files, line ranges, symbols, handles, continuations, task status, and task logs |
+| `code_fetch` | Read exact files, line ranges, symbols, handles, continuations, Bash status, and Bash logs |
 | `code_preview` | Preview a multi-file edit transaction and return the diff without writing files |
 | `code_transaction` | Apply a multi-file edit transaction with preconditions, validation, diff output, and rollback |
 | `code_write` | Create or overwrite exactly one file |
@@ -258,9 +246,9 @@ Never commit `config.json`, `.mcp-token`, tunnel credentials, generated caches, 
 | `git_stage`, `git_commit` | Update the local Git index or create a commit |
 | `git_restore` | Restore selected paths after explicit confirmation |
 | `git_push` | Push commits to a remote |
-| `task_run` | Run a configured task profile |
-| `task_status`, `task_output` | Read retained background-task state and output |
-| `task_cancel` | Cancel a running background task |
+| `bash` | Run a Bash command in the active workspace |
+| `bash_status`, `bash_output` | Read retained Bash run state and output |
+| `bash_cancel` | Cancel a running background Bash run |
 
 A typical coding-agent workflow is:
 
@@ -269,14 +257,14 @@ A typical coding-agent workflow is:
 3. Locate exact definitions with `code_search`; use `references` for indexed symbol call-site discovery rather than regex.
 4. Read only the required ranges with `code_fetch`; use `response_detail: "compact"` or `metadata` items when full debug fields or content are unnecessary.
 5. Preview multi-file edits with `code_preview`, then apply with `code_transaction` or a narrow write wrapper.
-6. Run configured checks with `task_run` and inspect retained output with `task_status` or `task_output`.
+6. Run focused checks with `bash` and inspect retained output with `bash_status` or `bash_output`.
 7. Review the final state with `git_status` and `git_diff`.
 
 See [docs/implementation.md](docs/implementation.md) and [docs/tools.md](docs/tools.md).
 
 ## Security
 
-CodeWeave can read and modify source code and run approved commands. Treat every connected App or Connector as a trusted coding agent.
+CodeWeave can read and modify source code and run arbitrary Bash commands as its operating-system user. Treat every connected App or Connector as a trusted coding agent.
 
 The secure default is:
 
@@ -284,8 +272,8 @@ The secure default is:
 - keep bearer authentication enabled at the local origin;
 - inject that credential inside the tunnel or reverse proxy;
 - restrict `allowedRoots`;
-- leave shell execution disabled;
-- keep the executable allow-list minimal;
+- disable `policy.bash.enabled` when command execution is not required;
+- run CodeWeave under a dedicated, least-privileged operating-system account;
 - test first against a disposable or non-critical repository.
 
 Read [SECURITY.md](SECURITY.md) before exposing CodeWeave beyond localhost.

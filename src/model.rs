@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WorkspaceConfig {
     pub id: String,
@@ -19,11 +17,24 @@ pub struct PolicyConfig {
     pub max_file_bytes: usize,
     pub max_context_chars: usize,
     pub max_search_results: usize,
-    pub max_task_output_chars: usize,
-    pub shell_enabled: bool,
-    pub allowed_commands: Vec<String>,
+    pub bash: BashConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BashConfig {
     #[serde(default)]
-    pub task_retention_hours: Option<i64>,
+    pub enabled: bool,
+    #[serde(default = "default_bash_executable")]
+    pub executable: String,
+    #[serde(default = "default_bash_timeout_ms")]
+    pub default_timeout_ms: u64,
+    #[serde(default = "default_bash_max_timeout_ms")]
+    pub max_timeout_ms: u64,
+    #[serde(default = "default_bash_max_output_chars")]
+    pub max_output_chars: usize,
+    #[serde(default = "default_bash_retention_hours")]
+    pub retention_hours: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -52,19 +63,50 @@ pub enum OutputFilter {
 }
 
 fn default_failed_tail_chars() -> usize {
+    default_bash_max_output_chars()
+}
+
+fn default_bash_executable() -> String {
+    "bash".to_owned()
+}
+
+fn default_bash_timeout_ms() -> u64 {
+    120_000
+}
+
+fn default_bash_max_timeout_ms() -> u64 {
+    300_000
+}
+
+fn default_bash_max_output_chars() -> usize {
     30_000
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskProfile {
-    pub command: Vec<String>,
-    pub cwd: Option<String>,
-    pub timeout_ms: u64,
-    #[serde(default)]
-    pub background: bool,
-    #[serde(default)]
-    pub output_filter: OutputFilter,
+fn default_bash_retention_hours() -> i64 {
+    1
+}
+
+#[cfg(test)]
+pub fn test_bash_executable() -> String {
+    #[cfg(windows)]
+    {
+        for root in [
+            std::env::var_os("ProgramW6432"),
+            std::env::var_os("ProgramFiles"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let candidate = std::path::PathBuf::from(root)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "bash".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -104,7 +146,6 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub skills: SkillsConfig,
     pub policy: PolicyConfig,
-    pub tasks: HashMap<String, TaskProfile>,
     pub cache_root: String,
 }
 
@@ -240,39 +281,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_profile_new_fields_default_for_existing_configs() {
-        let profile: TaskProfile = serde_json::from_value(serde_json::json!({
-            "command": ["cargo", "check"],
-            "cwd": null,
-            "timeoutMs": 120000
-        }))
-        .unwrap();
-
-        assert!(!profile.background);
-        assert!(matches!(profile.output_filter, OutputFilter::Raw));
-    }
-
-    #[test]
-    fn task_profile_parses_cargo_json_filter() {
-        let profile: TaskProfile = serde_json::from_value(serde_json::json!({
-            "command": ["cargo", "check", "--message-format=json"],
-            "cwd": null,
-            "timeoutMs": 120000,
-            "background": true,
-            "outputFilter": {
-                "type": "cargoJson",
-                "includeWarnings": true
+    fn bash_policy_defaults_optional_fields() {
+        let policy: PolicyConfig = serde_json::from_value(serde_json::json!({
+            "maxFileBytes": 1000000,
+            "maxContextChars": 50000,
+            "maxSearchResults": 100,
+            "bash": {
+                "enabled": true
             }
         }))
         .unwrap();
 
-        assert!(profile.background);
-        assert!(matches!(
-            profile.output_filter,
-            OutputFilter::CargoJson {
-                include_warnings: true
-            }
-        ));
+        assert!(policy.bash.enabled);
+        assert_eq!(policy.bash.executable, "bash");
+        assert_eq!(policy.bash.default_timeout_ms, 120_000);
+        assert_eq!(policy.bash.max_timeout_ms, 300_000);
+        assert_eq!(policy.bash.max_output_chars, 30_000);
+        assert_eq!(policy.bash.retention_hours, 1);
     }
 
     #[test]

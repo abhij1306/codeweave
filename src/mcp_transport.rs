@@ -36,7 +36,7 @@ use crate::{
     SERVER_NAME,
 };
 
-const INSTRUCTIONS: &str = "Use code_capabilities to inspect supported contracts, code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, code_preview/code_transaction for multi-file edits, and the single-operation code_write/code_replace/code_replace_range/code_insert/code_delete/code_rename tools for narrow changes. Run configured builds and tests with task_run; inspect or stop retained tasks with task_status, task_output, and task_cancel. Use the narrowly scoped git_status/git_diff/git_log/git_show/git_blame/git_preflight/git_stage/git_commit/git_restore/git_push tools for repository operations. CodeWeave manages one active repository per MCP session; call workspace with an absolute path to switch this session explicitly.";
+const INSTRUCTIONS: &str = "Use code_capabilities to inspect supported contracts, code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, code_preview/code_transaction for multi-file edits, and the single-operation code_write/code_replace/code_replace_range/code_insert/code_delete/code_rename tools for narrow changes. Run commands with bash; inspect or stop retained runs with bash_status, bash_output, and bash_cancel. Bash executes as the CodeWeave OS user and is not sandboxed. Use the narrowly scoped git_status/git_diff/git_log/git_show/git_blame/git_preflight/git_stage/git_commit/git_restore/git_push tools for repository operations. CodeWeave manages one active repository per MCP session; call workspace with an absolute path to switch this session explicitly.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CodeWeaveSessionId(String);
@@ -106,10 +106,10 @@ impl ServerHandler for CodeWeaveMcp {
             "git_commit",
             "git_restore",
             "git_push",
-            "task_run",
-            "task_status",
-            "task_output",
-            "task_cancel",
+            "bash",
+            "bash_status",
+            "bash_output",
+            "bash_cancel",
         ]
         .contains(&name)
         {
@@ -328,8 +328,40 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
     let address = format!("{}:{}", state.server.host, state.server.port);
     let listener = tokio::net::TcpListener::bind(&address).await?;
     eprintln!("{SERVER_NAME} listening on http://{address}/mcp");
-    axum::serve(listener, app).await?;
+    axum::serve(NoDelayListener(listener), app).await?;
     Ok(())
+}
+
+/// Wraps a `TcpListener` so every accepted connection gets `TCP_NODELAY`.
+///
+/// Without this, Nagle's algorithm holds the final small TCP segment of each
+/// response until the peer's delayed-ACK timer fires (~200ms on Windows),
+/// adding a flat per-request latency floor. Disabling Nagle removes it.
+struct NoDelayListener(tokio::net::TcpListener);
+
+impl axum::serve::Listener for NoDelayListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.0.accept().await {
+                Ok((stream, addr)) => {
+                    let _ = stream.set_nodelay(true);
+                    return (stream, addr);
+                }
+                // Mirror axum's own accept loop: back off briefly on transient
+                // errors (e.g. EMFILE) instead of busy-spinning.
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.0.local_addr()
+    }
 }
 
 fn configured_allowed_hosts(server: &crate::ServerConfig) -> Vec<String> {

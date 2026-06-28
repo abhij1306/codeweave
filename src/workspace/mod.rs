@@ -8,14 +8,14 @@ pub use journal::MutationRecord;
 use journal::{load_journal, open_journal, rotate_journal_if_needed};
 use util::{stale_snapshot, summarize_changed_paths, ChangedPathSummary};
 
+use crate::bash::{BashSupervisor, StartRequest};
 use crate::index::{content_hash, CodeIndex, ContextParams, SearchParams, WorkspaceExclusions};
 use crate::model::{
     bool_value, required_str, string_list, usize_value, AppError, AppResult, PolicyConfig,
-    TaskProfile, WorkspaceConfig,
+    WorkspaceConfig,
 };
 use crate::repository::{CliGitBackend, RepoStatus, RepositoryBackend};
 use crate::security::{canonical_root, relative_string, validate_relative};
-use crate::tasks::{StartRequest, TaskSupervisor};
 use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::{Mutex, RwLock};
@@ -56,15 +56,15 @@ pub struct WorkspaceActor {
     mutations: Mutex<VecDeque<MutationRecord>>,
     journal_file: Mutex<Option<fs::File>>,
     journal_path: PathBuf,
-    tasks: TaskSupervisor,
-    task_generations: Mutex<HashMap<String, TaskBaseline>>,
+    bash: BashSupervisor,
+    run_generations: Mutex<HashMap<String, RunBaseline>>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
     open_diagnostics: Value,
     _watcher: Mutex<RecommendedWatcher>,
 }
 
 #[derive(Debug, Clone)]
-struct TaskBaseline {
+struct RunBaseline {
     generation: u64,
     dirty_files: HashSet<String>,
 }
@@ -120,14 +120,13 @@ impl WorkspaceActor {
         &self.root
     }
 
-    pub fn running_task_count(&self) -> usize {
-        self.tasks.running_count()
+    pub fn running_bash_count(&self) -> usize {
+        self.bash.running_count()
     }
 
     pub fn open(
         config: &WorkspaceConfig,
         policy: PolicyConfig,
-        tasks: HashMap<String, TaskProfile>,
         cache_root: PathBuf,
     ) -> AppResult<Self> {
         let opened_started = Instant::now();
@@ -212,7 +211,7 @@ impl WorkspaceActor {
             .unwrap_or(1);
         generation.store(persisted_generation.max(1), Ordering::Release);
         let journal_file = open_journal(&journal_path)?;
-        let tasks = TaskSupervisor::new(workspace_cache, policy.clone(), tasks)?;
+        let bash = BashSupervisor::new(workspace_cache, policy.clone())?;
         let journal_ms = journal_started.elapsed().as_millis();
         let open_diagnostics = json!({
             "cache_hit": index_cache_hit,
@@ -222,7 +221,7 @@ impl WorkspaceActor {
                 "git": git_ms,
                 "index": index_ms,
                 "watcher": watcher_ms,
-                "journal_and_tasks": journal_ms
+            "journal_and_bash": journal_ms
             }
         });
         Ok(Self {
@@ -247,8 +246,8 @@ impl WorkspaceActor {
             mutations: Mutex::new(mutations),
             journal_file: Mutex::new(Some(journal_file)),
             journal_path,
-            tasks,
-            task_generations: Mutex::new(HashMap::new()),
+            bash,
+            run_generations: Mutex::new(HashMap::new()),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             open_diagnostics,
             _watcher: Mutex::new(watcher),
@@ -425,15 +424,12 @@ impl WorkspaceActor {
             "languages": index.languages(),
             "reconcile_pending": self.read_reconcile_pending(),
             "pending_path_count": self.pending_paths.lock().len(),
-            "running_task_count": self.tasks.running_count(),
-            "task_profiles": self.tasks.profile_diagnostics(&self.root),
+            "running_bash_count": self.bash.running_count(),
             "policy": {
                 "max_file_bytes": self.policy.max_file_bytes,
                 "max_context_chars": self.policy.max_context_chars,
                 "max_search_results": self.policy.max_search_results,
-                "max_task_output_chars": self.policy.max_task_output_chars,
-                "shell_enabled": self.policy.shell_enabled,
-                "allowed_commands": self.policy.allowed_commands,
+                "bash": self.policy.bash,
             }
         }))
     }
@@ -445,7 +441,7 @@ impl WorkspaceActor {
             "generation": self.generation(),
             "snapshot_id": self.snapshot(),
             "search_modes": ["literal", "regex", "filename", "symbol", "references", "outline", "repo_map"],
-            "fetch_kinds": ["path", "handle", "symbol", "metadata", "task_status", "task_log", "continuation"],
+            "fetch_kinds": ["path", "handle", "symbol", "metadata", "bash_status", "bash_log", "continuation"],
             "context": {
                 "supports_required_terms": true,
                 "supports_optional_terms": true,
@@ -460,14 +456,15 @@ impl WorkspaceActor {
                 "supports_transaction": true,
                 "supports_single_file_wrappers": true,
                 "supports_handle_range_replace": true,
-                "supports_validation_profiles": !self.tasks.profile_names().is_empty(),
+                "supports_bash_validation_commands": self.policy.bash.enabled,
                 "supports_rollback_on_failure": true
             },
             "limits": {
                 "max_file_bytes": self.policy.max_file_bytes,
                 "max_context_chars": self.policy.max_context_chars,
                 "max_search_results": self.policy.max_search_results,
-                "max_task_output_chars": self.policy.max_task_output_chars
+                "max_bash_output_chars": self.policy.bash.max_output_chars,
+                "max_bash_timeout_ms": self.policy.bash.max_timeout_ms
             },
             "known_limitations": [
                 "regex mode is raw text search; use references mode for indexed symbol call-site discovery",
@@ -523,17 +520,16 @@ impl WorkspaceActor {
                     .map(|file| json!({"path": path, "content": file.content}))
             })
             .collect::<Vec<_>>();
-        let task_profiles = self.tasks.profile_names();
-        let profile_validation_available = !task_profiles.is_empty();
-        let validation_guidance = if profile_validation_available {
-            "Write-tool validate fields accept configured task profile names only. Use task_run(profile='<name>') for standalone profile execution."
+        let bash_available = self.policy.bash.enabled;
+        let validation_guidance = if bash_available {
+            "Write-tool validate fields accept Bash command strings. Use bash(command='<command>') for standalone execution."
         } else {
-            "No validation profiles are configured. Configure tasks.<name>, restart CodeWeave, and use task_run(profile='<name>') after applying the edit."
+            "Bash execution is disabled. Set policy.bash.enabled to true and restart CodeWeave to use bash and write-tool validation commands."
         };
-        let warnings = if profile_validation_available {
+        let warnings = if bash_available {
             Vec::<String>::new()
         } else {
-            vec!["No task profiles are configured; task_run and profile-based write validation are unavailable until tasks.<name> is configured and CodeWeave is restarted.".to_owned()]
+            vec!["Bash execution and write-tool validation commands are unavailable until policy.bash.enabled is true and CodeWeave is restarted.".to_owned()]
         };
         let mut warnings = warnings;
         if stateless_session {
@@ -542,10 +538,8 @@ impl WorkspaceActor {
         let mut result = json!({
             "workspace_id": self.id, "name": self.name, "root": self.root, "generation": self.generation(), "snapshot_id": self.snapshot(),
             "file_count": index.file_count(), "languages": index.languages(), "repository": repository, "instructions": instructions,
-            "task_profiles": task_profiles,
             "capabilities": {
-                "profile_validation_available": profile_validation_available,
-                "raw_commands_available": false,
+                "bash_available": bash_available,
                 "validation_guidance": validation_guidance
             },
             "warnings": warnings,
@@ -675,12 +669,12 @@ impl WorkspaceActor {
         })?;
         let index_ms = index_started.elapsed().as_millis();
         if let Some(object) = result.as_object_mut() {
-            if bool_value(params, "include_task_failures", false)
-                || evidence.iter().any(|item| item == "task_failures")
+            if bool_value(params, "include_bash_failures", false)
+                || evidence.iter().any(|item| item == "bash_failures")
             {
                 object.insert(
-                    "recent_task_failures".to_owned(),
-                    json!(self.tasks.recent_failures(query, 3)),
+                    "recent_bash_failures".to_owned(),
+                    json!(self.bash.recent_failures(query, 3)),
                 );
             }
             object.insert("reconcile_pending".to_owned(), json!(reconcile_pending));
@@ -1045,42 +1039,28 @@ impl WorkspaceActor {
                     .iter()
                     .cloned()
                     .collect();
-                let command = params
-                    .get("command")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>()
-                    });
+                let command = required_str(params, "command")?.to_owned();
                 let run_started = Instant::now();
                 let value = self
-                    .tasks
+                    .bash
                     .start(
                         &self.root,
                         StartRequest {
-                            profile: params
-                                .get("profile")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
                             command,
                             cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
-                            shell: bool_value(params, "shell", false),
                             background: params.get("background").and_then(Value::as_bool),
                             timeout_ms: params.get("timeout_ms").and_then(Value::as_u64),
                         },
                     )
                     .await?;
                 run_startup_ms = Some(run_started.elapsed().as_millis());
-                if let Some(task_id) = value.get("task_id").and_then(Value::as_str) {
-                    let retained = self.tasks.retained_task_ids();
-                    let mut generations = self.task_generations.lock();
-                    generations.retain(|known_task, _| retained.contains(known_task));
+                if let Some(run_id) = value.get("run_id").and_then(Value::as_str) {
+                    let retained = self.bash.retained_run_ids();
+                    let mut generations = self.run_generations.lock();
+                    generations.retain(|known_run, _| retained.contains(known_run));
                     generations.insert(
-                        task_id.to_owned(),
-                        TaskBaseline {
+                        run_id.to_owned(),
+                        RunBaseline {
                             generation: before,
                             dirty_files: before_dirty,
                         },
@@ -1090,14 +1070,14 @@ impl WorkspaceActor {
             }
             "status" => {
                 let actor = Arc::clone(self);
-                let task_id = required_str(params, "task_id")?.to_owned();
-                tokio::task::spawn_blocking(move || actor.tasks.status(&task_id))
+                let run_id = required_str(params, "run_id")?.to_owned();
+                tokio::task::spawn_blocking(move || actor.bash.status(&run_id))
                     .await
                     .map_err(AppError::internal)??
             }
             "output" => {
                 let actor = Arc::clone(self);
-                let task_id = required_str(params, "task_id")?.to_owned();
+                let run_id = required_str(params, "run_id")?.to_owned();
                 let continuation = params
                     .get("continuation")
                     .and_then(Value::as_str)
@@ -1108,16 +1088,16 @@ impl WorkspaceActor {
                     .map(str::to_owned);
                 tokio::task::spawn_blocking(move || {
                     actor
-                        .tasks
-                        .output_stream(&task_id, continuation.as_deref(), stream.as_deref())
+                        .bash
+                        .output_stream(&run_id, continuation.as_deref(), stream.as_deref())
                 })
                 .await
                 .map_err(AppError::internal)??
             }
             "cancel" => {
                 let actor = Arc::clone(self);
-                let task_id = required_str(params, "task_id")?.to_owned();
-                tokio::task::spawn_blocking(move || actor.tasks.cancel(&task_id))
+                let run_id = required_str(params, "run_id")?.to_owned();
+                tokio::task::spawn_blocking(move || actor.bash.cancel(&run_id))
                     .await
                     .map_err(AppError::internal)??
             }
@@ -1132,7 +1112,7 @@ impl WorkspaceActor {
         let reconcile_after_started = Instant::now();
         self.reconcile_pending_async().await?;
         let reconcile_after_ms = reconcile_after_started.elapsed().as_millis();
-        if let Some(task_id) = result.get("task_id").and_then(Value::as_str) {
+        if let Some(run_id) = result.get("run_id").and_then(Value::as_str) {
             let current_dirty: HashSet<String> = self
                 .repo_status
                 .read()
@@ -1141,15 +1121,15 @@ impl WorkspaceActor {
                 .cloned()
                 .collect();
             let baseline = self
-                .task_generations
+                .run_generations
                 .lock()
-                .get(task_id)
+                .get(run_id)
                 .cloned()
-                .unwrap_or_else(|| TaskBaseline {
+                .unwrap_or_else(|| RunBaseline {
                     generation: self.generation(),
                     dirty_files: current_dirty.clone(),
                 });
-            let paths = self.observed_task_changed_paths(&baseline, &current_dirty);
+            let paths = self.observed_run_changed_paths(&baseline, &current_dirty);
             let changed = summarize_changed_paths(paths);
             if let Some(object) = result.as_object_mut() {
                 object.insert(
@@ -1173,10 +1153,6 @@ impl WorkspaceActor {
                     "observed_changed_path_groups".to_owned(),
                     json!(changed.groups),
                 );
-                object.insert(
-                    "task_profiles".to_owned(),
-                    json!(self.tasks.profile_names()),
-                );
             }
         }
         if let Some(object) = result.as_object_mut() {
@@ -1195,9 +1171,9 @@ impl WorkspaceActor {
         Ok(result)
     }
 
-    fn observed_task_changed_paths(
+    fn observed_run_changed_paths(
         &self,
-        baseline: &TaskBaseline,
+        baseline: &RunBaseline,
         current_dirty: &HashSet<String>,
     ) -> HashSet<String> {
         let mut paths: HashSet<String> = current_dirty

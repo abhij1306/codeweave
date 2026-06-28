@@ -4,12 +4,12 @@ use super::util::{
     line_ending_label, line_range_bytes, normalize_line_endings_for_content,
     summarize_changed_paths, MAX_CHANGED_PATH_GROUPS, MAX_OBSERVED_CHANGED_PATHS,
 };
-use super::{validated_push_target, TaskBaseline, WorkspaceActor};
+use super::{validated_push_target, RunBaseline, WorkspaceActor};
 use crate::index::content_hash;
-use crate::model::{PolicyConfig, WorkspaceConfig};
+use crate::model::{test_bash_executable, BashConfig, PolicyConfig, WorkspaceConfig};
 use chrono::Utc;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -20,10 +20,14 @@ fn test_policy() -> PolicyConfig {
         max_file_bytes: 1_000_000,
         max_context_chars: 50_000,
         max_search_results: 100,
-        max_task_output_chars: 30_000,
-        shell_enabled: false,
-        allowed_commands: vec!["cargo".to_owned(), "npm".to_owned()],
-        task_retention_hours: None,
+        bash: BashConfig {
+            enabled: true,
+            executable: test_bash_executable(),
+            default_timeout_ms: 120_000,
+            max_timeout_ms: 300_000,
+            max_output_chars: 30_000,
+            retention_hours: 1,
+        },
     }
 }
 
@@ -43,7 +47,6 @@ fn test_actor_with_exclusions(root: &Path, exclude_paths: Vec<String>) -> Arc<Wo
                 exclude_paths,
             },
             test_policy(),
-            HashMap::new(),
             cache,
         )
         .unwrap(),
@@ -326,7 +329,7 @@ fn fetch_supports_compact_metadata_and_symbol_import_context() {
 }
 
 #[test]
-fn workspace_diagnostics_exposes_profiles_and_limits() {
+fn workspace_diagnostics_exposes_bash_policy_and_limits() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
     let actor = test_actor(root.path());
@@ -336,7 +339,7 @@ fn workspace_diagnostics_exposes_profiles_and_limits() {
     assert_eq!(diagnostics["workspace_id"], "main");
     assert_eq!(diagnostics["file_count"], 1);
     assert_eq!(diagnostics["policy"]["max_search_results"], 100);
-    assert!(diagnostics["task_profiles"].is_array());
+    assert_eq!(diagnostics["policy"]["bash"]["enabled"], true);
 }
 
 #[test]
@@ -389,7 +392,7 @@ fn code_context_accepts_weighted_terms_without_legacy_query() {
 }
 
 #[tokio::test]
-async fn task_status_fetch_and_task_local_changed_paths_are_bounded() {
+async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
     let actor = test_actor(root.path());
@@ -409,32 +412,32 @@ async fn task_status_fetch_and_task_local_changed_paths_are_bounded() {
         .run(
             "session",
             &json!({
-                "command": ["cargo", "--version"],
+                "command": "printf codeweave-bash-test",
                 "background": false
             }),
         )
         .await
         .unwrap();
-    let task_id = started["task_id"].as_str().unwrap();
-    assert_eq!(started["status_fetch"]["kind"], "task_status");
-    assert_eq!(started["status_fetch"]["value"], task_id);
+    let run_id = started["run_id"].as_str().unwrap();
+    assert_eq!(started["status_fetch"]["kind"], "bash_status");
+    assert_eq!(started["status_fetch"]["value"], run_id);
 
     let fetched = actor
         .code_fetch(&json!({
-            "items": [{"kind": "task_status", "value": task_id}]
+            "items": [{"kind": "bash_status", "value": run_id}]
         }))
         .unwrap();
 
     assert_eq!(fetched["result_count"], 1);
-    assert_eq!(fetched["results"][0]["task_id"], task_id);
+    assert_eq!(fetched["results"][0]["run_id"], run_id);
     assert_eq!(started["observed_changed_path_count"], 0);
     assert_eq!(fetched["results"][0]["status"], "succeeded");
 
     let bounded = actor
         .code_fetch(&json!({
             "items": [
-                {"kind": "task_status", "value": task_id},
-                {"kind": "task_status", "value": task_id}
+                {"kind": "bash_status", "value": run_id},
+                {"kind": "bash_status", "value": run_id}
             ],
             "max_chars": 5
         }))
@@ -448,18 +451,18 @@ async fn task_status_fetch_and_task_local_changed_paths_are_bounded() {
 }
 
 #[test]
-fn task_change_detection_includes_new_mutations_to_already_dirty_files() {
+fn run_change_detection_includes_new_mutations_to_already_dirty_files() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("existing.rs"), "fn existing() {}\n").unwrap();
     let actor = test_actor(root.path());
     let generation = actor.generation();
     let dirty_files = HashSet::from(["existing.rs".to_owned()]);
-    let baseline = TaskBaseline {
+    let baseline = RunBaseline {
         generation,
         dirty_files: dirty_files.clone(),
     };
     actor.mutations.lock().push_back(MutationRecord {
-        mutation_id: "during-task".to_owned(),
+        mutation_id: "during-run".to_owned(),
         session_id: "external".to_owned(),
         path: "existing.rs".to_owned(),
         before_hash: Some("before".to_owned()),
@@ -470,7 +473,7 @@ fn task_change_detection_includes_new_mutations_to_already_dirty_files() {
         generation: generation + 1,
     });
 
-    let observed = actor.observed_task_changed_paths(&baseline, &dirty_files);
+    let observed = actor.observed_run_changed_paths(&baseline, &dirty_files);
 
     assert_eq!(observed, HashSet::from(["existing.rs".to_owned()]));
 }
@@ -524,16 +527,16 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
         .unwrap();
     assert_eq!(context["reconcile_pending"], true);
     assert_eq!(context["result_count"], 1);
-    assert!(context.get("recent_task_failures").is_none());
+    assert!(context.get("recent_bash_failures").is_none());
     assert!(context["phase_ms"]["index_context"].is_number());
 
     let context_with_failures = actor
         .code_context(&json!({
             "query": "existing_symbol",
-            "include_task_failures": true
+            "include_bash_failures": true
         }))
         .unwrap();
-    assert!(context_with_failures["recent_task_failures"].is_array());
+    assert!(context_with_failures["recent_bash_failures"].is_array());
     assert!(actor
         .needs_reconcile
         .load(std::sync::atomic::Ordering::Acquire));
@@ -865,22 +868,15 @@ async fn stale_snapshot_rebases_when_file_hash_is_current() {
 }
 
 #[tokio::test]
-async fn unknown_validation_profile_fails_before_mutation() {
+async fn failed_bash_validation_rolls_back_mutation() {
     let root = tempdir().unwrap();
     let original = "fn value() -> i32 { 1 }\n";
     fs::write(root.path().join("value.rs"), original).unwrap();
     let actor = test_actor(root.path());
     let summary = actor.summary("test-session", false).unwrap();
-    assert_eq!(
-        summary["capabilities"]["profile_validation_available"],
-        false
-    );
-    assert_eq!(summary["capabilities"]["raw_commands_available"], false);
-    assert!(summary["warnings"]
-        .as_array()
-        .is_some_and(|warnings| !warnings.is_empty()));
-    let generation = actor.generation();
-    let error = actor
+    assert_eq!(summary["capabilities"]["bash_available"], true);
+    assert!(summary["warnings"].as_array().is_some_and(Vec::is_empty));
+    let result = actor
         .code_edit(
             "test-session",
             &json!({
@@ -891,17 +887,26 @@ async fn unknown_validation_profile_fails_before_mutation() {
                     "new_text": "{ 2 }",
                     "expected_hash": content_hash(original)
                 }],
-                "validate": ["typecheck"]
+                "validate": [
+                    "printf validation-started",
+                    "printf validation-failed >&2; exit 1"
+                ]
             }),
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.0.code, "UNKNOWN_VALIDATION_PROFILE");
+        .unwrap();
+    assert_eq!(result["applied"], false);
+    assert_eq!(result["rolled_back"], true);
+    assert_eq!(result["reason"], "validation_failed");
+    assert_eq!(result["validation"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        result["validation"][1]["command"],
+        "printf validation-failed >&2; exit 1"
+    );
     assert_eq!(
         fs::read_to_string(root.path().join("value.rs")).unwrap(),
         original
     );
-    assert_eq!(actor.generation(), generation);
 }
 
 #[test]
@@ -1042,7 +1047,6 @@ fn workspace_generation_resumes_after_persisted_journal_records() {
             exclude_paths: Vec::new(),
         },
         test_policy(),
-        HashMap::new(),
         cache.path().to_path_buf(),
     )
     .unwrap();

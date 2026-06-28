@@ -184,15 +184,15 @@ impl WorkspaceActor {
                 bool_value(item, "include_imports", false),
             ),
             "metadata" => self.fetch_metadata(value),
-            "task_status" => {
-                let task_id = value.strip_prefix("task:").unwrap_or(value);
-                self.tasks.status_with_limit(task_id, remaining)
+            "bash_status" => {
+                let run_id = value.strip_prefix("bash:").unwrap_or(value);
+                self.bash.status_with_limit(run_id, remaining)
             }
-            "task_log" => {
-                let task_id = value.strip_prefix("task-log:").unwrap_or(value);
-                let content = self.tasks.read_log(task_id)?;
+            "bash_log" => {
+                let run_id = value.strip_prefix("bash-log:").unwrap_or(value);
+                let content = self.bash.read_log(run_id)?;
                 Ok(bounded_content(
-                    json!({"kind": "task_log", "task_id": task_id}),
+                    json!({"kind": "bash_log", "run_id": run_id}),
                     &content,
                     0,
                     remaining,
@@ -418,7 +418,7 @@ fn compact_fetch_result(result: &Value) -> Value {
         "hash",
         "content",
         "line_ending",
-        "task_id",
+        "run_id",
         "status",
         "exit_code",
         "output",

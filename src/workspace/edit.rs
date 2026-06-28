@@ -7,11 +7,11 @@ use super::util::{
     normalize_line_endings_for_content, stale_snapshot_for_paths,
 };
 use super::WorkspaceActor;
+use crate::bash::StartRequest;
 use crate::index::{content_hash, decode_handle, CodeIndex};
 use crate::model::{bool_value, required_str, string_list, usize_value, AppError, AppResult};
 use crate::security::validate_relative;
 use crate::symbols::{extract_symbols, parse_has_error};
-use crate::tasks::StartRequest;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -46,7 +46,12 @@ enum PreparedEdit {
 impl WorkspaceActor {
     pub async fn code_edit(self: &Arc<Self>, session_id: &str, params: &Value) -> AppResult<Value> {
         let validate = string_list(params, "validate");
-        self.tasks.validate_profiles(&validate)?;
+        if !validate.is_empty() && !self.policy.bash.enabled {
+            return Err(AppError::new(
+                "BASH_DISABLED",
+                "Bash execution is disabled; enable policy.bash before using validation commands",
+            ));
+        }
         let write_guard = self.write_lock.clone().lock_owned().await;
         let actor = Arc::clone(self);
         let params_owned = params.clone();
@@ -74,16 +79,14 @@ impl WorkspaceActor {
 
         let mut validation = Vec::new();
         let mut validation_failed = false;
-        for profile in validate {
+        for command in validate {
             match self
-                .tasks
+                .bash
                 .start(
                     &self.root,
                     StartRequest {
-                        profile: Some(profile.clone()),
-                        command: None,
+                        command: command.clone(),
                         cwd: None,
-                        shell: false,
                         background: Some(false),
                         timeout_ms: None,
                     },
@@ -94,12 +97,12 @@ impl WorkspaceActor {
                     if result.get("status").and_then(Value::as_str) != Some("succeeded") {
                         validation_failed = true;
                     }
-                    validation.push(json!({"profile": profile, "result": result}));
+                    validation.push(json!({"command": command, "result": result}));
                 }
                 Err(error) => {
                     validation_failed = true;
                     validation.push(json!({
-                        "profile": profile,
+                        "command": command,
                         "error": error.0,
                     }));
                 }

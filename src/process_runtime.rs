@@ -1,5 +1,5 @@
+use crate::bash::RunRecord;
 use crate::model::OutputFilter;
-use crate::tasks::TaskRecord;
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 const LOG_HEAD_BYTES: usize = 12 * 1024 * 1024;
 const LOG_TAIL_BYTES: usize = 4 * 1024 * 1024;
 const LIVE_TAIL_MAX_BYTES: usize = 512 * 1024;
-const OMITTED_MARKER: &[u8] = b"\n... task log middle omitted; tail follows ...\n";
+const OMITTED_MARKER: &[u8] = b"\n... Bash log middle omitted; tail follows ...\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputStream {
@@ -30,7 +30,7 @@ impl OutputStream {
             "stderr" => Ok(Self::Stderr),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("unknown task output stream: {other}"),
+                format!("unknown Bash output stream: {other}"),
             )),
         }
     }
@@ -45,18 +45,18 @@ impl OutputStream {
 }
 
 #[derive(Debug, Clone)]
-pub struct TaskLogPaths {
+pub struct RunLogPaths {
     pub combined: PathBuf,
     pub stdout: PathBuf,
     pub stderr: PathBuf,
 }
 
-impl TaskLogPaths {
-    pub fn new(log_root: &Path, task_id: &str) -> Self {
+impl RunLogPaths {
+    pub fn new(log_root: &Path, run_id: &str) -> Self {
         Self {
-            combined: log_root.join(format!("{task_id}.log")),
-            stdout: log_root.join(format!("{task_id}.stdout.log")),
-            stderr: log_root.join(format!("{task_id}.stderr.log")),
+            combined: log_root.join(format!("{run_id}.log")),
+            stdout: log_root.join(format!("{run_id}.stdout.log")),
+            stderr: log_root.join(format!("{run_id}.stderr.log")),
         }
     }
 
@@ -95,6 +95,7 @@ impl StreamSink {
         let retained = remaining.min(chunk.len());
         if retained > 0 {
             self.file.write_all(&chunk[..retained]).await?;
+            self.file.flush().await?;
             self.head_written += retained;
         }
         if retained < chunk.len() {
@@ -142,7 +143,7 @@ pub struct CollectedLogs {
 pub async fn stream_output<O, E>(
     mut stdout: O,
     mut stderr: E,
-    record: Arc<Mutex<TaskRecord>>,
+    record: Arc<Mutex<RunRecord>>,
     max_live_chars: usize,
 ) -> io::Result<CollectedLogs>
 where
@@ -202,7 +203,7 @@ where
     })
 }
 
-fn update_live_preview(record: &Arc<Mutex<TaskRecord>>, bytes: &[u8], truncated: bool) {
+fn update_live_preview(record: &Arc<Mutex<RunRecord>>, bytes: &[u8], truncated: bool) {
     let text = String::from_utf8_lossy(bytes);
     let mut item = record.lock();
     item.output = strip_ansi(&text);
@@ -210,7 +211,7 @@ fn update_live_preview(record: &Arc<Mutex<TaskRecord>>, bytes: &[u8], truncated:
 }
 
 pub async fn render_preview(
-    paths: &TaskLogPaths,
+    paths: &RunLogPaths,
     filter: &OutputFilter,
     status: &str,
     max_output: usize,
@@ -348,9 +349,9 @@ fn cargo_summary(
     let mut output = String::new();
     let succeeded = status == "succeeded" && build_success.unwrap_or(true);
     output.push_str(if succeeded {
-        "Cargo task succeeded"
+        "Cargo command succeeded"
     } else {
-        "Cargo task failed"
+        "Cargo command failed"
     });
     output.push_str(&format!("; {} retained diagnostic(s).", diagnostics.len()));
 
@@ -553,11 +554,11 @@ pub fn terminate_process_tree(pid: u32, job: Option<&WindowsJob>) {
     }
 }
 
-pub fn remove_logs(paths: &TaskLogPaths) {
+pub fn remove_logs(paths: &RunLogPaths) {
     for path in paths.all() {
         if let Err(error) = fs::remove_file(path) {
             if error.kind() != io::ErrorKind::NotFound {
-                eprintln!("task log cleanup failed for {}: {error}", path.display());
+                eprintln!("Bash log cleanup failed for {}: {error}", path.display());
             }
         }
     }

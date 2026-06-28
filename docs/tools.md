@@ -14,7 +14,7 @@ Returns ranked code context for unfamiliar code. Queries are treated as inert re
 
 Use `required_terms`, `optional_terms`, `exclude_terms`, `document_types`, and `min_score` to reduce noise when a broad path scope contains unrelated files. Legacy `terms` remains supported and is treated as optional weighted terms. Responses include per-result `score`, `reason_codes`, `group`, and a compact `groups` summary.
 
-Recent task failures are excluded by default so unrelated retrieval stays focused. Set `include_task_failures: true` only when runtime failures are relevant to the current debugging query.
+Recent Bash failures are excluded by default so unrelated retrieval stays focused. Set `include_bash_failures: true` only when runtime failures are relevant to the current debugging query.
 
 ## `code_capabilities`
 
@@ -32,11 +32,11 @@ Filename mode treats plain queries as case-insensitive substrings by default. Qu
 
 ## `code_fetch`
 
-Reads exact paths, line ranges, symbols, metadata, provenance handles, continuations, retained task status, and retained task logs. Batch requests return per-item errors without discarding successful reads.
+Reads exact paths, line ranges, symbols, metadata, provenance handles, continuations, retained Bash status, and retained Bash logs. Batch requests return per-item errors without discarding successful reads.
 
-`response_detail` accepts `standard` (default), `compact`, or `debug`. Compact responses keep essential fields such as `path`, `hash`, `content`, and task status while omitting handles and pagination diagnostics. Metadata items return `hash`, `size`, `language`, `document_type`, `line_count`, and `modified_ns` without content. Symbol items may pass `context_lines` and `include_imports`; imports are lexical prelude lines, not inferred dependencies.
+`response_detail` accepts `standard` (default), `compact`, or `debug`. Compact responses keep essential fields such as `path`, `hash`, `content`, and Bash status while omitting handles and pagination diagnostics. Metadata items return `hash`, `size`, `language`, `document_type`, `line_count`, and `modified_ns` without content. Symbol items may pass `context_lines` and `include_imports`; imports are lexical prelude lines, not inferred dependencies.
 
-The returned `status_fetch` descriptor, equivalent to `{"kind":"task_status","value":"task_..."}`, remains available as a read-only task-status handle. The dedicated `task_status` tool provides the same risk-isolated polling path directly.
+The returned `status_fetch` descriptor, equivalent to `{"kind":"bash_status","value":"run_..."}`, remains available as a read-only run-status handle. The dedicated `bash_status` tool provides the same polling path directly.
 
 ## Write tools
 
@@ -106,12 +106,19 @@ Git operations are advertised as separate tools so each operation has one static
 
 These tools remain narrower than unrestricted shell access. A scoped `git_diff` for an untracked file returns a bounded synthetic new-file patch instead of silently returning an empty diff.
 
-## Task tools
+## Bash tools
 
-`task_run` runs one configured profile. It accepts only `profile`; arbitrary command arrays, shell flags, and per-call working-directory overrides are not part of the public MCP contract. `task_status` and `task_output` read retained task state, while `task_cancel` stops a running background task.
+`bash` accepts a non-empty command string plus optional `cwd`, `background`, and `timeout_ms` fields. CodeWeave invokes the configured executable as `bash -c <command>`. `cwd` defaults to the workspace root and must resolve to an existing directory inside the active workspace. For example:
 
-Profiles may set `background`, `timeoutMs`, and an `outputFilter`. Available filters are `raw`, `failedTail`, `tailLines`, `cargoJson`, and `jsonSummary`. Cargo profiles using `cargoJson` should add `--message-format=json` to the command.
+```json
+{
+  "command": "cd backend && ./.venv/Scripts/python.exe -m pytest tests/unit/test_file.py -q",
+  "timeout_ms": 300000
+}
+```
 
-Configured profiles are trusted server configuration and may reference explicit repository-local executable paths such as `.venv/Scripts/python.exe`. Bare profile commands first resolve from `node_modules/.bin` in the profile working directory or workspace root, then fall back to the server's `PATH`. The example configuration defines `vp-check`, `vp-test`, and `vp-build` for CrawlerAI's Vite+ frontend; `vp` is required there and `npm` is not an interchangeable fallback.
+`bash_status` reads live or completed state by `run_id`. `bash_output` pages retained `combined`, `stdout`, or `stderr` logs using the returned continuation token. `bash_cancel` terminates a background run while retaining partial output. Only one run is active per workspace actor at a time, and timeouts use the same process-tree cleanup as cancellation.
 
-Background tasks write combined, stdout, and stderr logs incrementally. Use `task_status` for the live tail, or `task_output` with `stream: "combined"`, `"stdout"`, or `"stderr"`. Page through output by passing the returned `continuation` token. Partial output is retained after `task_cancel` and timeout.
+Write-tool `validate` arrays contain Bash command strings. Commands run sequentially from the workspace root through the same supervisor. If one fails, later commands are skipped and the edit is rolled back unless `rollback_on_failure` is false. Validation entries report `command` and `result`.
+
+Bash is trusted-client functionality and is not sandboxed. `workspace.allowedRoots` constrains file tools and Bash `cwd`, but commands can access anything available to the CodeWeave operating-system user. On Windows, configure a Bash-compatible executable such as Git Bash, WSL Bash, MSYS2, or Cygwin Bash; CodeWeave does not auto-detect it.
