@@ -1,7 +1,7 @@
 use crate::model::{AppError, AppResult, OutputFilter, PolicyConfig};
 use crate::process_runtime::{
     remove_logs, render_preview, stream_output, strip_ansi, terminate_process_tree, OutputStream,
-    RunLogPaths, WindowsJob,
+    RunLogPaths, WarmShell, WindowsJob,
 };
 use crate::security::resolve_existing;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -121,6 +121,7 @@ fn cleanup_orphan_logs(log_root: &Path, retention_hours: i64) {
 pub struct BashSupervisor {
     runs: Arc<Mutex<HashMap<String, Arc<Mutex<RunRecord>>>>>,
     run_permit: Arc<Semaphore>,
+    warm_shell: Arc<tokio::sync::Mutex<Option<WarmShell>>>,
     cache_root: PathBuf,
     policy: PolicyConfig,
     retention_hours: i64,
@@ -187,6 +188,7 @@ impl BashSupervisor {
         Ok(Self {
             runs: Arc::new(Mutex::new(HashMap::new())),
             run_permit: Arc::new(Semaphore::new(1)),
+            warm_shell: Arc::new(tokio::sync::Mutex::new(None)),
             cache_root,
             policy,
             retention_hours,
@@ -277,9 +279,37 @@ impl BashSupervisor {
         let background = request.background.unwrap_or(false);
         let bash_executable = self.policy.bash.executable.clone();
         let max_output = self.policy.bash.max_output_chars;
-        let execution_record = record.clone();
-        let runner = async move {
-            let result = execute(
+
+        if background {
+            let execution_record = record.clone();
+            let runner = async move {
+                let result = execute(
+                    record,
+                    bash_executable,
+                    command,
+                    cwd,
+                    timeout_ms,
+                    max_output,
+                )
+                .await;
+                if let Err(error) = &result {
+                    finalize_run_error(&execution_record, error);
+                }
+                result
+            };
+            tokio::spawn(async move {
+                let _run_permit = run_permit;
+                let _ = runner.await;
+            });
+            let mut result = self.status(&run_id)?;
+            result["background"] = Value::Bool(true);
+            Ok(result)
+        } else {
+            let _run_permit = run_permit;
+            let warm_shell = self.warm_shell.clone();
+            let execution_record = record.clone();
+            let result = execute_warm(
+                warm_shell,
                 record,
                 bash_executable,
                 command,
@@ -291,19 +321,7 @@ impl BashSupervisor {
             if let Err(error) = &result {
                 finalize_run_error(&execution_record, error);
             }
-            result
-        };
-        if background {
-            tokio::spawn(async move {
-                let _run_permit = run_permit;
-                let _ = runner.await;
-            });
-            let mut result = self.status(&run_id)?;
-            result["background"] = Value::Bool(true);
-            Ok(result)
-        } else {
-            let _run_permit = run_permit;
-            runner.await?;
+            result?;
             self.status(&run_id)
         }
     }
@@ -525,6 +543,92 @@ fn finalize_cancelled_before_start(record: &Arc<Mutex<RunRecord>>) -> bool {
     item.output
         .push_str("Bash run was cancelled before the process started.");
     true
+}
+
+async fn execute_warm(
+    warm_shell: Arc<tokio::sync::Mutex<Option<WarmShell>>>,
+    record: Arc<Mutex<RunRecord>>,
+    bash_executable: String,
+    command: String,
+    cwd: PathBuf,
+    timeout_ms: u64,
+    max_output: usize,
+) -> AppResult<()> {
+    if finalize_cancelled_before_start(&record) {
+        return Ok(());
+    }
+
+    {
+        let mut item = record.lock();
+        item.status = "running".to_owned();
+        item.started_at = Utc::now();
+    }
+
+    let mut guard = warm_shell.lock().await;
+    if guard.is_none() {
+        *guard = Some(WarmShell::spawn(&bash_executable).map_err(|error| {
+            AppError::details(
+                "BASH_START_FAILED",
+                error.to_string(),
+                json!({"bash_executable": bash_executable}),
+            )
+        })?);
+    }
+
+    let paths = record.lock().logs.clone();
+    let outcome = match guard
+        .as_mut()
+        .unwrap()
+        .run(&command, &cwd, timeout_ms, &paths)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            *guard = None;
+            return Err(AppError::details(
+                "BASH_RUN_FAILED",
+                error.to_string(),
+                json!({"command": command}),
+            ));
+        }
+    };
+
+    if outcome.needs_respawn {
+        *guard = None;
+    }
+
+    let (mut display_output, mut output_truncated) = render_preview(
+        &paths,
+        &OutputFilter::Raw,
+        outcome.status,
+        max_output,
+        outcome.limited,
+    )
+    .await;
+
+    if outcome.status == "timed_out" {
+        append_note(
+            &mut display_output,
+            &format!("Bash run exceeded timeout of {timeout_ms} ms; partial output was retained."),
+        );
+    }
+
+    if display_output.chars().count() > max_output {
+        display_output = if matches!(outcome.status, "failed" | "timed_out" | "cancelled") {
+            tail_chars(&display_output, max_output)
+        } else {
+            head_chars(&display_output, max_output)
+        };
+        output_truncated = true;
+    }
+
+    let mut item = record.lock();
+    item.status = outcome.status.to_owned();
+    item.exit_code = outcome.exit_code;
+    item.ended_at = Some(Utc::now());
+    item.output = display_output;
+    item.output_truncated = output_truncated;
+    Ok(())
 }
 
 async fn execute(
@@ -951,6 +1055,84 @@ mod tests {
             .unwrap();
         assert_eq!(failed["status"], "failed");
         assert_eq!(failed["exit_code"], 7);
+    }
+
+    #[tokio::test]
+    async fn foreground_warm_shell_preserves_quotes_and_non_utf8_output() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
+
+        let quoted = supervisor
+            .start(
+                root.path(),
+                StartRequest {
+                    command: "printf \"first's\"".to_owned(),
+                    cwd: None,
+                    background: None,
+                    timeout_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(quoted["status"], "succeeded");
+        assert!(quoted["output"].as_str().unwrap().contains("first's"));
+
+        let binary = supervisor
+            .start(
+                root.path(),
+                StartRequest {
+                    command: r"printf '\377'".to_owned(),
+                    cwd: None,
+                    background: None,
+                    timeout_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(binary["status"], "succeeded");
+        assert!(!binary["output"].as_str().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn foreground_wsl_bash_maps_windows_working_directory() {
+        let wsl_bash = PathBuf::from(std::env::var_os("WINDIR").unwrap_or_default())
+            .join("System32")
+            .join("bash.exe");
+        if !wsl_bash.is_file()
+            || !std::process::Command::new(&wsl_bash)
+                .args(["-c", "true"])
+                .status()
+                .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+
+        let root = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let cache = tempdir().unwrap();
+        let mut wsl_policy = policy();
+        wsl_policy.bash.executable = wsl_bash.to_string_lossy().into_owned();
+        let supervisor = BashSupervisor::new(cache.path().to_path_buf(), wsl_policy).unwrap();
+        let result = supervisor
+            .start(
+                &root,
+                StartRequest {
+                    command: "pwd".to_owned(),
+                    cwd: None,
+                    background: None,
+                    timeout_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["status"], "succeeded");
+        assert!(result["output"]
+            .as_str()
+            .unwrap()
+            .trim()
+            .ends_with("/Projects/codeweave"));
     }
 
     #[tokio::test]

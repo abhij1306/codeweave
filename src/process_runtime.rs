@@ -6,13 +6,18 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 const LOG_HEAD_BYTES: usize = 12 * 1024 * 1024;
 const LOG_TAIL_BYTES: usize = 4 * 1024 * 1024;
 const LIVE_TAIL_MAX_BYTES: usize = 512 * 1024;
+const SHELL_READ_CHUNK_BYTES: u64 = 64 * 1024;
 const OMITTED_MARKER: &[u8] = b"\n... Bash log middle omitted; tail follows ...\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +138,292 @@ fn append_rolling(target: &mut Vec<u8>, chunk: &[u8], limit: usize) {
         target.drain(..overflow);
     }
     target.extend_from_slice(chunk);
+}
+
+enum ShellLine {
+    Data(Vec<u8>),
+    Closed,
+}
+
+#[derive(Debug)]
+pub struct WarmShell {
+    child: Child,
+    stdin: ChildStdin,
+    stdout_rx: UnboundedReceiver<ShellLine>,
+    stderr_rx: UnboundedReceiver<ShellLine>,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+    pid: Option<u32>,
+    #[cfg(windows)]
+    job: Option<Arc<WindowsJob>>,
+}
+
+pub struct WarmOutcome {
+    pub status: &'static str,
+    pub exit_code: Option<i32>,
+    pub limited: bool,
+    pub needs_respawn: bool,
+}
+
+impl WarmShell {
+    pub fn spawn(executable: &str) -> io::Result<Self> {
+        let mut cmd = Command::new(executable);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+
+        let mut child = cmd.spawn()?;
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let pid = child.id();
+
+        #[cfg(windows)]
+        let job = pid.and_then(|p| WindowsJob::assign(p).ok());
+
+        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
+        let (stderr_tx, stderr_rx) = mpsc::unbounded_channel();
+
+        let stdout_reader = tokio::spawn(pump_lines(stdout, stdout_tx));
+        let stderr_reader = tokio::spawn(pump_lines(stderr, stderr_tx));
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout_rx,
+            stderr_rx,
+            readers: vec![stdout_reader, stderr_reader],
+            pid,
+            #[cfg(windows)]
+            job,
+        })
+    }
+
+    pub async fn run(
+        &mut self,
+        command: &str,
+        cwd: &Path,
+        timeout_ms: u64,
+        paths: &RunLogPaths,
+    ) -> io::Result<WarmOutcome> {
+        while let Ok(ShellLine::Data(_)) = self.stdout_rx.try_recv() {}
+        while let Ok(ShellLine::Data(_)) = self.stderr_rx.try_recv() {}
+
+        let marker = uuid::Uuid::new_v4().simple().to_string();
+        let cwd_shell = to_shell_path(cwd);
+        let command_quoted = quote_single(command);
+
+        let script = format!(
+            "(\n__cw_cwd={}\nif [ -n \"${{MSYSTEM:-}}\" ] && command -v cygpath >/dev/null 2>&1; then\n  __cw_cwd=$(cygpath -u \"$__cw_cwd\") || exit $?\nelif command -v wslpath >/dev/null 2>&1; then\n  __cw_cwd=$(wslpath -u \"$__cw_cwd\") || exit $?\nelif command -v cygpath >/dev/null 2>&1; then\n  __cw_cwd=$(cygpath -u \"$__cw_cwd\") || exit $?\nfi\ncd \"$__cw_cwd\" && eval {}\n) </dev/null\n__cw_ec=$?\nprintf '\\n%s %d\\n' '{}' \"$__cw_ec\"\nprintf '\\n%s\\n' '{}' >&2\n",
+            quote_single(&cwd_shell),
+            command_quoted,
+            marker,
+            marker
+        );
+
+        self.stdin.write_all(script.as_bytes()).await?;
+        self.stdin.flush().await?;
+
+        let mut combined_sink = StreamSink::create(&paths.combined).await?;
+        let mut stdout_sink = StreamSink::create(&paths.stdout).await?;
+        let mut stderr_sink = StreamSink::create(&paths.stderr).await?;
+
+        let mut stdout_closed = false;
+        let mut stderr_closed = false;
+        let mut stdout_done = false;
+        let mut stderr_done = false;
+        let mut exit_code = None;
+        let mut timed_out = false;
+
+        let drain = async {
+            let stdout_rx = &mut self.stdout_rx;
+            let stderr_rx = &mut self.stderr_rx;
+
+            loop {
+                if (stdout_done || stdout_closed) && (stderr_done || stderr_closed) {
+                    break;
+                }
+
+                tokio::select! {
+                    line = stdout_rx.recv(), if !stdout_done && !stdout_closed => {
+                        match line {
+                            Some(ShellLine::Data(bytes)) => {
+                                if let Some(code) = parse_marker(&bytes, &marker) {
+                                    exit_code = code;
+                                    stdout_done = true;
+                                    continue;
+                                }
+                                combined_sink.push(&bytes).await?;
+                                stdout_sink.push(&bytes).await?;
+                            }
+                            Some(ShellLine::Closed) | None => {
+                                stdout_closed = true;
+                            }
+                        }
+                    }
+                    line = stderr_rx.recv(), if !stderr_done && !stderr_closed => {
+                        match line {
+                            Some(ShellLine::Data(bytes)) => {
+                                if parse_marker(&bytes, &marker).is_some() {
+                                    stderr_done = true;
+                                    continue;
+                                }
+                                combined_sink.push(&bytes).await?;
+                                stderr_sink.push(&bytes).await?;
+                            }
+                            Some(ShellLine::Closed) | None => {
+                                stderr_closed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok::<_, io::Error>(())
+        };
+
+        match tokio::time::timeout(Duration::from_millis(timeout_ms), drain).await {
+            Ok(result) => result?,
+            Err(_) => {
+                timed_out = true;
+                if let Some(pid) = self.pid {
+                    terminate_process_tree(
+                        pid,
+                        #[cfg(windows)]
+                        self.job.as_deref(),
+                        #[cfg(not(windows))]
+                        None,
+                    );
+                }
+
+                let grace = tokio::time::sleep(Duration::from_secs(5));
+                tokio::pin!(grace);
+
+                loop {
+                    tokio::select! {
+                        _ = &mut grace => break,
+                        line = self.stdout_rx.recv() => {
+                            if let Some(ShellLine::Data(bytes)) = line {
+                                let _ = combined_sink.push(&bytes).await;
+                                let _ = stdout_sink.push(&bytes).await;
+                            } else {
+                                stdout_closed = true;
+                            }
+                        }
+                        line = self.stderr_rx.recv() => {
+                            if let Some(ShellLine::Data(bytes)) = line {
+                                let _ = combined_sink.push(&bytes).await;
+                                let _ = stderr_sink.push(&bytes).await;
+                            } else {
+                                stderr_closed = true;
+                            }
+                        }
+                    }
+                    if stdout_closed && stderr_closed {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let shell_died = stdout_closed || stderr_closed;
+        if exit_code.is_none() && shell_died {
+            exit_code = self.child.try_wait()?.and_then(|s| s.code());
+            if exit_code.is_none() {
+                exit_code = self.child.wait().await.ok().and_then(|s| s.code());
+            }
+        }
+
+        let limited_combined = combined_sink.finish().await?;
+        let limited_stdout = stdout_sink.finish().await?;
+        let limited_stderr = stderr_sink.finish().await?;
+        let limited = limited_combined || limited_stdout || limited_stderr;
+
+        let status = if timed_out {
+            "timed_out"
+        } else if let Some(0) = exit_code {
+            "succeeded"
+        } else {
+            "failed"
+        };
+
+        Ok(WarmOutcome {
+            status,
+            exit_code,
+            limited,
+            needs_respawn: timed_out || shell_died,
+        })
+    }
+}
+
+impl Drop for WarmShell {
+    fn drop(&mut self) {
+        for reader in &self.readers {
+            reader.abort();
+        }
+    }
+}
+
+fn parse_marker(bytes: &[u8], marker: &str) -> Option<Option<i32>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix(marker) {
+        let code_str = rest.trim();
+        if code_str.is_empty() {
+            return Some(None);
+        }
+        let code = code_str.parse::<i32>().ok()?;
+        return Some(Some(code));
+    }
+    None
+}
+
+fn to_shell_path(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let path = path.to_string_lossy();
+        if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+            return format!("//{}", unc.replace('\\', "/"));
+        }
+        path.strip_prefix(r"\\?\")
+            .unwrap_or(&path)
+            .replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.display().to_string()
+    }
+}
+
+fn quote_single(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+async fn pump_lines<R: AsyncRead + Unpin>(reader: R, tx: UnboundedSender<ShellLine>) {
+    let mut reader = BufReader::new(reader);
+    loop {
+        let mut bytes = Vec::new();
+        match (&mut reader)
+            .take(SHELL_READ_CHUNK_BYTES)
+            .read_until(b'\n', &mut bytes)
+            .await
+        {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if tx.send(ShellLine::Data(bytes)).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+    let _ = tx.send(ShellLine::Closed);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -573,6 +864,19 @@ mod tests {
         let mut buffer = b"abcdef".to_vec();
         append_rolling(&mut buffer, b"ghij", 6);
         assert_eq!(buffer, b"efghij");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_paths_remove_windows_verbatim_prefixes() {
+        assert_eq!(
+            to_shell_path(Path::new(r"\\?\C:\Projects\codeweave")),
+            "C:/Projects/codeweave"
+        );
+        assert_eq!(
+            to_shell_path(Path::new(r"\\?\UNC\server\share\workspace")),
+            "//server/share/workspace"
+        );
     }
 
     #[test]
