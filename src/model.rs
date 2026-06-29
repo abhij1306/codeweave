@@ -114,6 +114,11 @@ pub fn test_bash_executable() -> String {
 pub struct WorkspaceSettings {
     #[serde(default)]
     pub default_path: Option<String>,
+    /// Pin the instance to `default_path`: ignore any `path` argument passed to
+    /// `workspace(open)` so a tunneled single-repo deployment can never switch
+    /// to the wrong repository, even when the transport session id is lost.
+    #[serde(default)]
+    pub lock_to_default: bool,
     #[serde(default)]
     pub allowed_roots: Vec<String>,
     #[serde(default)]

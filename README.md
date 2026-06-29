@@ -176,12 +176,14 @@ Detailed guides:
     "port": 8820,
     "authMode": "bearer",
     "tokenFile": ".mcp-token",
-    "statefulMode": true,
-    "jsonResponse": false,
+    "statefulMode": false,
+    "jsonResponse": true,
+    "idleTimeoutMs": 5000,
     "allowedHosts": ["*"]
   },
   "workspace": {
     "defaultPath": "/path/to/projects/example",
+    "lockToDefault": true,
     "allowedRoots": ["/path/to/projects"],
     "artifactPaths": ["artifacts"],
     "excludePaths": ["**/__pycache__/", "**/.pytest_cache/", "**/.mypy_cache/", "**/.ruff_cache/", "*.log"]
@@ -217,7 +219,11 @@ Bash output is written incrementally. Use `bash_status` for the live tail or `ba
 
 This execution surface is trusted-client functionality, not a sandbox. `workspace.allowedRoots` constrains repository selection, file tools, and the `cwd` argument, but a Bash command can access anything available to the operating-system account running CodeWeave. Windows requires an explicitly configured Bash-compatible executable such as Git Bash, WSL Bash, MSYS2, or Cygwin Bash; CodeWeave does not auto-detect one.
 
-`server.statefulMode` defaults to `true` so independent chats or LLM clients receive isolated active-workspace state through the MCP session id. Stateful streamable HTTP uses long-lived SSE requests; ngrok's p50/p90 dashboard can include those request durations, so it may show high values even when tool responses report low `elapsed_ms`. `server.jsonResponse` defaults to `false` and only applies when `statefulMode` is disabled. Stateless HTTP remains supported for legacy direct JSON responses, but all stateless requests share one fallback workspace key.
+`server.statefulMode` defaults to `false`, so each `POST /mcp` returns an immediate `application/json` response and proxy dashboards such as ngrok report true handler latency. Setting `statefulMode` to `true` gives independent chats isolated active-workspace state through the MCP session id, but RMCP serves every stateful request over a long-lived SSE stream (15-second keep-alives); ngrok's p50/p90 then includes those request durations and can show high values even when tool responses report low `elapsed_ms`. `server.jsonResponse` defaults to `true` and only takes effect while `statefulMode` is `false` (RMCP 1.8 has no stateful direct-JSON mode).
+
+`server.idleTimeoutMs` defaults to `5000` and bounds how long an **idle keep-alive TCP connection** stays open. This is independent of request latency: even when every `POST /mcp` returns in milliseconds, Hyper keeps the underlying socket open for reuse, so a tunnel or connector (ngrok, the OpenAI connector) holds it until its own deadline — often ~90 seconds — and reports that as the **Connections** p50/p90, not the request duration. CodeWeave applies `idleTimeoutMs` as Hyper's `header_read_timeout` (the equivalent of Uvicorn's `timeout_keep_alive`, which is why Serena's dashboard reads ~5s): an idle connection is closed after the timeout, while an in-flight request — including a long foreground `bash` POST — is never interrupted, because the timeout resets per request. Set it to `0` to disable the bound and keep connections open until the peer closes them.
+
+Because stateless HTTP shares one fallback workspace key, a tunneled single-repository instance should set `workspace.defaultPath` and `workspace.lockToDefault: true`: the instance then ignores any `path` passed to `workspace(action="open", ...)` and always serves the configured repository, so a connector that drops the MCP session id can never resolve to the wrong repository. The effective `statefulMode`, `jsonResponse`, `idleTimeoutMs`, pinned `workspace`, and build `gitSha` are reported by `GET /live`.
 
 `server.allowedHosts` extends rmcp's Host-header validation. Set it to exact public hostnames for fixed domains, or to `["*"]` for trusted local tunnels such as random ngrok URLs where bearer auth is injected before requests reach CodeWeave.
 

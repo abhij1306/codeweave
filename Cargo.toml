@@ -16,6 +16,7 @@ cap-std = "4.0"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.5", features = ["derive"] }
 futures-util = "0.3"
+hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
 ignore = "0.4"
 notify = "8.2"
 parking_lot = "0.12"

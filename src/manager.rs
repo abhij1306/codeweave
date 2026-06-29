@@ -398,16 +398,30 @@ impl WorkspaceManager {
             .get("_summary_ids")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let summarize = |actor: &WorkspaceActor| {
-            if ids_only {
-                actor.summary_ids()
-            } else {
-                actor.summary(session.as_str(), session.is_stateless())
-            }
-        };
         let started = Instant::now();
         let config = self.config()?;
-        let requested_path = params.get("path").and_then(Value::as_str);
+        let pinned =
+            config.workspace.lock_to_default && config.workspace.default_path.is_some();
+        let summarize = |actor: &WorkspaceActor| -> AppResult<Value> {
+            let mut summary = if ids_only {
+                actor.summary_ids()?
+            } else {
+                actor.summary(session.as_str(), session.is_stateless())?
+            };
+            if pinned {
+                if let Some(object) = summary.as_object_mut() {
+                    object.insert("pinned".to_owned(), json!(true));
+                }
+            }
+            Ok(summary)
+        };
+        // A pinned single-repo instance ignores any caller-supplied `path` so a
+        // dropped transport session can never resolve to the wrong repository.
+        let requested_path = if pinned {
+            None
+        } else {
+            params.get("path").and_then(Value::as_str)
+        };
         let workspace = if let Some(path) = requested_path {
             self.workspace_for_path(&config, path)?
         } else if let Some(path) = config.workspace.default_path.as_deref() {
@@ -919,6 +933,7 @@ mod tests {
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: Some(root.path().to_string_lossy().into_owned()),
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
@@ -963,6 +978,7 @@ mod tests {
                 exclude_paths: vec!["generated/".to_owned()],
             }],
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: Some(root.path().to_string_lossy().into_owned()),
                 allowed_roots: Vec::new(),
                 artifact_paths: Vec::new(),
@@ -1002,6 +1018,7 @@ mod tests {
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
@@ -1052,6 +1069,7 @@ mod tests {
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
@@ -1102,6 +1120,7 @@ mod tests {
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: Some(default_workspace.to_string_lossy().into_owned()),
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
@@ -1156,6 +1175,7 @@ mod tests {
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
@@ -1197,6 +1217,56 @@ mod tests {
     }
 
     #[test]
+    fn pinned_instance_ignores_foreign_open_path() {
+        let root = tempdir().unwrap();
+        let pinned = root.path().join("pinned");
+        let other = root.path().join("other");
+        let cache = root.path().join("cache");
+        std::fs::create_dir_all(&pinned).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(pinned.join("main.rs"), "fn pinned() {}\n").unwrap();
+        std::fs::write(other.join("main.rs"), "fn other() {}\n").unwrap();
+        let manager = WorkspaceManager::default();
+        let config = serde_json::to_value(DaemonConfig {
+            workspaces: Vec::new(),
+            workspace: WorkspaceSettings {
+                lock_to_default: true,
+                default_path: Some(pinned.to_string_lossy().into_owned()),
+                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
+                artifact_paths: Vec::new(),
+                exclude_paths: Vec::new(),
+            },
+            skills: SkillsConfig::default(),
+            policy: PolicyConfig {
+                max_file_bytes: 1_000_000,
+                max_context_chars: 50_000,
+                max_search_results: 100,
+                bash: test_bash_config(),
+            },
+            cache_root: cache.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+        manager.initialize(&config).unwrap();
+
+        // Explicitly asking for `other` must still resolve to the pinned repo,
+        // and the summary must advertise the pin.
+        let summary = manager
+            .workspace(
+                &SessionKey::stateless(),
+                &json!({"action": "open", "path": other}),
+            )
+            .unwrap();
+        assert_eq!(summary.get("pinned").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            manager
+                .active_actor(&SessionKey::stateless())
+                .unwrap()
+                .root_path(),
+            std::fs::canonicalize(&pinned).unwrap()
+        );
+    }
+
+    #[test]
     fn sessions_opening_same_repo_reuse_one_actor_and_clear_open_lock() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
@@ -1205,6 +1275,7 @@ mod tests {
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
@@ -1258,6 +1329,7 @@ mod tests {
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
@@ -1327,6 +1399,7 @@ mod tests {
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
@@ -1470,6 +1543,7 @@ mod tests {
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
@@ -1507,6 +1581,7 @@ mod tests {
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: None,
                 allowed_roots: vec![allowed.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
@@ -1556,6 +1631,7 @@ mod tests {
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),
@@ -1658,6 +1734,7 @@ mod tests {
         let config = serde_json::to_value(DaemonConfig {
             workspaces: Vec::new(),
             workspace: WorkspaceSettings {
+                lock_to_default: false,
                 default_path: None,
                 allowed_roots: vec![root.path().to_string_lossy().into_owned()],
                 artifact_paths: Vec::new(),

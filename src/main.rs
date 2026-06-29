@@ -68,6 +68,13 @@ struct ServerConfig {
     stateful_mode: bool,
     #[serde(default = "default_json_response")]
     json_response: bool,
+    /// Idle HTTP keep-alive timeout in milliseconds. Hyper's equivalent of
+    /// Uvicorn's `timeout_keep_alive`: an idle kept-alive connection is closed
+    /// after this long, so a tunnel/connector does not hold the socket open to
+    /// its own ~90s deadline and report that as the connection lifetime. `0`
+    /// disables the bound (connections stay open until the peer closes them).
+    #[serde(default = "default_idle_timeout_ms")]
+    idle_timeout_ms: u64,
 }
 fn default_host() -> String {
     "127.0.0.1".into()
@@ -82,10 +89,13 @@ fn default_token() -> String {
     ".mcp-token".into()
 }
 fn default_stateful_mode() -> bool {
-    true
+    false
 }
 fn default_json_response() -> bool {
-    false
+    true
+}
+fn default_idle_timeout_ms() -> u64 {
+    5000
 }
 
 fn validate_auth_mode(auth_mode: &str) -> Result<()> {
@@ -950,9 +960,37 @@ fn tool_failure(error: model::AppError) -> Value {
 }
 
 async fn live(State(state): State<AppState>) -> Json<Value> {
-    Json(
-        json!({"ok":true,"name":SERVER_NAME,"version":env!("CARGO_PKG_VERSION"),"transport":"http","auth":state.server.auth_mode}),
-    )
+    let workspace = state.config.get("workspace");
+    Json(json!({
+        "ok": true,
+        "name": SERVER_NAME,
+        "version": env!("CARGO_PKG_VERSION"),
+        "transport": "http",
+        "auth": state.server.auth_mode,
+        // Effective transport mode, so a tunnel operator can confirm the running
+        // process is stateless+JSON (not the old long-lived-SSE behaviour).
+        "statefulMode": state.server.stateful_mode,
+        "jsonResponse": state.server.json_response,
+        // Idle keep-alive timeout actually applied to accepted connections, so a
+        // tunnel operator can confirm sockets are closed at ~5s (matching the
+        // ngrok "Connections" p50/p90) rather than held to the connector deadline.
+        "idleTimeoutMs": state.server.idle_timeout_ms,
+        "rmcp": "1.8",
+        "workspace": {
+            "defaultPath": workspace
+                .and_then(|value| value.get("defaultPath"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "lockToDefault": workspace
+                .and_then(|value| value.get("lockToDefault"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
+        "build": {
+            "gitSha": option_env!("CODEWEAVE_GIT_SHA").unwrap_or("unknown"),
+            "unixTime": option_env!("CODEWEAVE_BUILD_TIME").unwrap_or("0"),
+        },
+    }))
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {

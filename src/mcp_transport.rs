@@ -328,39 +328,63 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
     let address = format!("{}:{}", state.server.host, state.server.port);
     let listener = tokio::net::TcpListener::bind(&address).await?;
     eprintln!("{SERVER_NAME} listening on http://{address}/mcp");
-    axum::serve(NoDelayListener(listener), app).await?;
-    Ok(())
+    serve_with_idle_timeout(listener, app, state.server.idle_timeout_ms).await
 }
 
-/// Wraps a `TcpListener` so every accepted connection gets `TCP_NODELAY`.
+/// Serves the app on a manual hyper accept loop so we can bound idle keep-alive
+/// connection lifetime — something `axum::serve` does not expose.
 ///
-/// Without this, Nagle's algorithm holds the final small TCP segment of each
-/// response until the peer's delayed-ACK timer fires (~200ms on Windows),
-/// adding a flat per-request latency floor. Disabling Nagle removes it.
-struct NoDelayListener(tokio::net::TcpListener);
+/// Why this matters: `jsonResponse`/`statefulMode` only control how fast a
+/// *request body* returns. They do not close the underlying TCP connection.
+/// Hyper keeps an idle keep-alive socket open indefinitely, so a tunnel/proxy
+/// (ngrok, the OpenAI connector) holds it until its own ~90s deadline and
+/// reports that as the connection's p50/p90 lifetime — even though every
+/// request finished in milliseconds. Uvicorn (Serena's server) closes idle
+/// keep-alive connections after ~5s, which is why its dashboard reads ~5s.
+///
+/// `header_read_timeout` is hyper's equivalent of Uvicorn's `timeout_keep_alive`:
+/// it bounds the time spent waiting to read a request head, including the wait
+/// for the *next* request on a kept-alive connection, so an idle socket is
+/// closed after the timeout. It resets per request and does not interrupt an
+/// in-flight request/response (e.g. a long foreground `bash` POST).
+async fn serve_with_idle_timeout(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    idle_timeout_ms: u64,
+) -> Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::server::conn::auto::Builder as ConnBuilder;
+    use hyper_util::service::TowerToHyperService;
 
-impl axum::serve::Listener for NoDelayListener {
-    type Io = tokio::net::TcpStream;
-    type Addr = std::net::SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            match self.0.accept().await {
-                Ok((stream, addr)) => {
-                    let _ = stream.set_nodelay(true);
-                    return (stream, addr);
-                }
-                // Mirror axum's own accept loop: back off briefly on transient
-                // errors (e.g. EMFILE) instead of busy-spinning.
-                Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-            }
-        }
+    let mut builder = ConnBuilder::new(TokioExecutor::new());
+    if idle_timeout_ms > 0 {
+        builder
+            .http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(std::time::Duration::from_millis(idle_timeout_ms));
     }
+    let builder = Arc::new(builder);
 
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.0.local_addr()
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            // Mirror axum's accept loop: back off briefly on transient errors
+            // (e.g. EMFILE) instead of busy-spinning.
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                continue;
+            }
+        };
+        // Disable Nagle: without this the final small TCP segment of each
+        // response waits on the peer's delayed-ACK timer (~200ms on Windows).
+        let _ = stream.set_nodelay(true);
+
+        let io = TokioIo::new(stream);
+        let service = TowerToHyperService::new(app.clone());
+        let builder = builder.clone();
+        tokio::spawn(async move {
+            let _ = builder.serve_connection_with_upgrades(io, service).await;
+        });
     }
 }
 
@@ -509,6 +533,7 @@ mod tests {
             allowed_origins: Vec::new(),
             stateful_mode: true,
             json_response: false,
+            idle_timeout_ms: 5000,
         };
 
         assert!(configured_allowed_hosts(&server).is_empty());
@@ -525,6 +550,7 @@ mod tests {
             allowed_origins: Vec::new(),
             stateful_mode: true,
             json_response: false,
+            idle_timeout_ms: 5000,
         };
 
         let hosts = configured_allowed_hosts(&server);
@@ -544,6 +570,7 @@ mod tests {
             allowed_origins: Vec::new(),
             stateful_mode: true,
             json_response: false,
+            idle_timeout_ms: 5000,
         };
 
         let hosts = configured_allowed_hosts(&server);

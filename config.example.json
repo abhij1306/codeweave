@@ -4,8 +4,9 @@
     "port": 8813,
     "authMode": "bearer",
     "tokenFile": ".mcp-token",
-    "statefulMode": true,
-    "jsonResponse": false,
+    "statefulMode": false,
+    "jsonResponse": true,
+    "idleTimeoutMs": 5000,
     "allowedHosts": [
       "*"
     ],
@@ -13,6 +14,7 @@
   },
   "workspace": {
     "defaultPath": "/path/to/projects/example",
+    "lockToDefault": true,
     "allowedRoots": [
       "/path/to/projects"
     ],
