@@ -276,6 +276,11 @@ impl WorkspaceManager {
     fn initialize(&self, params: &Value) -> AppResult<Value> {
         reject_legacy_execution_config(params)?;
         let config: DaemonConfig = serde_json::from_value(params.clone())?;
+        if config.workspace.lock_to_default && config.workspace.default_path.is_none() {
+            return Err(AppError::invalid(
+                "workspace.lockToDefault requires workspace.defaultPath",
+            ));
+        }
         for actor in self.actors.read().values() {
             let running_runs = actor.running_bash_count();
             if running_runs > 0 {
@@ -400,8 +405,7 @@ impl WorkspaceManager {
             .unwrap_or(false);
         let started = Instant::now();
         let config = self.config()?;
-        let pinned =
-            config.workspace.lock_to_default && config.workspace.default_path.is_some();
+        let pinned = config.workspace.lock_to_default && config.workspace.default_path.is_some();
         let summarize = |actor: &WorkspaceActor| -> AppResult<Value> {
             let mut summary = if ids_only {
                 actor.summary_ids()?
@@ -888,6 +892,22 @@ mod tests {
             cache_root: cache.to_string_lossy().into_owned(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn initialize_rejects_lock_to_default_without_default_path() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let mut config = daemon_config(root.path(), cache.path(), 1_000_000);
+        config["workspace"]["lockToDefault"] = json!(true);
+
+        let error = WorkspaceManager::default().initialize(&config).unwrap_err();
+
+        assert_eq!(error.0.code, "INVALID_ARGUMENT");
+        assert!(error
+            .0
+            .message
+            .contains("workspace.lockToDefault requires workspace.defaultPath"));
     }
 
     #[test]

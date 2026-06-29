@@ -960,15 +960,13 @@ fn tool_failure(error: model::AppError) -> Value {
 }
 
 async fn live(State(state): State<AppState>) -> Json<Value> {
-    let workspace = state.config.get("workspace");
     Json(json!({
         "ok": true,
         "name": SERVER_NAME,
         "version": env!("CARGO_PKG_VERSION"),
         "transport": "http",
-        "auth": state.server.auth_mode,
-        // Effective transport mode, so a tunnel operator can confirm the running
-        // process is stateless+JSON (not the old long-lived-SSE behaviour).
+        // Keep the public liveness response operationally useful without
+        // exposing authentication, repository, or build provenance details.
         "statefulMode": state.server.stateful_mode,
         "jsonResponse": state.server.json_response,
         // Idle keep-alive timeout actually applied to accepted connections, so a
@@ -976,20 +974,6 @@ async fn live(State(state): State<AppState>) -> Json<Value> {
         // ngrok "Connections" p50/p90) rather than held to the connector deadline.
         "idleTimeoutMs": state.server.idle_timeout_ms,
         "rmcp": "1.8",
-        "workspace": {
-            "defaultPath": workspace
-                .and_then(|value| value.get("defaultPath"))
-                .cloned()
-                .unwrap_or(Value::Null),
-            "lockToDefault": workspace
-                .and_then(|value| value.get("lockToDefault"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        },
-        "build": {
-            "gitSha": option_env!("CODEWEAVE_GIT_SHA").unwrap_or("unknown"),
-            "unixTime": option_env!("CODEWEAVE_BUILD_TIME").unwrap_or("0"),
-        },
     }))
 }
 
@@ -1080,6 +1064,37 @@ mod tests {
                     .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
             })
             .expect("tool must exist")
+    }
+
+    #[tokio::test]
+    async fn live_omits_sensitive_runtime_metadata() {
+        let state = AppState {
+            manager: Arc::new(WorkspaceManager::default()),
+            config: json!({
+                "workspace": {
+                    "defaultPath": "C:\\private\\repository",
+                    "lockToDefault": true
+                }
+            }),
+            server: serde_json::from_value(json!({
+                "authMode": "bearer",
+                "statefulMode": false,
+                "jsonResponse": true,
+                "idleTimeoutMs": 5000
+            }))
+            .unwrap(),
+            token: Some(Arc::new(b"secret".to_vec())),
+        };
+
+        let Json(payload) = live(State(state)).await;
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["idleTimeoutMs"], 5000);
+        for field in ["auth", "workspace", "build"] {
+            assert!(payload.get(field).is_none(), "unexpected {field} field");
+        }
+        assert!(!payload.to_string().contains("private"));
+        assert!(!payload.to_string().contains("secret"));
     }
 
     #[test]

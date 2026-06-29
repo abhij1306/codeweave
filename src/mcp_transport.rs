@@ -331,6 +331,11 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
     serve_with_idle_timeout(listener, app, state.server.idle_timeout_ms).await
 }
 
+fn is_accept_resource_exhaustion(error: &std::io::Error) -> bool {
+    // Unix EMFILE/ENFILE and Windows ERROR_TOO_MANY_OPEN_FILES/WSAEMFILE.
+    matches!(error.raw_os_error(), Some(4 | 23 | 24 | 10024))
+}
+
 /// Serves the app on a manual hyper accept loop so we can bound idle keep-alive
 /// connection lifetime — something `axum::serve` does not expose.
 ///
@@ -364,14 +369,38 @@ async fn serve_with_idle_timeout(
             .header_read_timeout(std::time::Duration::from_millis(idle_timeout_ms));
     }
     let builder = Arc::new(builder);
+    let mut accept_backoff = std::time::Duration::from_millis(10);
 
     loop {
         let (stream, _addr) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            // Mirror axum's accept loop: back off briefly on transient errors
-            // (e.g. EMFILE) instead of busy-spinning.
-            Err(_) => {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            Ok(accepted) => {
+                accept_backoff = std::time::Duration::from_millis(10);
+                accepted
+            }
+            Err(error) => {
+                let resource_exhausted = is_accept_resource_exhaustion(&error);
+                let min_backoff = if resource_exhausted {
+                    std::time::Duration::from_millis(100)
+                } else {
+                    std::time::Duration::from_millis(10)
+                };
+                let max_backoff = if resource_exhausted {
+                    std::time::Duration::from_secs(5)
+                } else {
+                    std::time::Duration::from_secs(1)
+                };
+                accept_backoff = accept_backoff.max(min_backoff).min(max_backoff);
+                eprintln!(
+                    "{SERVER_NAME} listener accept failed ({}): {error}; retrying in {} ms",
+                    if resource_exhausted {
+                        "file-descriptor exhaustion"
+                    } else {
+                        "transient error"
+                    },
+                    accept_backoff.as_millis()
+                );
+                tokio::time::sleep(accept_backoff).await;
+                accept_backoff = accept_backoff.saturating_mul(2).min(max_backoff);
                 continue;
             }
         };
@@ -432,6 +461,18 @@ pub(crate) async fn run_stdio(state: AppState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accept_resource_exhaustion_classifies_common_platform_codes() {
+        for code in [4, 23, 24, 10024] {
+            assert!(is_accept_resource_exhaustion(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!is_accept_resource_exhaustion(
+            &std::io::Error::from_raw_os_error(111)
+        ));
+    }
 
     #[test]
     fn compatibility_event_contains_json_rpc_message() {
