@@ -862,6 +862,7 @@ mod tests {
             enabled: true,
             executable: test_bash_executable(),
             default_timeout_ms: 120_000,
+            foreground_budget_ms: 20_000,
             max_timeout_ms: 300_000,
             max_output_chars: 30_000,
             retention_hours: 1,

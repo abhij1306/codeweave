@@ -1,6 +1,6 @@
 use super::edit::PlannedFile;
 use cap_std::{ambient_authority, fs::Dir};
-use similar::TextDiff;
+use similar::{ChangeTag, TextDiff};
 use std::io;
 use std::path::Path;
 use uuid::Uuid;
@@ -21,6 +21,29 @@ pub(super) fn render_diff(plan: &[PlannedFile]) -> String {
         }
     }
     output
+}
+
+/// Per-file added/removed line counts for a planned edit. Cheap to compute from the
+/// same before/after buffers `render_diff` uses, and small enough to return even when
+/// the full unified diff is capped or omitted.
+pub(super) fn diff_stat(plan: &[PlannedFile]) -> Vec<(String, usize, usize)> {
+    plan.iter()
+        .map(|item| {
+            let before = item.before.as_deref().unwrap_or_default();
+            let after = item.after.as_deref().unwrap_or_default();
+            let diff = TextDiff::from_lines(before, after);
+            let mut added = 0usize;
+            let mut removed = 0usize;
+            for change in diff.iter_all_changes() {
+                match change.tag() {
+                    ChangeTag::Insert => added += 1,
+                    ChangeTag::Delete => removed += 1,
+                    ChangeTag::Equal => {}
+                }
+            }
+            (item.path.clone(), added, removed)
+        })
+        .collect()
 }
 
 fn workspace_dir(root: &Path) -> io::Result<Dir> {

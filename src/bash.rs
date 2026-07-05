@@ -98,6 +98,57 @@ impl Drop for ExecutionGuard {
     }
 }
 
+/// Guards a warm-shell execution running on a detached task. If the task is
+/// aborted or panics mid-command (so the marker is never consumed), the guard
+/// terminates the shell's process tree and marks the run record terminal. The
+/// shell is removed from the shared slot before execution, so a shell whose
+/// marker was not consumed can never be reused: its next output would interleave
+/// with the previous command's.
+struct WarmExecutionGuard {
+    record: Arc<Mutex<RunRecord>>,
+    pid: Option<u32>,
+    job: Option<Arc<WindowsJob>>,
+    armed: bool,
+}
+
+impl WarmExecutionGuard {
+    fn new(record: Arc<Mutex<RunRecord>>, pid: Option<u32>, job: Option<Arc<WindowsJob>>) -> Self {
+        Self {
+            record,
+            pid,
+            job,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WarmExecutionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(pid) = self.pid {
+            terminate_process_tree(pid, self.job.as_deref());
+        }
+        let mut item = self.record.lock();
+        if item.ended_at.is_none() {
+            item.status = "cancelled".to_owned();
+            item.ended_at = Some(Utc::now());
+            item.pid = None;
+            item.job = None;
+            if !item.output.is_empty() {
+                item.output.push('\n');
+            }
+            item.output
+                .push_str("Bash run was abandoned; the process tree was terminated.");
+        }
+    }
+}
+
 fn cleanup_orphan_logs(log_root: &Path, retention_hours: i64) {
     let Ok(entries) = fs::read_dir(log_root) else {
         return;
@@ -241,21 +292,36 @@ impl BashSupervisor {
                 }),
             ));
         }
-        let run_permit = self
-            .run_permit
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                AppError::details(
+        let background = request.background.unwrap_or(false);
+        let run_permit = match self.run_permit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // The single run slot is busy. If the caller re-issued an
+                // identical command against the same cwd (ChatGPT retries a
+                // timed-out call verbatim), hand back the in-flight run so the
+                // model polls it instead of flailing on RUN_BUSY.
+                if let Some(active) = self.active_run_matching(&command, &cwd) {
+                    let mut view = self.status(&active)?;
+                    view["deduplicated"] = Value::Bool(true);
+                    view["guidance"] = Value::String(
+                        "An identical command is already running; poll bash_status with this run_id."
+                            .to_owned(),
+                    );
+                    return Ok(view);
+                }
+                let active = self.active_run_view();
+                return Err(AppError::details(
                     "RUN_BUSY",
                     "Another command is already running",
                     json!({
                         "retryable": true,
                         "active_run_limit": 1,
-                        "suggested_action": "Wait for the active command to finish or cancel it before starting another command."
+                        "active_run": active,
+                        "suggested_action": "Poll bash_status with the active run_id, or cancel it before starting a different command."
                     }),
-                )
-            })?;
+                ));
+            }
+        };
         let run_id = format!("run_{}", Uuid::new_v4().simple());
         let log_root = self.cache_root.join("bash-logs");
         let logs = RunLogPaths::new(&log_root, &run_id);
@@ -276,14 +342,19 @@ impl BashSupervisor {
         }));
         self.runs.lock().insert(run_id.clone(), record.clone());
         self.trim_runs();
-        let background = request.background.unwrap_or(false);
         let bash_executable = self.policy.bash.executable.clone();
         let max_output = self.policy.bash.max_output_chars;
 
-        if background {
-            let execution_record = record.clone();
-            let runner = async move {
-                let result = execute(
+        // Execution always runs on a detached task, even for foreground calls.
+        // If the client aborts the request (dropping the request future), the
+        // command keeps running, the permit stays held until it finishes, and
+        // the warm shell cannot be handed to the next call mid-command.
+        let warm_shell = self.warm_shell.clone();
+        let execution_record = record.clone();
+        let mut handle = tokio::spawn(async move {
+            let _run_permit = run_permit;
+            let result = if background {
+                execute(
                     record,
                     bash_executable,
                     command,
@@ -291,39 +362,108 @@ impl BashSupervisor {
                     timeout_ms,
                     max_output,
                 )
-                .await;
-                if let Err(error) = &result {
-                    finalize_run_error(&execution_record, error);
-                }
-                result
+                .await
+            } else {
+                execute_warm(
+                    warm_shell,
+                    record,
+                    bash_executable,
+                    command,
+                    cwd,
+                    timeout_ms,
+                    max_output,
+                )
+                .await
             };
-            tokio::spawn(async move {
-                let _run_permit = run_permit;
-                let _ = runner.await;
-            });
-            let mut result = self.status(&run_id)?;
-            result["background"] = Value::Bool(true);
-            Ok(result)
-        } else {
-            let _run_permit = run_permit;
-            let warm_shell = self.warm_shell.clone();
-            let execution_record = record.clone();
-            let result = execute_warm(
-                warm_shell,
-                record,
-                bash_executable,
-                command,
-                cwd,
-                timeout_ms,
-                max_output,
-            )
-            .await;
             if let Err(error) = &result {
                 finalize_run_error(&execution_record, error);
             }
-            result?;
-            self.status(&run_id)
+            result
+        });
+
+        if background {
+            let mut result = self.status(&run_id)?;
+            result["background"] = Value::Bool(true);
+            return Ok(result);
         }
+
+        // Foreground: return as soon as the command finishes, but never block
+        // the MCP request past the foreground budget. Exceeding it does NOT
+        // kill the command — the detached task keeps running and the client is
+        // told to poll. A budget of 0 disables auto-promotion.
+        // Only race the budget when the command could plausibly outlast it.
+        // If its own timeout is within the budget it will finish (or self-kill)
+        // in time, so we await it fully and avoid a promotion/completion race.
+        let budget_ms = self.policy.bash.foreground_budget_ms;
+        let outcome = if budget_ms == 0 || timeout_ms <= budget_ms {
+            Some(handle.await)
+        } else {
+            timeout(Duration::from_millis(budget_ms), &mut handle)
+                .await
+                .ok()
+        };
+
+        match outcome {
+            Some(Ok(result)) => {
+                result?;
+                self.status(&run_id)
+            }
+            Some(Err(join_error)) => Err(AppError::details(
+                "BASH_EXECUTION_FAILED",
+                "Bash execution task terminated unexpectedly",
+                json!({"run_id": run_id, "detail": join_error.to_string()}),
+            )),
+            None => {
+                // Budget exceeded; command continues in the background.
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "bash_foreground_auto_promoted",
+                        "run_id": run_id,
+                        "budget_ms": budget_ms
+                    })
+                );
+                let mut view = self.status(&run_id)?;
+                view["detached"] = Value::Bool(true);
+                view["reason"] = Value::String("foreground_budget_exceeded".to_owned());
+                view["poll_hint_ms"] = json!(3000);
+                view["guidance"] = Value::String(
+                    "Command is still running after the foreground budget; do not re-issue it. \
+                     Poll bash_status with the returned run_id until status is terminal."
+                        .to_owned(),
+                );
+                Ok(view)
+            }
+        }
+    }
+
+    /// Dedupe key for retried commands: an *active* run with the same command
+    /// text and working directory. Single-slot semantics make an identical
+    /// concurrent command an almost-certain client retry.
+    fn active_run_matching(&self, command: &str, cwd: &Path) -> Option<String> {
+        self.runs.lock().values().find_map(|record| {
+            let record = record.lock();
+            (record.ended_at.is_none() && record.command == command && record.cwd == cwd)
+                .then(|| record.run_id.clone())
+        })
+    }
+
+    /// Summary of the currently active run, attached to RUN_BUSY so the model
+    /// can poll or cancel instead of retrying blindly.
+    fn active_run_view(&self) -> Option<serde_json::Value> {
+        self.runs.lock().values().find_map(|record| {
+            let record = record.lock();
+            if record.ended_at.is_some() {
+                return None;
+            }
+            let elapsed_ms = (Utc::now() - record.started_at).num_milliseconds().max(0);
+            Some(json!({
+                "run_id": record.run_id,
+                "command": record.command,
+                "elapsed_ms": elapsed_ms,
+                "status_fetch": {"kind": "bash_status", "value": record.run_id}
+            }))
+        })
     }
 
     pub fn status(&self, run_id: &str) -> AppResult<serde_json::Value> {
@@ -564,27 +704,35 @@ async fn execute_warm(
         item.started_at = Utc::now();
     }
 
-    let mut guard = warm_shell.lock().await;
-    if guard.is_none() {
-        *guard = Some(WarmShell::spawn(&bash_executable).map_err(|error| {
-            AppError::details(
-                "BASH_START_FAILED",
-                error.to_string(),
-                json!({"bash_executable": bash_executable}),
-            )
-        })?);
+    let mut shell = {
+        let mut slot = warm_shell.lock().await;
+        match slot.take() {
+            Some(shell) => shell,
+            None => WarmShell::spawn(&bash_executable).map_err(|error| {
+                AppError::details(
+                    "BASH_START_FAILED",
+                    error.to_string(),
+                    json!({"bash_executable": bash_executable}),
+                )
+            })?,
+        }
+    };
+
+    let mut execution_guard = WarmExecutionGuard::new(record.clone(), shell.pid(), shell.job());
+    {
+        // Expose the shell pid so bash_cancel can terminate a warm run. The
+        // shell dies with the command's process group; needs_respawn handles
+        // the replacement below.
+        let mut item = record.lock();
+        item.pid = shell.pid();
+        item.job = shell.job();
     }
 
     let paths = record.lock().logs.clone();
-    let outcome = match guard
-        .as_mut()
-        .unwrap()
-        .run(&command, &cwd, timeout_ms, &paths)
-        .await
-    {
+    let outcome = match shell.run(&command, &cwd, timeout_ms, &paths).await {
         Ok(outcome) => outcome,
         Err(error) => {
-            *guard = None;
+            execution_guard.disarm();
             return Err(AppError::details(
                 "BASH_RUN_FAILED",
                 error.to_string(),
@@ -592,42 +740,42 @@ async fn execute_warm(
             ));
         }
     };
+    let reuse_shell = !outcome.needs_respawn;
 
-    if outcome.needs_respawn {
-        *guard = None;
-    }
+    let cancelled = record.lock().cancel_requested && outcome.status != "succeeded";
+    let status = if cancelled {
+        "cancelled"
+    } else {
+        outcome.status
+    };
 
     let (mut display_output, mut output_truncated) = render_preview(
         &paths,
         &OutputFilter::Raw,
-        outcome.status,
+        status,
         max_output,
         outcome.limited,
     )
     .await;
 
-    if outcome.status == "timed_out" {
-        append_note(
-            &mut display_output,
-            &format!("Bash run exceeded timeout of {timeout_ms} ms; partial output was retained."),
-        );
+    append_status_notes(&mut display_output, status, timeout_ms);
+    clamp_display(
+        &mut display_output,
+        &mut output_truncated,
+        status,
+        max_output,
+    );
+    finalize_record_output(
+        &record,
+        status,
+        outcome.exit_code,
+        display_output,
+        output_truncated,
+    );
+    execution_guard.disarm();
+    if reuse_shell {
+        *warm_shell.lock().await = Some(shell);
     }
-
-    if display_output.chars().count() > max_output {
-        display_output = if matches!(outcome.status, "failed" | "timed_out" | "cancelled") {
-            tail_chars(&display_output, max_output)
-        } else {
-            head_chars(&display_output, max_output)
-        };
-        output_truncated = true;
-    }
-
-    let mut item = record.lock();
-    item.status = outcome.status.to_owned();
-    item.exit_code = outcome.exit_code;
-    item.ended_at = Some(Utc::now());
-    item.output = display_output;
-    item.output_truncated = output_truncated;
     Ok(())
 }
 
@@ -798,38 +946,17 @@ async fn execute(
     if let Some(warning) = collector_warning {
         append_note(&mut display_output, &warning);
     }
-    if status == "timed_out" {
-        append_note(
-            &mut display_output,
-            &format!("Bash run exceeded timeout of {timeout_ms} ms; partial output was retained."),
-        );
-    } else if status == "cancelled" {
-        append_note(
-            &mut display_output,
-            "Bash run was cancelled; partial output was retained.",
-        );
-    }
+    append_status_notes(&mut display_output, status, timeout_ms);
     if let Some(warning) = setup_warning {
         append_note(&mut display_output, &warning);
     }
-    if display_output.chars().count() > max_output {
-        display_output = if matches!(status, "failed" | "timed_out" | "cancelled") {
-            tail_chars(&display_output, max_output)
-        } else {
-            head_chars(&display_output, max_output)
-        };
-        output_truncated = true;
-    }
-
-    let mut item = record.lock();
-    item.status = status.to_owned();
-    item.exit_code = exit_code;
-    item.ended_at = Some(Utc::now());
-    item.pid = None;
-    item.job = None;
-    item.output = display_output;
-    item.output_truncated = output_truncated;
-    drop(item);
+    clamp_display(
+        &mut display_output,
+        &mut output_truncated,
+        status,
+        max_output,
+    );
+    finalize_record_output(&record, status, exit_code, display_output, output_truncated);
     execution_guard.disarm();
     Ok(())
 }
@@ -839,6 +966,54 @@ fn append_note(output: &mut String, note: &str) {
         output.push_str("\n\n");
     }
     output.push_str(note);
+}
+
+/// Append the standard timeout/cancellation note to a rendered output preview.
+/// Shared by the warm-shell and cold-process finalizers so the wording stays in sync.
+fn append_status_notes(output: &mut String, status: &str, timeout_ms: u64) {
+    match status {
+        "timed_out" => append_note(
+            output,
+            &format!("Bash run exceeded timeout of {timeout_ms} ms; partial output was retained."),
+        ),
+        "cancelled" => append_note(
+            output,
+            "Bash run was cancelled; partial output was retained.",
+        ),
+        _ => {}
+    }
+}
+
+/// Clamp a rendered preview to `max_output` characters, keeping the tail for
+/// failure-like statuses (where the error is at the end) and the head otherwise.
+/// Sets `truncated` when it trims. Shared by both finalizers.
+fn clamp_display(output: &mut String, truncated: &mut bool, status: &str, max_output: usize) {
+    if output.chars().count() > max_output {
+        *output = if matches!(status, "failed" | "timed_out" | "cancelled") {
+            tail_chars(output, max_output)
+        } else {
+            head_chars(output, max_output)
+        };
+        *truncated = true;
+    }
+}
+
+/// Write the terminal outcome of a run onto its record. Shared by both finalizers.
+fn finalize_record_output(
+    record: &Arc<Mutex<RunRecord>>,
+    status: &str,
+    exit_code: Option<i32>,
+    display_output: String,
+    output_truncated: bool,
+) {
+    let mut item = record.lock();
+    item.status = status.to_owned();
+    item.exit_code = exit_code;
+    item.ended_at = Some(Utc::now());
+    item.pid = None;
+    item.job = None;
+    item.output = display_output;
+    item.output_truncated = output_truncated;
 }
 
 fn finalize_run_error(record: &Arc<Mutex<RunRecord>>, error: &AppError) {
@@ -936,6 +1111,7 @@ mod tests {
                 enabled: true,
                 executable: test_bash_executable(),
                 default_timeout_ms: 5_000,
+                foreground_budget_ms: 4_000,
                 max_timeout_ms: 10_000,
                 max_output_chars: 30_000,
                 retention_hours: 1,
@@ -1182,6 +1358,153 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(supervisor.status(run_id).unwrap()["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn client_abort_keeps_run_alive_and_respawns_warm_shell() {
+        // Simulates ChatGPT aborting the HTTP request: the request future is
+        // dropped mid-command. The detached execution task must keep running,
+        // the permit must free once it finishes, and the next warm run must be
+        // clean (not interleaved with the abandoned command's output).
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let mut abort_policy = policy();
+        abort_policy.bash.foreground_budget_ms = 20_000;
+        abort_policy.bash.default_timeout_ms = 10_000;
+        let supervisor =
+            Arc::new(BashSupervisor::new(cache.path().to_path_buf(), abort_policy).unwrap());
+
+        // Start a slow command on a task we then abort, mirroring a dropped
+        // request future.
+        let bg = supervisor.clone();
+        let root_path = root.path().to_path_buf();
+        let request_task = tokio::spawn(async move {
+            bg.start(
+                &root_path,
+                StartRequest {
+                    command: "echo abandoned; sleep 5".to_owned(),
+                    cwd: None,
+                    background: None,
+                    timeout_ms: None,
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        request_task.abort();
+        let _ = request_task.await;
+
+        // The permit is still held by the detached command, so an identical
+        // retry dedupes rather than colliding.
+        let retry = supervisor
+            .start(
+                root.path(),
+                StartRequest {
+                    command: "echo abandoned; sleep 5".to_owned(),
+                    cwd: None,
+                    background: None,
+                    timeout_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry["deduplicated"], true);
+
+        // Wait for the abandoned command to finish and free the permit.
+        for _ in 0..100 {
+            if supervisor.running_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(supervisor.running_count(), 0);
+
+        // The next warm run is clean: only its own output, no leakage.
+        let fresh = supervisor
+            .start(
+                root.path(),
+                StartRequest {
+                    command: "printf fresh-output".to_owned(),
+                    cwd: None,
+                    background: None,
+                    timeout_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(fresh["status"], "succeeded");
+        let output = fresh["output"].as_str().unwrap();
+        assert!(output.contains("fresh-output"));
+        assert!(!output.contains("abandoned"));
+    }
+
+    #[tokio::test]
+    async fn foreground_budget_auto_promotes_long_command() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let mut promote_policy = policy();
+        promote_policy.bash.foreground_budget_ms = 200;
+        promote_policy.bash.default_timeout_ms = 10_000;
+        let supervisor = BashSupervisor::new(cache.path().to_path_buf(), promote_policy).unwrap();
+        let result = supervisor
+            .start(
+                root.path(),
+                StartRequest {
+                    command: "echo warming; sleep 30".to_owned(),
+                    cwd: None,
+                    background: None,
+                    timeout_ms: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["detached"], true);
+        assert_eq!(result["reason"], "foreground_budget_exceeded");
+        let run_id = result["run_id"].as_str().unwrap().to_owned();
+        assert!(supervisor.cancel(&run_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn identical_command_dedupes_to_running_run() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let mut dedupe_policy = policy();
+        dedupe_policy.bash.foreground_budget_ms = 200;
+        dedupe_policy.bash.default_timeout_ms = 10_000;
+        let supervisor = BashSupervisor::new(cache.path().to_path_buf(), dedupe_policy).unwrap();
+        let request = || StartRequest {
+            command: "sleep 30".to_owned(),
+            cwd: None,
+            background: None,
+            timeout_ms: None,
+        };
+        let first = supervisor.start(root.path(), request()).await.unwrap();
+        assert_eq!(first["status"], "running");
+        let run_id = first["run_id"].as_str().unwrap().to_owned();
+
+        let retry = supervisor.start(root.path(), request()).await.unwrap();
+        assert_eq!(retry["deduplicated"], true);
+        assert_eq!(retry["run_id"], run_id);
+
+        // A genuinely different command still gets a busy error carrying the
+        // active run so the model can poll or cancel.
+        let busy = supervisor
+            .start(
+                root.path(),
+                StartRequest {
+                    command: "echo other".to_owned(),
+                    cwd: None,
+                    background: None,
+                    timeout_ms: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(busy.0.code, "RUN_BUSY");
+        let details = busy.0.details.unwrap();
+        assert_eq!(details["active_run"]["run_id"], run_id);
+        assert!(supervisor.cancel(&run_id).is_ok());
     }
 
     #[tokio::test]

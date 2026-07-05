@@ -23,6 +23,14 @@ pub struct MutationRecord {
     pub generation: u64,
 }
 
+impl MutationRecord {
+    /// Fresh mutation id. Centralized so every record (edit, rollback, external)
+    /// shares the `mut_` prefix that downstream consumers match on.
+    pub(super) fn new_id() -> String {
+        format!("mut_{}", uuid::Uuid::new_v4().simple())
+    }
+}
+
 fn archive_paths(path: &Path) -> (PathBuf, PathBuf) {
     (
         path.with_file_name("mutations.previous.jsonl"),

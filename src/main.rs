@@ -91,6 +91,12 @@ fn default_token() -> String {
 fn default_stateful_mode() -> bool {
     false
 }
+/// Single-shot JSON responses are the default, not SSE streaming. Long-running work
+/// usually does not block the response: when the configured foreground budget is
+/// enabled (default about 20s), `bash` auto-promotes past that budget to a background
+/// run the caller polls with `bash_status`. JSON keeps the framing simple and
+/// maximally connector-compatible. Operators who want server-push can still opt in
+/// with `"jsonResponse": false`.
 fn default_json_response() -> bool {
     true
 }
@@ -316,7 +322,8 @@ fn tools() -> Value {
             "overwrite":{"type":"boolean","default":true},
             "expected_hash":{"type":"string"},
             "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"}
+            "rollback_on_failure":{"type":"boolean"},
+            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"}
           },
           "required":["path","content"],
           "additionalProperties":false,
@@ -339,7 +346,8 @@ fn tools() -> Value {
             "expected_hash":{"type":"string"},
             "handle":{"type":"string"},
             "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"}
+            "rollback_on_failure":{"type":"boolean"},
+            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"}
           },
           "required":["path","old_text","new_text"],
           "additionalProperties":false,
@@ -359,7 +367,8 @@ fn tools() -> Value {
             "handle":{"type":"string"},
             "new_text":{"type":"string"},
             "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"}
+            "rollback_on_failure":{"type":"boolean"},
+            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"}
           },
           "required":["path","handle","new_text"],
           "additionalProperties":false,
@@ -381,7 +390,8 @@ fn tools() -> Value {
             "position":{"type":"string","enum":["before","after","inside_start","inside_end"]},
             "expected_hash":{"type":"string"},
             "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"}
+            "rollback_on_failure":{"type":"boolean"},
+            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"}
           },
           "required":["path","content","anchor_symbol","position"],
           "additionalProperties":false,
@@ -400,7 +410,8 @@ fn tools() -> Value {
             "path":{"type":"string"},
             "expected_hash":{"type":"string"},
             "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"}
+            "rollback_on_failure":{"type":"boolean"},
+            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"}
           },
           "required":["path"],
           "additionalProperties":false,
@@ -420,7 +431,8 @@ fn tools() -> Value {
             "to":{"type":"string"},
             "expected_hash":{"type":"string"},
             "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"}
+            "rollback_on_failure":{"type":"boolean"},
+            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"}
           },
           "required":["path","to"],
           "additionalProperties":false,
@@ -455,7 +467,8 @@ fn tools() -> Value {
             "changes":{"type":"array","items":{"type":"object"}},
             "snapshot_id":{"type":"string"},
             "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"}
+            "rollback_on_failure":{"type":"boolean"},
+            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard","description":"compact omits the unified diff and returns diff_stat only; standard caps the diff to bound payload size; debug returns the full diff."}
           },
           "required":["changes"],
           "$schema":"http://json-schema.org/draft-07/schema#"
@@ -617,7 +630,7 @@ fn tools() -> Value {
       {
         "name":"bash",
         "title":"Run Bash Command",
-        "description":"Run a Bash command as the CodeWeave OS user. This is trusted-client functionality, not a sandbox.",
+        "description":"Run a Bash command as the CodeWeave OS user. This is trusted-client functionality, not a sandbox. When the configured foreground budget is enabled (default about 20s), commands that exceed it automatically continue in the background: the call returns status \"running\" with a run_id and detached:true. When that happens, do NOT re-issue the command — poll bash_status(run_id) until the status is terminal. Re-sending an identical command while it is still running returns the same run_id (deduplicated), not a second run. Output is capped at maxOutputChars (default 30000) and each run's default timeout is defaultTimeoutMs (default 120000). Use background:true for known long-running commands.",
         "annotations":destructive_open.clone(),
         "execution":execution.clone(),
         "inputSchema":{
@@ -625,8 +638,8 @@ fn tools() -> Value {
           "properties":{
             "command":{"type":"string","minLength":1,"description":"Command string passed to the configured Bash executable with -c."},
             "cwd":{"type":"string","description":"Existing workspace-relative directory. Defaults to the workspace root."},
-            "background":{"type":"boolean","default":false},
-            "timeout_ms":{"type":"integer","minimum":1}
+            "background":{"type":"boolean","default":false,"description":"Run detached and return immediately with a run_id to poll."},
+            "timeout_ms":{"type":"integer","minimum":1,"description":"Per-run timeout in ms (<= maxTimeoutMs). The command is killed if it exceeds this; the foreground budget only detaches, it does not kill."}
           },
           "required":["command"],
           "$schema":"http://json-schema.org/draft-07/schema#"

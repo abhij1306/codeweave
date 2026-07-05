@@ -43,6 +43,7 @@
       "enabled": true,
       "executable": "bash",
       "defaultTimeoutMs": 120000,
+      "foregroundBudgetMs": 20000,
       "maxTimeoutMs": 300000,
       "maxOutputChars": 30000,
       "retentionHours": 1

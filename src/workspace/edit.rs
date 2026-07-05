@@ -1,4 +1,6 @@
-use super::io_helpers::{atomic_write, read_optional, remove_if_exists, render_diff, restore_one};
+use super::io_helpers::{
+    atomic_write, diff_stat, read_optional, remove_if_exists, render_diff, restore_one,
+};
 use super::journal::{
     open_journal, rotate_journal_now, trim_journal, MutationRecord, MAX_JOURNAL_BYTES,
 };
@@ -43,6 +45,66 @@ enum PreparedEdit {
     Applied(AppliedEdit),
 }
 
+/// The diff-related fields returned by `code_edit`, shaped by `response_detail`.
+/// `stat` is always present (cheap and useful); `diff` may be the full unified diff,
+/// a size-capped prefix, or null when the caller asked for a compact response.
+struct DiffView {
+    diff: Value,
+    stat: Value,
+    truncated: bool,
+    omitted: bool,
+}
+
+impl DiffView {
+    /// Build the view for the successful/applied response paths. `compact` drops the
+    /// unified diff and keeps only the per-file stat; `debug` returns it in full;
+    /// `standard` (the default) caps it at `max_context_chars` to bound payload size.
+    fn build(diff: &str, planned: &[PlannedFile], detail: &str, cap: usize) -> Self {
+        let stat = json!(diff_stat(planned)
+            .into_iter()
+            .map(|(path, added, removed)| json!({
+                "path": path,
+                "added": added,
+                "removed": removed,
+            }))
+            .collect::<Vec<_>>());
+        match detail {
+            "compact" => Self {
+                diff: Value::Null,
+                stat,
+                truncated: false,
+                omitted: true,
+            },
+            "debug" => Self {
+                diff: json!(diff),
+                stat,
+                truncated: false,
+                omitted: false,
+            },
+            _ if cap > 0 && diff.len() > cap => {
+                // Cut on a line boundary so the prefix stays a readable diff.
+                let safe_cap = char_boundary_at_or_before(diff, cap);
+                let end = diff[..safe_cap]
+                    .rfind('\n')
+                    .map(|idx| idx + 1)
+                    .unwrap_or(safe_cap);
+                Self {
+                    diff: json!(&diff[..end]),
+                    stat,
+                    truncated: true,
+                    omitted: false,
+                }
+            }
+            _ => Self {
+                diff: json!(diff),
+                stat,
+                truncated: false,
+                omitted: false,
+            },
+        }
+    }
+}
+
 impl WorkspaceActor {
     pub async fn code_edit(self: &Arc<Self>, session_id: &str, params: &Value) -> AppResult<Value> {
         let validate = string_list(params, "validate");
@@ -77,9 +139,49 @@ impl WorkspaceActor {
             commit_ms,
         } = applied;
 
+        // Shape the diff payload by response_detail before `planned` is moved into any
+        // rollback closure below. `standard` (default) caps the unified diff so a large
+        // edit cannot balloon the response; the per-file stat is always returned.
+        let detail = params
+            .get("response_detail")
+            .and_then(Value::as_str)
+            .unwrap_or("standard");
+        let diff_view = DiffView::build(&diff, &planned, detail, self.policy.max_context_chars);
+        let DiffView {
+            diff: diff_value,
+            stat: diff_stat_value,
+            truncated: diff_truncated,
+            omitted: diff_omitted,
+        } = diff_view;
+
+        // Validation must not push the edit call past the client's tool
+        // budget. Each command already auto-promotes to the background if it
+        // exceeds policy.bash.foregroundBudgetMs; we additionally bound the
+        // *cumulative* validation wall time. When the budget is spent (or a
+        // command auto-promotes), the remaining validation runs detached and
+        // the edit returns validation_pending for the caller to poll.
+        let budget_ms = self.policy.bash.foreground_budget_ms;
+        let validation_started = Instant::now();
         let mut validation = Vec::new();
         let mut validation_failed = false;
-        for command in validate {
+        let mut validation_pending: Option<String> = None;
+        let mut remaining = validate.iter().peekable();
+        while let Some(command) = remaining.next() {
+            let over_budget =
+                budget_ms != 0 && validation_started.elapsed().as_millis() as u64 >= budget_ms;
+            if over_budget {
+                // Fold this command and any that follow into one detached run.
+                let mut deferred = vec![command.clone()];
+                deferred.extend(remaining.map(String::clone));
+                match self
+                    .spawn_pending_validation(&deferred, &mut validation)
+                    .await
+                {
+                    Some(run_id) => validation_pending = Some(run_id),
+                    None => validation_failed = true,
+                }
+                break;
+            }
             match self
                 .bash
                 .start(
@@ -94,10 +196,40 @@ impl WorkspaceActor {
                 .await
             {
                 Ok(result) => {
-                    if result.get("status").and_then(Value::as_str) != Some("succeeded") {
-                        validation_failed = true;
+                    match result.get("status").and_then(Value::as_str) {
+                        Some("succeeded") => {
+                            validation.push(json!({"command": command, "result": result}));
+                        }
+                        Some("running") => {
+                            // Auto-promoted mid-validation: it is still running,
+                            // so its pass/fail is unknown. Defer to polling.
+                            validation_pending = result
+                                .get("run_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            validation.push(json!({"command": command, "result": result}));
+                            if let Some(run_id) = &validation_pending {
+                                for deferred in remaining {
+                                    validation.push(json!({
+                                        "command": deferred,
+                                        "deferred": true,
+                                        "result": {
+                                            "status": "pending",
+                                            "reason": "blocked_by_pending_validation",
+                                            "run_id": run_id
+                                        }
+                                    }));
+                                }
+                            } else {
+                                validation_failed = true;
+                            }
+                            break;
+                        }
+                        _ => {
+                            validation_failed = true;
+                            validation.push(json!({"command": command, "result": result}));
+                        }
                     }
-                    validation.push(json!({"command": command, "result": result}));
                 }
                 Err(error) => {
                     validation_failed = true;
@@ -111,6 +243,33 @@ impl WorkspaceActor {
                 break;
             }
         }
+
+        // A pending (detached) validation cannot drive a synchronous rollback;
+        // the edit stays applied and the caller decides after polling.
+        if let Some(run_id) = validation_pending {
+            self.reconcile_pending_async().await?;
+            return Ok(json!({
+                "applied": true,
+                "rolled_back": false,
+                "validation_pending": true,
+                "validation_run_id": run_id,
+                "guidance": "Validation exceeded the foreground budget and is running detached; poll bash_status with validation_run_id.",
+                "snapshot_rebased_from": snapshot_rebased_from,
+                "diff": diff_value,
+                "diff_stat": diff_stat_value,
+                "diff_truncated": diff_truncated,
+                "diff_omitted": diff_omitted,
+                "validation": validation,
+                "generation": self.generation(),
+                "snapshot_id": self.snapshot(),
+                "mutations": apply_result,
+                "phase_ms": {
+                    "prepare_and_commit": prepare_ms,
+                    "commit": commit_ms
+                }
+            }));
+        }
+
         let rollback_on_failure = bool_value(params, "rollback_on_failure", true);
         if validation_failed && rollback_on_failure {
             let write_guard = self.write_lock.clone().lock_owned().await;
@@ -132,7 +291,10 @@ impl WorkspaceActor {
                     "reason": "validation_failed_rollback_conflict",
                     "rollback_error": error.0,
                     "snapshot_rebased_from": snapshot_rebased_from,
-                    "diff": diff,
+                    "diff": diff_value,
+                    "diff_stat": diff_stat_value,
+                    "diff_truncated": diff_truncated,
+                    "diff_omitted": diff_omitted,
                     "validation": validation,
                     "generation": self.generation(),
                     "snapshot_id": self.snapshot(),
@@ -148,7 +310,10 @@ impl WorkspaceActor {
                 "rolled_back": true,
                 "reason": "validation_failed",
                 "snapshot_rebased_from": snapshot_rebased_from,
-                "diff": diff,
+                "diff": diff_value,
+                "diff_stat": diff_stat_value,
+                "diff_truncated": diff_truncated,
+                "diff_omitted": diff_omitted,
                 "validation": validation,
                 "generation": self.generation(),
                 "snapshot_id": self.snapshot(),
@@ -165,7 +330,10 @@ impl WorkspaceActor {
             "applied": true,
             "rolled_back": false,
             "snapshot_rebased_from": snapshot_rebased_from,
-            "diff": diff,
+            "diff": diff_value,
+            "diff_stat": diff_stat_value,
+            "diff_truncated": diff_truncated,
+            "diff_omitted": diff_omitted,
             "validation": validation,
             "generation": self.generation(),
             "snapshot_id": self.snapshot(),
@@ -175,6 +343,47 @@ impl WorkspaceActor {
                 "commit": commit_ms
             }
         }))
+    }
+
+    /// Launch the remaining validation commands as a single detached bash run
+    /// once the foreground budget is spent. Returns the run_id to poll, or
+    /// records an error entry and returns None if the launch itself failed.
+    async fn spawn_pending_validation(
+        &self,
+        commands: &[String],
+        validation: &mut Vec<Value>,
+    ) -> Option<String> {
+        let joined = commands
+            .iter()
+            .map(|command| format!("({command})"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        match self
+            .bash
+            .start(
+                &self.root,
+                StartRequest {
+                    command: joined.clone(),
+                    cwd: None,
+                    background: Some(true),
+                    timeout_ms: None,
+                },
+            )
+            .await
+        {
+            Ok(result) => {
+                let run_id = result
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                validation.push(json!({"command": joined, "deferred": true, "result": result}));
+                run_id
+            }
+            Err(error) => {
+                validation.push(json!({"command": joined, "error": error.0}));
+                None
+            }
+        }
     }
 
     fn prepare_edit(
@@ -587,7 +796,7 @@ impl WorkspaceActor {
         let records: Vec<MutationRecord> = plan
             .iter()
             .map(|item| MutationRecord {
-                mutation_id: format!("mut_{}", Uuid::new_v4().simple()),
+                mutation_id: MutationRecord::new_id(),
                 session_id: session_id.to_owned(),
                 path: item.path.clone(),
                 before_hash: item.before.as_ref().map(|value| content_hash(value)),
@@ -867,7 +1076,7 @@ impl WorkspaceActor {
         let records: Vec<_> = plan
             .iter()
             .map(|item| MutationRecord {
-                mutation_id: format!("mut_{}", Uuid::new_v4().simple()),
+                mutation_id: MutationRecord::new_id(),
                 session_id: session_id.to_owned(),
                 path: item.path.clone(),
                 before_hash: item.after.as_ref().map(|value| content_hash(value)),
@@ -912,6 +1121,14 @@ fn put_plan(
     }
 }
 
+fn char_boundary_at_or_before(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 fn matching_old_text(content: &str, selected: &str, old: &str, expected: usize) -> (String, usize) {
     let normalized = normalize_line_endings_for_content(content, old);
     if normalized != old {
@@ -922,4 +1139,19 @@ fn matching_old_text(content: &str, selected: &str, old: &str, expected: usize) 
     }
     let count = selected.match_indices(old).count();
     (old.to_owned(), count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_view_truncates_on_utf8_boundary() {
+        let diff = format!("{}é\nnext\n", "a".repeat(10));
+
+        let view = DiffView::build(&diff, &[], "standard", 11);
+
+        assert!(view.truncated);
+        assert_eq!(view.diff.as_str().unwrap(), "aaaaaaaaaa");
+    }
 }

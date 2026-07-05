@@ -181,9 +181,18 @@ impl WarmShell {
         }
 
         let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("warm shell stdin pipe is unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("warm shell stdout pipe is unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("warm shell stderr pipe is unavailable"))?;
         let pid = child.id();
 
         #[cfg(windows)]
@@ -205,6 +214,21 @@ impl WarmShell {
             #[cfg(windows)]
             job,
         })
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    pub fn job(&self) -> Option<Arc<WindowsJob>> {
+        #[cfg(windows)]
+        {
+            self.job.clone()
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
     }
 
     pub async fn run(
@@ -256,7 +280,7 @@ impl WarmShell {
                     line = stdout_rx.recv(), if !stdout_done && !stdout_closed => {
                         match line {
                             Some(ShellLine::Data(bytes)) => {
-                                if let Some(code) = parse_marker(&bytes, &marker) {
+                                if let MarkerLine::Sentinel(code) = parse_marker(&bytes, &marker) {
                                     exit_code = code;
                                     stdout_done = true;
                                     continue;
@@ -272,7 +296,7 @@ impl WarmShell {
                     line = stderr_rx.recv(), if !stderr_done && !stderr_closed => {
                         match line {
                             Some(ShellLine::Data(bytes)) => {
-                                if parse_marker(&bytes, &marker).is_some() {
+                                if parse_marker(&bytes, &marker).is_sentinel() {
                                     stderr_done = true;
                                     continue;
                                 }
@@ -371,18 +395,39 @@ impl Drop for WarmShell {
     }
 }
 
-fn parse_marker(bytes: &[u8], marker: &str) -> Option<Option<i32>> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let trimmed = text.trim();
-    if let Some(rest) = trimmed.strip_prefix(marker) {
-        let code_str = rest.trim();
-        if code_str.is_empty() {
-            return Some(None);
-        }
-        let code = code_str.parse::<i32>().ok()?;
-        return Some(Some(code));
+/// Classification of a shell line against the per-command sentinel marker.
+enum MarkerLine {
+    /// Ordinary command output, not the sentinel.
+    Output,
+    /// The end-of-command sentinel, carrying the exit code when the shell emitted one.
+    Sentinel(Option<i32>),
+}
+
+impl MarkerLine {
+    fn is_sentinel(&self) -> bool {
+        matches!(self, MarkerLine::Sentinel(_))
     }
-    None
+}
+
+fn parse_marker(bytes: &[u8], marker: &str) -> MarkerLine {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return MarkerLine::Output;
+    };
+    match text.trim().strip_prefix(marker) {
+        Some(rest) => {
+            let code = rest.trim();
+            if code.is_empty() {
+                MarkerLine::Sentinel(None)
+            } else if let Ok(parsed) = code.parse::<i32>() {
+                MarkerLine::Sentinel(Some(parsed))
+            } else {
+                // A line that starts with the marker but carries a non-integer
+                // suffix is not our sentinel; keep it as ordinary output.
+                MarkerLine::Output
+            }
+        }
+        None => MarkerLine::Output,
+    }
 }
 
 fn to_shell_path(path: &Path) -> String {

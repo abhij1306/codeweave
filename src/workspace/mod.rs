@@ -28,7 +28,13 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, Instant};
-use uuid::Uuid;
+
+/// Minimum spacing between workspace reconciles triggered by non-terminal run polls.
+const POLL_RECONCILE_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Maximum bytes of an instruction file (AGENTS.md/CLAUDE.md) inlined into a summary
+/// response before it is truncated and the caller is pointed at code_fetch.
+const INSTRUCTION_INLINE_CAP: usize = 4_096;
 
 pub struct WorkspaceActor {
     // Lock ordering for code that needs more than one guard:
@@ -52,6 +58,7 @@ pub struct WorkspaceActor {
     pending_paths: Arc<Mutex<HashSet<PathBuf>>>,
     needs_reconcile: Arc<AtomicBool>,
     reconcile_lock: Mutex<()>,
+    last_reconcile: Mutex<Instant>,
     internal_writes: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     mutations: Mutex<VecDeque<MutationRecord>>,
     journal_file: Mutex<Option<fs::File>>,
@@ -242,6 +249,7 @@ impl WorkspaceActor {
             pending_paths,
             needs_reconcile,
             reconcile_lock: Mutex::new(()),
+            last_reconcile: Mutex::new(Instant::now()),
             internal_writes,
             mutations: Mutex::new(mutations),
             journal_file: Mutex::new(Some(journal_file)),
@@ -361,7 +369,7 @@ impl WorkspaceActor {
                 known.insert(path.clone());
                 let after_hash = self.index.read().get(&path).map(|file| file.hash.clone());
                 records.push(MutationRecord {
-                    mutation_id: format!("mut_{}", Uuid::new_v4().simple()),
+                    mutation_id: MutationRecord::new_id(),
                     session_id: "external".to_owned(),
                     path,
                     before_hash: None,
@@ -385,9 +393,30 @@ impl WorkspaceActor {
             return Ok(Vec::new());
         }
         let actor = Arc::clone(self);
-        tokio::task::spawn_blocking(move || actor.reconcile_pending())
+        let changed = tokio::task::spawn_blocking(move || actor.reconcile_pending())
             .await
-            .map_err(AppError::internal)?
+            .map_err(AppError::internal)?;
+        *self.last_reconcile.lock() = Instant::now();
+        changed
+    }
+
+    /// Reconcile debounce for high-frequency run polls. `bash_status`/`bash_output`/
+    /// `bash_cancel` fire repeatedly while a command streams output and each one would
+    /// otherwise trigger a full `refresh_paths` + `git status` subprocess whenever the
+    /// running command touches the tree. Skip the refresh unless the run reached a
+    /// terminal state or it has been at least `POLL_RECONCILE_DEBOUNCE` since the last
+    /// reconcile, so the workspace view still converges without paying per-poll latency.
+    async fn reconcile_after_poll(self: &Arc<Self>, terminal: bool) -> AppResult<Vec<String>> {
+        if !self.needs_reconcile.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+        if !terminal {
+            let since = self.last_reconcile.lock().elapsed();
+            if since < POLL_RECONCILE_DEBOUNCE {
+                return Ok(Vec::new());
+            }
+        }
+        self.reconcile_pending_async().await
     }
 
     fn recompute_snapshot(&self) {
@@ -512,12 +541,32 @@ impl WorkspaceActor {
             "dirty_files_truncated": repository_dirty.truncated,
             "dirty_file_groups": repository_dirty.groups
         });
+        // Instruction files are inlined into every summary/open. Cap the inlined body
+        // so a large AGENTS.md/CLAUDE.md cannot dominate the response; the caller can
+        // read the rest with code_fetch(path) when truncated.
         let instructions = ["AGENTS.md", "CLAUDE.md"]
             .into_iter()
             .filter_map(|path| {
-                index
-                    .get(path)
-                    .map(|file| json!({"path": path, "content": file.content}))
+                index.get(path).map(|file| {
+                    let full_len = file.content.len();
+                    if full_len > INSTRUCTION_INLINE_CAP {
+                        let safe_cap =
+                            char_boundary_at_or_before(&file.content, INSTRUCTION_INLINE_CAP);
+                        let end = file.content[..safe_cap]
+                            .rfind('\n')
+                            .map(|idx| idx + 1)
+                            .unwrap_or(safe_cap);
+                        json!({
+                            "path": path,
+                            "content": &file.content[..end],
+                            "content_truncated": true,
+                            "content_bytes": full_len,
+                            "guidance": "Instruction file truncated; read the full file with code_fetch(path)."
+                        })
+                    } else {
+                        json!({"path": path, "content": file.content})
+                    }
+                })
             })
             .collect::<Vec<_>>();
         let bash_available = self.policy.bash.enabled;
@@ -1021,13 +1070,20 @@ impl WorkspaceActor {
 
     pub async fn run(self: &Arc<Self>, _session_id: &str, params: &Value) -> AppResult<Value> {
         let started = Instant::now();
-        let reconcile_started = Instant::now();
-        self.reconcile_pending_async().await?;
-        let reconcile_before_ms = reconcile_started.elapsed().as_millis();
         let action = params
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or("start");
+        // Run polls (status/output/cancel) never mutate the tree themselves, so a
+        // pre-action reconcile only adds latency to a hot loop. Reconcile before
+        // `start` (which may depend on a fresh view) and defer poll reconciles to the
+        // debounced pass after the action completes.
+        let is_poll = matches!(action, "status" | "output" | "cancel");
+        let reconcile_started = Instant::now();
+        if !is_poll {
+            self.reconcile_pending_async().await?;
+        }
+        let reconcile_before_ms = reconcile_started.elapsed().as_millis();
         let mut run_startup_ms = None;
         let mut result = match action {
             "start" => {
@@ -1110,7 +1166,16 @@ impl WorkspaceActor {
             }
         };
         let reconcile_after_started = Instant::now();
-        self.reconcile_pending_async().await?;
+        if is_poll {
+            let terminal = result
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|status| !matches!(status, "queued" | "running"))
+                .unwrap_or(true);
+            self.reconcile_after_poll(terminal).await?;
+        } else {
+            self.reconcile_pending_async().await?;
+        }
         let reconcile_after_ms = reconcile_after_started.elapsed().as_millis();
         if let Some(run_id) = result.get("run_id").and_then(Value::as_str) {
             let current_dirty: HashSet<String> = self
@@ -1210,6 +1275,14 @@ pub(super) fn add_phase_metrics(value: &mut Value, phases: &[(&str, u128)]) {
             ),
         );
     }
+}
+
+fn char_boundary_at_or_before(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 #[cfg(test)]

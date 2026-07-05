@@ -352,6 +352,14 @@ fn is_accept_resource_exhaustion(error: &std::io::Error) -> bool {
 /// for the *next* request on a kept-alive connection, so an idle socket is
 /// closed after the timeout. It resets per request and does not interrupt an
 /// in-flight request/response (e.g. a long foreground `bash` POST).
+///
+/// HTTP version: we keep the auto (h1/h2) builder but only tune HTTP/1.1. Every
+/// real client here — the OpenAI connector, ngrok, curl — speaks HTTP/1.1 to the
+/// origin (TLS/ALPN is terminated at the tunnel, so h2c prior-knowledge does not
+/// reach us). `header_read_timeout` is an HTTP/1 setting; HTTP/2 has its own
+/// keep-alive knobs and would bypass the idle bound. Rather than add a parallel
+/// h2 idle configuration for traffic that never arrives, the idle guarantee is
+/// intentionally scoped to HTTP/1.1.
 async fn serve_with_idle_timeout(
     listener: tokio::net::TcpListener,
     app: Router,

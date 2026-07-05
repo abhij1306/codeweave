@@ -29,6 +29,13 @@ pub struct BashConfig {
     pub executable: String,
     #[serde(default = "default_bash_timeout_ms")]
     pub default_timeout_ms: u64,
+    /// Soft cap on how long a foreground `bash` call may block the MCP
+    /// request. Commands exceeding it keep running detached and the call
+    /// returns a `running` status to poll. Hosted clients (ChatGPT) abort
+    /// tool calls at ~60s, so this must stay well below that. 0 disables
+    /// auto-promotion.
+    #[serde(default = "default_bash_foreground_budget_ms")]
+    pub foreground_budget_ms: u64,
     #[serde(default = "default_bash_max_timeout_ms")]
     pub max_timeout_ms: u64,
     #[serde(default = "default_bash_max_output_chars")]
@@ -72,6 +79,10 @@ fn default_bash_executable() -> String {
 
 fn default_bash_timeout_ms() -> u64 {
     120_000
+}
+
+fn default_bash_foreground_budget_ms() -> u64 {
+    20_000
 }
 
 fn default_bash_max_timeout_ms() -> u64 {
@@ -154,26 +165,6 @@ pub struct DaemonConfig {
     pub cache_root: String,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub struct RpcRequest {
-    pub id: u64,
-    pub method: String,
-    #[serde(default)]
-    pub params: Value,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Serialize)]
-pub struct RpcResponse {
-    pub id: u64,
-    pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<ErrorBody>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorBody {
     pub code: String,
@@ -228,26 +219,6 @@ impl std::fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
-#[allow(dead_code)]
-impl RpcResponse {
-    pub fn success(id: u64, result: Value) -> Self {
-        Self {
-            id,
-            ok: true,
-            result: Some(result),
-            error: None,
-        }
-    }
-    pub fn failure(id: u64, error: AppError) -> Self {
-        Self {
-            id,
-            ok: false,
-            result: None,
-            error: Some(error.0),
-        }
-    }
-}
-
 pub fn required_str<'a>(value: &'a Value, key: &str) -> AppResult<&'a str> {
     value
         .get(key)
@@ -300,6 +271,7 @@ mod tests {
         assert!(policy.bash.enabled);
         assert_eq!(policy.bash.executable, "bash");
         assert_eq!(policy.bash.default_timeout_ms, 120_000);
+        assert_eq!(policy.bash.foreground_budget_ms, 20_000);
         assert_eq!(policy.bash.max_timeout_ms, 300_000);
         assert_eq!(policy.bash.max_output_chars, 30_000);
         assert_eq!(policy.bash.retention_hours, 1);

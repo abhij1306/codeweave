@@ -217,6 +217,26 @@ pub struct CodeIndex {
     snapshot_dirty: bool,
     cached_snapshot_head: Option<String>,
     cached_snapshot: Option<String>,
+    /// Order-independent running digest of the file set. Each file contributes
+    /// `sha256(path ‖ 0 ‖ hash ‖ 0)` XORed into this accumulator, so inserts and
+    /// removals update it in O(1) instead of re-hashing the whole index on every
+    /// mutation. Combined with `head` and the file count at read time.
+    snapshot_acc: [u8; 32],
+}
+
+fn file_snapshot_digest(path: &str, hash: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(path.as_bytes());
+    digest.update([0]);
+    digest.update(hash.as_bytes());
+    digest.update([0]);
+    digest.finalize().into()
+}
+
+fn xor_accumulator(acc: &mut [u8; 32], contribution: &[u8; 32]) {
+    for (slot, byte) in acc.iter_mut().zip(contribution.iter()) {
+        *slot ^= *byte;
+    }
 }
 
 impl CodeIndex {
@@ -342,9 +362,17 @@ impl CodeIndex {
     fn insert_entry(&mut self, mut entry: FileEntry) {
         normalize_entry(&mut entry);
         if let Some(previous) = self.files.remove(&entry.path) {
+            xor_accumulator(
+                &mut self.snapshot_acc,
+                &file_snapshot_digest(&previous.path, &previous.hash),
+            );
             self.remove_from_token_index(&previous);
             self.remove_from_symbol_index(&previous);
         }
+        xor_accumulator(
+            &mut self.snapshot_acc,
+            &file_snapshot_digest(&entry.path, &entry.hash),
+        );
         self.add_to_token_index(&entry);
         self.add_to_symbol_index(&entry);
         self.files.insert(entry.path.clone(), entry);
@@ -353,6 +381,10 @@ impl CodeIndex {
 
     fn remove_entry(&mut self, path: &str) -> Option<FileEntry> {
         let removed = self.files.remove(path)?;
+        xor_accumulator(
+            &mut self.snapshot_acc,
+            &file_snapshot_digest(&removed.path, &removed.hash),
+        );
         self.remove_from_token_index(&removed);
         self.remove_from_symbol_index(&removed);
         self.snapshot_dirty = true;
@@ -535,15 +567,7 @@ impl CodeIndex {
         digest.update(head.as_bytes());
         digest.update([0]);
         digest.update((self.files.len() as u64).to_le_bytes());
-        let mut paths: Vec<_> = self.files.keys().collect();
-        paths.sort();
-        for path in paths {
-            let file = &self.files[path];
-            digest.update(path.as_bytes());
-            digest.update([0]);
-            digest.update(file.hash.as_bytes());
-            digest.update([0]);
-        }
+        digest.update(self.snapshot_acc);
         let result = format!("snap_{}", hex(&digest.finalize()));
         self.cached_snapshot_head = Some(head.to_owned());
         self.cached_snapshot = Some(result.clone());

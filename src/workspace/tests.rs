@@ -24,6 +24,7 @@ fn test_policy() -> PolicyConfig {
             enabled: true,
             executable: test_bash_executable(),
             default_timeout_ms: 120_000,
+            foreground_budget_ms: 20_000,
             max_timeout_ms: 300_000,
             max_output_chars: 30_000,
             retention_hours: 1,
@@ -35,7 +36,15 @@ fn test_actor(root: &Path) -> Arc<WorkspaceActor> {
     test_actor_with_exclusions(root, Vec::new())
 }
 
-fn test_actor_with_exclusions(root: &Path, exclude_paths: Vec<String>) -> Arc<WorkspaceActor> {
+fn test_actor_with_policy(root: &Path, policy: PolicyConfig) -> Arc<WorkspaceActor> {
+    test_actor_with_policy_and_exclusions(root, policy, Vec::new())
+}
+
+fn test_actor_with_policy_and_exclusions(
+    root: &Path,
+    policy: PolicyConfig,
+    exclude_paths: Vec<String>,
+) -> Arc<WorkspaceActor> {
     let cache = tempdir().unwrap().keep();
     Arc::new(
         WorkspaceActor::open(
@@ -46,11 +55,21 @@ fn test_actor_with_exclusions(root: &Path, exclude_paths: Vec<String>) -> Arc<Wo
                 artifact_paths: Vec::new(),
                 exclude_paths,
             },
-            test_policy(),
+            policy,
             cache,
         )
         .unwrap(),
     )
+}
+
+fn test_actor_with_budget(root: &Path, foreground_budget_ms: u64) -> Arc<WorkspaceActor> {
+    let mut policy = test_policy();
+    policy.bash.foreground_budget_ms = foreground_budget_ms;
+    test_actor_with_policy(root, policy)
+}
+
+fn test_actor_with_exclusions(root: &Path, exclude_paths: Vec<String>) -> Arc<WorkspaceActor> {
+    test_actor_with_policy_and_exclusions(root, test_policy(), exclude_paths)
 }
 
 #[test]
@@ -867,6 +886,111 @@ async fn stale_snapshot_rebases_when_file_hash_is_current() {
     assert!(result["snapshot_rebased_from"].is_string());
 }
 
+#[test]
+fn summary_caps_large_instruction_files() {
+    let root = tempdir().unwrap();
+    let big = format!("{}étail", "a".repeat(4_095));
+    assert!(big.len() > 4_096);
+    fs::write(root.path().join("AGENTS.md"), &big).unwrap();
+    fs::write(root.path().join("CLAUDE.md"), "short and sweet\n").unwrap();
+    let actor = test_actor(root.path());
+    let summary = actor.summary("test-session", false).unwrap();
+    let instructions = summary["instructions"].as_array().unwrap();
+
+    let agents = instructions
+        .iter()
+        .find(|entry| entry["path"] == "AGENTS.md")
+        .unwrap();
+    assert_eq!(agents["content_truncated"], true);
+    assert_eq!(agents["content_bytes"], big.len());
+    assert!(agents["content"].as_str().unwrap().len() <= 4_096);
+    assert_eq!(agents["content"].as_str().unwrap().len(), 4_095);
+
+    let claude = instructions
+        .iter()
+        .find(|entry| entry["path"] == "CLAUDE.md")
+        .unwrap();
+    assert!(claude.get("content_truncated").is_none());
+    assert_eq!(claude["content"], "short and sweet\n");
+}
+
+#[tokio::test]
+async fn response_detail_shapes_edit_diff_payload() {
+    let root = tempdir().unwrap();
+    let original = "fn value() -> i32 { 1 }\n";
+    fs::write(root.path().join("value.rs"), original).unwrap();
+    let actor = test_actor(root.path());
+    let change = json!([{
+        "kind": "replace",
+        "path": "value.rs",
+        "old_text": "{ 1 }",
+        "new_text": "{ 2 }",
+        "expected_hash": content_hash(original)
+    }]);
+
+    // compact: no unified diff, but the per-file stat is still present.
+    let compact = actor
+        .code_edit(
+            "test-session",
+            &json!({"changes": change, "response_detail": "compact"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(compact["applied"], true);
+    assert!(compact["diff"].is_null());
+    assert_eq!(compact["diff_omitted"], true);
+    assert_eq!(compact["diff_stat"][0]["path"], "value.rs");
+    assert_eq!(compact["diff_stat"][0]["added"], 1);
+    assert_eq!(compact["diff_stat"][0]["removed"], 1);
+
+    // debug: full unified diff is returned verbatim.
+    fs::write(root.path().join("value.rs"), original).unwrap();
+    actor.refresh(true, "test-session", false).unwrap();
+    let debug = actor
+        .code_edit(
+            "test-session",
+            &json!({"changes": change, "response_detail": "debug"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(debug["diff_omitted"], false);
+    assert_eq!(debug["diff_truncated"], false);
+    assert!(debug["diff"].as_str().unwrap().contains("{ 2 }"));
+}
+
+#[tokio::test]
+async fn standard_response_detail_caps_oversized_edit_diff() {
+    let root = tempdir().unwrap();
+    // A file large enough that its unified diff exceeds max_context_chars.
+    let original: String = (0..4_000).map(|i| format!("line {i}\n")).collect();
+    fs::write(root.path().join("big.txt"), &original).unwrap();
+    let mut policy = test_policy();
+    policy.max_context_chars = 2_000;
+    let actor = test_actor_with_policy(root.path(), policy);
+    let replaced: String = (0..4_000).map(|i| format!("edited {i}\n")).collect();
+    let result = actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [{
+                    "kind": "create",
+                    "path": "big.txt",
+                    "content": replaced,
+                    "overwrite": true,
+                    "expected_hash": content_hash(&original)
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["applied"], true);
+    assert_eq!(result["diff_truncated"], true);
+    assert_eq!(result["diff_omitted"], false);
+    let diff = result["diff"].as_str().unwrap();
+    assert!(diff.len() <= 2_000);
+    assert!(diff.ends_with('\n'));
+}
+
 #[tokio::test]
 async fn failed_bash_validation_rolls_back_mutation() {
     let root = tempdir().unwrap();
@@ -907,6 +1031,46 @@ async fn failed_bash_validation_rolls_back_mutation() {
         fs::read_to_string(root.path().join("value.rs")).unwrap(),
         original
     );
+}
+
+#[tokio::test]
+async fn slow_bash_validation_detaches_and_reports_pending() {
+    let root = tempdir().unwrap();
+    let original = "fn value() -> i32 { 1 }\n";
+    fs::write(root.path().join("value.rs"), original).unwrap();
+    let actor = test_actor_with_budget(root.path(), 200);
+    let result = actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [{
+                    "kind": "replace",
+                    "path": "value.rs",
+                    "old_text": "{ 1 }",
+                    "new_text": "{ 2 }",
+                    "expected_hash": content_hash(original)
+                }],
+                "validate": ["echo checking; sleep 30", "echo later"]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["applied"], true);
+    assert_eq!(result["validation_pending"], true);
+    assert!(result["validation_run_id"].is_string());
+    assert_eq!(result["validation"].as_array().unwrap().len(), 2);
+    assert_eq!(result["validation"][1]["command"], "echo later");
+    assert_eq!(
+        result["validation"][1]["result"]["reason"],
+        "blocked_by_pending_validation"
+    );
+    // Edit stays applied; validation could not drive a synchronous rollback.
+    assert_eq!(
+        fs::read_to_string(root.path().join("value.rs")).unwrap(),
+        "fn value() -> i32 { 2 }\n"
+    );
+    let run_id = result["validation_run_id"].as_str().unwrap();
+    let _ = actor.bash.cancel(run_id);
 }
 
 #[test]
