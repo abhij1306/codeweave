@@ -454,6 +454,9 @@ impl WorkspaceActor {
             "reconcile_pending": self.read_reconcile_pending(),
             "pending_path_count": self.pending_paths.lock().len(),
             "running_bash_count": self.bash.running_count(),
+            "execution": {
+                "bash": self.bash.readiness()
+            },
             "policy": {
                 "max_file_bytes": self.policy.max_file_bytes,
                 "max_context_chars": self.policy.max_context_chars,
@@ -464,6 +467,8 @@ impl WorkspaceActor {
     }
 
     pub fn code_capabilities(&self) -> AppResult<Value> {
+        let bash = self.bash.readiness();
+        let bash_available = bash.is_ready();
         Ok(json!({
             "workspace_id": self.id,
             "root": self.root,
@@ -485,8 +490,11 @@ impl WorkspaceActor {
                 "supports_transaction": true,
                 "supports_single_file_wrappers": true,
                 "supports_handle_range_replace": true,
-                "supports_bash_validation_commands": self.policy.bash.enabled,
+                "supports_bash_validation_commands": bash_available,
                 "supports_rollback_on_failure": true
+            },
+            "execution": {
+                "bash": bash
             },
             "limits": {
                 "max_file_bytes": self.policy.max_file_bytes,
@@ -510,6 +518,12 @@ impl WorkspaceActor {
         let reconcile_ms = reconcile_started.elapsed().as_millis();
         let index = self.index.read();
         let repo = self.repo_status.read().clone();
+        let dirty_set: HashSet<String> = repo
+            .dirty_files
+            .iter()
+            .filter(|path| !self.exclusions.is_ignored(Path::new(path), false))
+            .cloned()
+            .collect();
         let mcp_paths: HashSet<String> = self
             .mutations
             .lock()
@@ -518,20 +532,21 @@ impl WorkspaceActor {
                 item.session_id == session_id
                     && item.source == "mcp_edit"
                     && item.timestamp >= self.opened_at
+                    && dirty_set.contains(&item.path)
             })
             .map(|item| item.path.clone())
             .collect();
-        let external = self.external_changed.lock().clone();
+        let external: HashSet<String> = self
+            .external_changed
+            .lock()
+            .iter()
+            .filter(|path| dirty_set.contains(*path))
+            .cloned()
+            .collect();
         let preexisting = &self.opened_dirty_summary;
         let mcp_changed = summarize_changed_paths(mcp_paths);
         let external = summarize_changed_paths(external);
-        let repository_dirty = summarize_changed_paths(
-            repo.dirty_files
-                .iter()
-                .filter(|path| !self.exclusions.is_ignored(Path::new(path), false))
-                .cloned()
-                .collect(),
-        );
+        let repository_dirty = summarize_changed_paths(dirty_set);
         let repository = json!({
             "is_git": repo.is_git,
             "head": repo.head,
@@ -569,14 +584,24 @@ impl WorkspaceActor {
                 })
             })
             .collect::<Vec<_>>();
-        let bash_available = self.policy.bash.enabled;
+        let bash = self.bash.readiness();
+        let bash_available = bash.is_ready();
         let validation_guidance = if bash_available {
             "Write-tool validate fields accept Bash command strings. Use bash(command='<command>') for standalone execution."
+        } else if self.policy.bash.enabled {
+            "Bash execution is enabled but no usable Bash implementation passed readiness checks. Fix policy.bash.executable or install Git Bash/MSYS2/Cygwin Bash; WSL is used only when explicitly configured and ready."
         } else {
             "Bash execution is disabled. Set policy.bash.enabled to true and restart CodeWeave to use bash and write-tool validation commands."
         };
         let warnings = if bash_available {
             Vec::<String>::new()
+        } else if self.policy.bash.enabled {
+            vec![format!(
+                "Bash execution and write-tool validation commands are unavailable: {}",
+                bash.failure_reason
+                    .as_deref()
+                    .unwrap_or("No usable Bash implementation found")
+            )]
         } else {
             vec!["Bash execution and write-tool validation commands are unavailable until policy.bash.enabled is true and CodeWeave is restarted.".to_owned()]
         };
@@ -589,6 +614,7 @@ impl WorkspaceActor {
             "file_count": index.file_count(), "languages": index.languages(), "repository": repository, "instructions": instructions,
             "capabilities": {
                 "bash_available": bash_available,
+                "bash": bash,
                 "validation_guidance": validation_guidance
             },
             "warnings": warnings,
@@ -651,6 +677,10 @@ impl WorkspaceActor {
     }
 
     pub fn code_context(&self, params: &Value) -> AppResult<Value> {
+        self.code_context_for_session("default", params)
+    }
+
+    pub fn code_context_for_session(&self, session_id: &str, params: &Value) -> AppResult<Value> {
         let started = Instant::now();
         let reconcile_pending = self.read_reconcile_pending();
         let query = params.get("query").and_then(Value::as_str).unwrap_or("");
@@ -723,7 +753,7 @@ impl WorkspaceActor {
             {
                 object.insert(
                     "recent_bash_failures".to_owned(),
-                    json!(self.bash.recent_failures(query, 3)),
+                    json!(self.bash.recent_failures_for_session(session_id, query, 3)),
                 );
             }
             object.insert("reconcile_pending".to_owned(), json!(reconcile_pending));
@@ -1068,7 +1098,7 @@ impl WorkspaceActor {
         Ok(response)
     }
 
-    pub async fn run(self: &Arc<Self>, _session_id: &str, params: &Value) -> AppResult<Value> {
+    pub async fn run(self: &Arc<Self>, session_id: &str, params: &Value) -> AppResult<Value> {
         let started = Instant::now();
         let action = params
             .get("action")
@@ -1099,8 +1129,9 @@ impl WorkspaceActor {
                 let run_started = Instant::now();
                 let value = self
                     .bash
-                    .start(
+                    .start_for_session(
                         &self.root,
+                        session_id,
                         StartRequest {
                             command,
                             cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
@@ -1126,13 +1157,17 @@ impl WorkspaceActor {
             }
             "status" => {
                 let actor = Arc::clone(self);
+                let session_id = session_id.to_owned();
                 let run_id = required_str(params, "run_id")?.to_owned();
-                tokio::task::spawn_blocking(move || actor.bash.status(&run_id))
-                    .await
-                    .map_err(AppError::internal)??
+                tokio::task::spawn_blocking(move || {
+                    actor.bash.status_for_session(&session_id, &run_id)
+                })
+                .await
+                .map_err(AppError::internal)??
             }
             "output" => {
                 let actor = Arc::clone(self);
+                let session_id = session_id.to_owned();
                 let run_id = required_str(params, "run_id")?.to_owned();
                 let continuation = params
                     .get("continuation")
@@ -1143,19 +1178,25 @@ impl WorkspaceActor {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 tokio::task::spawn_blocking(move || {
-                    actor
-                        .bash
-                        .output_stream(&run_id, continuation.as_deref(), stream.as_deref())
+                    actor.bash.output_stream_for_session(
+                        &session_id,
+                        &run_id,
+                        continuation.as_deref(),
+                        stream.as_deref(),
+                    )
                 })
                 .await
                 .map_err(AppError::internal)??
             }
             "cancel" => {
                 let actor = Arc::clone(self);
+                let session_id = session_id.to_owned();
                 let run_id = required_str(params, "run_id")?.to_owned();
-                tokio::task::spawn_blocking(move || actor.bash.cancel(&run_id))
-                    .await
-                    .map_err(AppError::internal)??
+                tokio::task::spawn_blocking(move || {
+                    actor.bash.cancel_for_session(&session_id, &run_id)
+                })
+                .await
+                .map_err(AppError::internal)??
             }
             other => {
                 return Err(AppError::details(

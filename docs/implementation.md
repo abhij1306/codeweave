@@ -30,7 +30,7 @@ Do not expose an unauthenticated CodeWeave endpoint to a public network.
 
 CodeWeave keeps one active repository per MCP session. Opening a different approved path first builds or reuses the cached repository actor and only swaps that session after opening succeeds, so a failed switch leaves the session's current repository usable. Persistent indexes and cached actors remain separated by canonical path under `.codeweave-cache`.
 
-Repository switching is explicit through `workspace(action="open", path="...")`. A switch is rejected while Bash runs are active in that session's repository because run status and cancellation belong to the cached repository actor. Stateful Streamable HTTP is recommended for independent chats; stateless HTTP shares one fallback workspace key.
+Repository switching is explicit through `workspace(action="open", path="...")`. A switch is rejected while Bash runs are active in that session's repository because run status and cancellation belong to the cached repository actor. For fast single-repository HTTP, use stateless JSON with `workspace.defaultPath` and `workspace.lockToDefault`; repository switching is then disabled and the fallback stateless key cannot escape the pinned repo. Use stateful Streamable HTTP only when independent chats need separate active repositories in one server process, accepting RMCP's long-lived SSE connection behavior.
 
 ## Editing model
 

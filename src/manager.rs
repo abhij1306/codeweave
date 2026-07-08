@@ -177,7 +177,8 @@ impl WorkspaceManager {
             "code_context" => {
                 let actor = self.active_actor(session)?;
                 let params = params.clone();
-                run_blocking(move || actor.code_context(&params)).await
+                let session_id = session.as_str().to_owned();
+                run_blocking(move || actor.code_context_for_session(&session_id, &params)).await
             }
             "code_search" => {
                 let actor = self.active_actor(session)?;
@@ -187,7 +188,8 @@ impl WorkspaceManager {
             "code_fetch" => {
                 let actor = self.active_actor(session)?;
                 let params = params.clone();
-                run_blocking(move || actor.code_fetch(&params)).await
+                let session_id = session.as_str().to_owned();
+                run_blocking(move || actor.code_fetch_for_session(&session_id, &params)).await
             }
             "code_capabilities" => {
                 let actor = self.active_actor(session)?;
@@ -358,6 +360,7 @@ impl WorkspaceManager {
     }
 
     fn workspace(&self, session: &SessionKey, params: &Value) -> AppResult<Value> {
+        let stateless_unpinned = self.stateless_unpinned(session);
         match params
             .get("action")
             .and_then(Value::as_str)
@@ -373,7 +376,7 @@ impl WorkspaceManager {
                 {
                     actor.summary_ids()
                 } else {
-                    actor.summary(session.as_str(), session.is_stateless())
+                    actor.summary(session.as_str(), stateless_unpinned)
                 }
             }
             "refresh" => self.active_actor(session)?.refresh(
@@ -382,7 +385,7 @@ impl WorkspaceManager {
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 session.as_str(),
-                session.is_stateless(),
+                stateless_unpinned,
             ),
             "changes" => self
                 .active_actor(session)?
@@ -410,7 +413,7 @@ impl WorkspaceManager {
             let mut summary = if ids_only {
                 actor.summary_ids()?
             } else {
-                actor.summary(session.as_str(), session.is_stateless())?
+                actor.summary(session.as_str(), session.is_stateless() && !pinned)?
             };
             if pinned {
                 if let Some(object) = summary.as_object_mut() {
@@ -567,6 +570,16 @@ impl WorkspaceManager {
                 "suggested_action": "workspace(action='open', path='C:/absolute/path/to/project')"
             }),
         ))
+    }
+
+    fn stateless_unpinned(&self, session: &SessionKey) -> bool {
+        if !session.is_stateless() {
+            return false;
+        }
+        let Ok(config) = self.config() else {
+            return true;
+        };
+        !(config.workspace.lock_to_default && config.workspace.default_path.is_some())
     }
 
     fn touch_actor(&self, key: &str) {
@@ -1406,6 +1419,30 @@ mod tests {
             )));
     }
 
+    #[test]
+    fn pinned_stateless_session_does_not_report_workspace_isolation_warning() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "fn pinned() {}\n").unwrap();
+        let manager = WorkspaceManager::default();
+        let mut config = daemon_config(root.path(), cache.path(), 1_000_000);
+        config["workspace"]["defaultPath"] = json!(root.path());
+        config["workspace"]["lockToDefault"] = json!(true);
+        manager.initialize(&config).unwrap();
+
+        let summary = manager
+            .workspace(&SessionKey::stateless(), &json!({"action": "open"}))
+            .unwrap();
+
+        assert!(!summary["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().is_some_and(
+                |text| text.contains("Stateless HTTP requests share one legacy workspace key")
+            )));
+    }
+
     #[tokio::test]
     async fn running_bash_blocks_only_owning_session_switch_and_global_reinitialize() {
         let root = tempdir().unwrap();
@@ -1486,6 +1523,68 @@ mod tests {
         assert_eq!(reinitialize_error.0.code, "WORKSPACE_BUSY");
 
         let run_id = started["run_id"].as_str().unwrap();
+        let _ = manager
+            .dispatch(session_a, "bash_cancel", &json!({"run_id": run_id}))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn bash_run_registry_is_scoped_by_session() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let manager = Arc::new(WorkspaceManager::default());
+        let config = daemon_config(root.path(), cache.path(), 1_000_000);
+        manager
+            .dispatch(SessionKey::stdio(), "initialize", &config)
+            .await
+            .unwrap();
+        let session_a = SessionKey::new("http:a");
+        let session_b = SessionKey::new("http:b");
+        for session in [&session_a, &session_b] {
+            manager
+                .dispatch(
+                    session.clone(),
+                    "workspace",
+                    &json!({"action": "open", "path": root.path()}),
+                )
+                .await
+                .unwrap();
+        }
+
+        let started = manager
+            .dispatch(
+                session_a.clone(),
+                "bash",
+                &json!({"command": sleep_command(), "background": true}),
+            )
+            .await
+            .unwrap();
+        let run_id = started["run_id"].as_str().unwrap();
+
+        let retry_from_other_session = manager
+            .dispatch(
+                session_b.clone(),
+                "bash",
+                &json!({"command": sleep_command(), "background": true}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(retry_from_other_session.0.code, "RUN_BUSY");
+        assert!(retry_from_other_session
+            .0
+            .details
+            .as_ref()
+            .unwrap()
+            .get("active_run")
+            .is_none_or(Value::is_null));
+
+        let cross_session_cancel = manager
+            .dispatch(session_b, "bash_cancel", &json!({"run_id": run_id}))
+            .await
+            .unwrap_err();
+        assert_eq!(cross_session_cancel.0.code, "RUN_NOT_FOUND");
+
         let _ = manager
             .dispatch(session_a, "bash_cancel", &json!({"run_id": run_id}))
             .await;

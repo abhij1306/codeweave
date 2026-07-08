@@ -39,6 +39,10 @@ struct FetchPrecondition<'a> {
 
 impl WorkspaceActor {
     pub fn code_fetch(&self, params: &Value) -> AppResult<Value> {
+        self.code_fetch_for_session("default", params)
+    }
+
+    pub fn code_fetch_for_session(&self, session_id: &str, params: &Value) -> AppResult<Value> {
         let started = std::time::Instant::now();
         let reconcile_pending = self.read_reconcile_pending();
         if let Some(expected) = params.get("snapshot_id").and_then(Value::as_str) {
@@ -74,7 +78,7 @@ impl WorkspaceActor {
             if remaining == 0 {
                 break;
             }
-            match self.fetch_item(item, remaining) {
+            match self.fetch_item(session_id, item, remaining) {
                 Ok(result) => {
                     remaining = remaining.saturating_sub(result_text_len(&result));
                     results.push(result);
@@ -137,7 +141,7 @@ impl WorkspaceActor {
         Ok(result)
     }
 
-    fn fetch_item(&self, item: &Value, remaining: usize) -> AppResult<Value> {
+    fn fetch_item(&self, session_id: &str, item: &Value, remaining: usize) -> AppResult<Value> {
         let kind = required_str(item, "kind")?;
         let value = required_str(item, "value")?;
         match kind {
@@ -186,11 +190,12 @@ impl WorkspaceActor {
             "metadata" => self.fetch_metadata(value),
             "bash_status" => {
                 let run_id = value.strip_prefix("bash:").unwrap_or(value);
-                self.bash.status_with_limit(run_id, remaining)
+                self.bash
+                    .status_with_limit_for_session(session_id, run_id, remaining)
             }
             "bash_log" => {
                 let run_id = value.strip_prefix("bash-log:").unwrap_or(value);
-                let content = self.bash.read_log(run_id)?;
+                let content = self.bash.read_log_for_session(session_id, run_id)?;
                 Ok(bounded_content(
                     json!({"kind": "bash_log", "run_id": run_id}),
                     &content,

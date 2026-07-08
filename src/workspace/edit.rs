@@ -108,11 +108,8 @@ impl DiffView {
 impl WorkspaceActor {
     pub async fn code_edit(self: &Arc<Self>, session_id: &str, params: &Value) -> AppResult<Value> {
         let validate = string_list(params, "validate");
-        if !validate.is_empty() && !self.policy.bash.enabled {
-            return Err(AppError::new(
-                "BASH_DISABLED",
-                "Bash execution is disabled; enable policy.bash before using validation commands",
-            ));
+        if !validate.is_empty() {
+            self.bash.ensure_available()?;
         }
         let write_guard = self.write_lock.clone().lock_owned().await;
         let actor = Arc::clone(self);
@@ -174,7 +171,7 @@ impl WorkspaceActor {
                 let mut deferred = vec![command.clone()];
                 deferred.extend(remaining.map(String::clone));
                 match self
-                    .spawn_pending_validation(&deferred, &mut validation)
+                    .spawn_pending_validation(session_id, &deferred, &mut validation)
                     .await
                 {
                     Some(run_id) => validation_pending = Some(run_id),
@@ -184,8 +181,9 @@ impl WorkspaceActor {
             }
             match self
                 .bash
-                .start(
+                .start_for_session(
                     &self.root,
+                    session_id,
                     StartRequest {
                         command: command.clone(),
                         cwd: None,
@@ -350,6 +348,7 @@ impl WorkspaceActor {
     /// records an error entry and returns None if the launch itself failed.
     async fn spawn_pending_validation(
         &self,
+        session_id: &str,
         commands: &[String],
         validation: &mut Vec<Value>,
     ) -> Option<String> {
@@ -360,8 +359,9 @@ impl WorkspaceActor {
             .join(" && ");
         match self
             .bash
-            .start(
+            .start_for_session(
                 &self.root,
+                session_id,
                 StartRequest {
                     command: joined.clone(),
                     cwd: None,
@@ -878,6 +878,7 @@ impl WorkspaceActor {
                 error.to_string(),
             )
         })?;
+        *self.repo_status.write() = self.repository.status(&self.root).unwrap_or_default();
         self.generation.store(generation, Ordering::Release);
         self.recompute_snapshot();
         self.publish_mutations(&records);
@@ -1088,6 +1089,7 @@ impl WorkspaceActor {
             })
             .collect();
         self.persist_mutations(&records)?;
+        *self.repo_status.write() = self.repository.status(&self.root).unwrap_or_default();
         self.generation.store(generation, Ordering::Release);
         self.recompute_snapshot();
         self.publish_mutations(&records);

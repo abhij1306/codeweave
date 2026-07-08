@@ -164,6 +164,28 @@ fn is_loopback(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "localhost")
 }
 
+fn validate_http_workspace_mode(server: &ServerConfig, config: &Value) -> Result<()> {
+    if server.stateful_mode {
+        return Ok(());
+    }
+    let workspace = config.get("workspace").and_then(Value::as_object);
+    let default_path = workspace
+        .and_then(|workspace| workspace.get("defaultPath"))
+        .and_then(Value::as_str)
+        .is_some_and(|path| !path.trim().is_empty());
+    let locked = workspace
+        .and_then(|workspace| workspace.get("lockToDefault"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if default_path && locked {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "stateless HTTP requires workspace.defaultPath plus workspace.lockToDefault=true; \
+         enable server.statefulMode for multi-repository or independently switching sessions"
+    )
+}
+
 fn authorized(headers: &HeaderMap, state: &AppState) -> bool {
     let Some(expected) = &state.token else {
         return true;
@@ -1041,6 +1063,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let (server, config) = load_config(&cli.config)?;
     validate_auth_mode(&server.auth_mode)?;
+    if matches!(cli.transport, Transport::Http) {
+        validate_http_workspace_mode(&server, &config)?;
+    }
     let token = if matches!(cli.transport, Transport::Http) && server.auth_mode == "bearer" {
         let token_path = config_relative_path(&cli.config, &server.token_file);
         let token_value = load_or_create_bearer_token(&token_path)?;
@@ -1108,6 +1133,37 @@ mod tests {
         }
         assert!(!payload.to_string().contains("private"));
         assert!(!payload.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn stateless_http_requires_a_pinned_default_workspace() {
+        let server: ServerConfig = serde_json::from_value(json!({
+            "statefulMode": false,
+            "jsonResponse": true
+        }))
+        .unwrap();
+        let pinned = json!({
+            "workspace": {
+                "defaultPath": "C:\\Projects\\crawlerai",
+                "lockToDefault": true
+            }
+        });
+        assert!(validate_http_workspace_mode(&server, &pinned).is_ok());
+
+        let dynamic = json!({
+            "workspace": {
+                "allowedRoots": ["C:\\Projects"]
+            }
+        });
+        let error = validate_http_workspace_mode(&server, &dynamic).unwrap_err();
+        assert!(error.to_string().contains("stateless HTTP requires"));
+
+        let stateful: ServerConfig = serde_json::from_value(json!({
+            "statefulMode": true,
+            "jsonResponse": false
+        }))
+        .unwrap();
+        assert!(validate_http_workspace_mode(&stateful, &dynamic).is_ok());
     }
 
     #[test]

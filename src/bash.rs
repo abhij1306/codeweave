@@ -10,10 +10,11 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -39,6 +40,7 @@ pub struct BashRunView {
 #[derive(Debug)]
 pub(crate) struct RunRecord {
     run_id: String,
+    session_id: String,
     status: String,
     command: String,
     cwd: PathBuf,
@@ -51,6 +53,43 @@ pub(crate) struct RunRecord {
     pid: Option<u32>,
     cancel_requested: bool,
     job: Option<Arc<WindowsJob>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct BashReadiness {
+    pub configured: bool,
+    pub configured_executable: String,
+    pub resolved_executable: Option<String>,
+    pub shell_type: String,
+    pub readiness: String,
+    pub failure_reason: Option<String>,
+}
+
+impl BashReadiness {
+    pub fn is_ready(&self) -> bool {
+        self.readiness == "ready" && self.resolved_executable.is_some()
+    }
+
+    fn executable(&self) -> Option<String> {
+        self.resolved_executable.clone()
+    }
+}
+
+fn bash_readiness(
+    configured: &str,
+    readiness: &str,
+    executable: Option<&Path>,
+    failure_reason: Option<String>,
+) -> BashReadiness {
+    BashReadiness {
+        configured: readiness != "disabled",
+        configured_executable: configured.to_owned(),
+        resolved_executable: executable.map(|path| path.to_string_lossy().into_owned()),
+        shell_type: "bash".to_owned(),
+        readiness: readiness.to_owned(),
+        failure_reason,
+    }
 }
 
 struct ExecutionGuard {
@@ -176,10 +215,13 @@ pub struct BashSupervisor {
     cache_root: PathBuf,
     policy: PolicyConfig,
     retention_hours: i64,
+    readiness: BashReadiness,
 }
 
 const MAX_RETAINED_RUNS: usize = 256;
 const OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 10;
+const READINESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const READINESS_PROBE_OUTPUT_CAP: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct StartRequest {
@@ -187,6 +229,192 @@ pub struct StartRequest {
     pub cwd: Option<String>,
     pub background: Option<bool>,
     pub timeout_ms: Option<u64>,
+}
+
+fn resolve_bash(policy: &PolicyConfig) -> BashReadiness {
+    let configured = policy.bash.executable.trim();
+    if !policy.bash.enabled {
+        return bash_readiness(
+            configured,
+            "disabled",
+            None,
+            Some("Bash execution is disabled by policy".to_owned()),
+        );
+    }
+    if configured.is_empty() {
+        return bash_readiness(
+            configured,
+            "unavailable",
+            None,
+            Some("policy.bash.executable must not be empty".to_owned()),
+        );
+    }
+
+    let mut failures = Vec::new();
+    let configured_path = PathBuf::from(configured);
+    if configured_path.is_absolute() {
+        return match probe_bash(&configured_path) {
+            Ok(()) => bash_readiness(configured, "ready", Some(&configured_path), None),
+            Err(error) => bash_readiness(
+                configured,
+                "unavailable",
+                None,
+                Some(format!("Configured Bash executable is not usable: {error}")),
+            ),
+        };
+    }
+
+    match probe_bash(&configured_path) {
+        Ok(()) => {
+            return bash_readiness(configured, "ready", Some(&configured_path), None);
+        }
+        Err(error) => failures.push(format!("{configured}: {error}")),
+    }
+
+    if is_default_bash_name(configured) {
+        for candidate in discover_bash_candidates(configured) {
+            if probe_bash(&candidate).is_ok() {
+                return bash_readiness(configured, "ready", Some(&candidate), None);
+            }
+        }
+    }
+
+    let reason = if failures.is_empty() {
+        "No usable Bash implementation found".to_owned()
+    } else {
+        format!(
+            "No usable Bash implementation found; readiness probe failures: {}",
+            failures.join("; ")
+        )
+    };
+    bash_readiness(configured, "unavailable", None, Some(reason))
+}
+
+fn is_default_bash_name(configured: &str) -> bool {
+    matches!(
+        configured.trim().to_ascii_lowercase().as_str(),
+        "bash" | "bash.exe"
+    )
+}
+
+fn probe_bash(executable: &Path) -> Result<(), String> {
+    let mut child = StdCommand::new(executable)
+        .args(["-c", "printf codeweave-bash-ready"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut reader) = child.stdout.take() {
+                    let _ = reader
+                        .by_ref()
+                        .take(READINESS_PROBE_OUTPUT_CAP as u64)
+                        .read_to_end(&mut stdout);
+                }
+                if let Some(mut reader) = child.stderr.take() {
+                    let _ = reader
+                        .by_ref()
+                        .take(READINESS_PROBE_OUTPUT_CAP as u64)
+                        .read_to_end(&mut stderr);
+                }
+                let stdout = String::from_utf8_lossy(&stdout);
+                let stderr = String::from_utf8_lossy(&stderr);
+                if status.success() && stdout.contains("codeweave-bash-ready") {
+                    return Ok(());
+                }
+                let detail = stderr.trim();
+                return Err(if detail.is_empty() {
+                    format!("readiness probe exited with status {status}")
+                } else {
+                    format!("readiness probe exited with status {status}: {detail}")
+                });
+            }
+            Ok(None) if started.elapsed() < READINESS_PROBE_TIMEOUT => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "readiness probe timed out after {} ms",
+                    READINESS_PROBE_TIMEOUT.as_millis()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.to_string());
+            }
+        }
+    }
+}
+
+fn discover_bash_candidates(_configured: &str) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        discover_windows_bash_candidates()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(windows)]
+fn discover_windows_bash_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !path.as_os_str().is_empty() && !candidates.iter().any(|existing| existing == &path) {
+            candidates.push(path);
+        }
+    };
+
+    if let Ok(output) = StdCommand::new("where.exe").arg("bash.exe").output() {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let path = PathBuf::from(line.trim());
+            if path.is_file() {
+                push(path);
+            }
+        }
+    }
+
+    for root in [
+        std::env::var_os("ProgramW6432").map(PathBuf::from),
+        std::env::var_os("ProgramFiles").map(PathBuf::from),
+        std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
+        std::env::var_os("LocalAppData").map(|value| PathBuf::from(value).join("Programs")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        push(root.join("Git").join("bin").join("bash.exe"));
+        push(root.join("Git").join("usr").join("bin").join("bash.exe"));
+    }
+
+    if let Ok(output) = StdCommand::new("where.exe").arg("git.exe").output() {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let git = PathBuf::from(line.trim());
+            let Some(parent) = git.parent() else {
+                continue;
+            };
+            push(parent.join("..").join("bin").join("bash.exe"));
+            push(parent.join("..").join("usr").join("bin").join("bash.exe"));
+        }
+    }
+
+    candidates
+        .into_iter()
+        .filter_map(|path| {
+            let path = fs::canonicalize(&path).unwrap_or(path);
+            path.is_file().then_some(path)
+        })
+        .collect()
 }
 
 impl BashSupervisor {
@@ -236,6 +464,7 @@ impl BashSupervisor {
             ));
         }
         cleanup_orphan_logs(&log_root, retention_hours);
+        let readiness = resolve_bash(&policy);
         Ok(Self {
             runs: Arc::new(Mutex::new(HashMap::new())),
             run_permit: Arc::new(Semaphore::new(1)),
@@ -243,7 +472,33 @@ impl BashSupervisor {
             cache_root,
             policy,
             retention_hours,
+            readiness,
         })
+    }
+
+    pub fn readiness(&self) -> BashReadiness {
+        self.readiness.clone()
+    }
+
+    pub fn ensure_available(&self) -> AppResult<()> {
+        if !self.policy.bash.enabled {
+            return Err(AppError::details(
+                "BASH_DISABLED",
+                "Bash execution is disabled by policy",
+                json!({"configuration_hint": "Set policy.bash.enabled to true and restart CodeWeave."}),
+            ));
+        }
+        if self.readiness.is_ready() {
+            return Ok(());
+        }
+        Err(AppError::details(
+            "BASH_UNAVAILABLE",
+            self.readiness
+                .failure_reason
+                .clone()
+                .unwrap_or_else(|| "No usable Bash implementation found".to_owned()),
+            json!({"execution": self.readiness()}),
+        ))
     }
 
     pub fn running_count(&self) -> usize {
@@ -258,14 +513,13 @@ impl BashSupervisor {
         self.runs.lock().keys().cloned().collect()
     }
 
-    pub async fn start(&self, root: &Path, request: StartRequest) -> AppResult<serde_json::Value> {
-        if !self.policy.bash.enabled {
-            return Err(AppError::details(
-                "BASH_DISABLED",
-                "Bash execution is disabled by policy",
-                json!({"configuration_hint": "Set policy.bash.enabled to true and restart CodeWeave."}),
-            ));
-        }
+    pub async fn start_for_session(
+        &self,
+        root: &Path,
+        session_id: &str,
+        request: StartRequest,
+    ) -> AppResult<serde_json::Value> {
+        self.ensure_available()?;
         let command = request.command.trim().to_owned();
         if command.is_empty() {
             return Err(AppError::invalid("Bash command cannot be empty"));
@@ -300,8 +554,8 @@ impl BashSupervisor {
                 // identical command against the same cwd (ChatGPT retries a
                 // timed-out call verbatim), hand back the in-flight run so the
                 // model polls it instead of flailing on RUN_BUSY.
-                if let Some(active) = self.active_run_matching(&command, &cwd) {
-                    let mut view = self.status(&active)?;
+                if let Some(active) = self.active_run_matching(session_id, &command, &cwd) {
+                    let mut view = self.status_for_session(session_id, &active)?;
                     view["deduplicated"] = Value::Bool(true);
                     view["guidance"] = Value::String(
                         "An identical command is already running; poll bash_status with this run_id."
@@ -309,7 +563,7 @@ impl BashSupervisor {
                     );
                     return Ok(view);
                 }
-                let active = self.active_run_view();
+                let active = self.active_run_view_for_session(session_id);
                 return Err(AppError::details(
                     "RUN_BUSY",
                     "Another command is already running",
@@ -327,6 +581,7 @@ impl BashSupervisor {
         let logs = RunLogPaths::new(&log_root, &run_id);
         let record = Arc::new(Mutex::new(RunRecord {
             run_id: run_id.clone(),
+            session_id: session_id.to_owned(),
             status: "queued".to_owned(),
             command: command.clone(),
             cwd: cwd.clone(),
@@ -342,7 +597,10 @@ impl BashSupervisor {
         }));
         self.runs.lock().insert(run_id.clone(), record.clone());
         self.trim_runs();
-        let bash_executable = self.policy.bash.executable.clone();
+        let bash_executable = self
+            .readiness
+            .executable()
+            .expect("ensure_available guarantees a resolved executable");
         let max_output = self.policy.bash.max_output_chars;
 
         // Execution always runs on a detached task, even for foreground calls.
@@ -440,20 +698,23 @@ impl BashSupervisor {
     /// Dedupe key for retried commands: an *active* run with the same command
     /// text and working directory. Single-slot semantics make an identical
     /// concurrent command an almost-certain client retry.
-    fn active_run_matching(&self, command: &str, cwd: &Path) -> Option<String> {
+    fn active_run_matching(&self, session_id: &str, command: &str, cwd: &Path) -> Option<String> {
         self.runs.lock().values().find_map(|record| {
             let record = record.lock();
-            (record.ended_at.is_none() && record.command == command && record.cwd == cwd)
+            (record.ended_at.is_none()
+                && record.session_id == session_id
+                && record.command == command
+                && record.cwd == cwd)
                 .then(|| record.run_id.clone())
         })
     }
 
     /// Summary of the currently active run, attached to RUN_BUSY so the model
     /// can poll or cancel instead of retrying blindly.
-    fn active_run_view(&self) -> Option<serde_json::Value> {
+    fn active_run_view_for_session(&self, session_id: &str) -> Option<serde_json::Value> {
         self.runs.lock().values().find_map(|record| {
             let record = record.lock();
-            if record.ended_at.is_some() {
+            if record.ended_at.is_some() || record.session_id != session_id {
                 return None;
             }
             let elapsed_ms = (Utc::now() - record.started_at).num_milliseconds().max(0);
@@ -470,9 +731,35 @@ impl BashSupervisor {
         self.status_with_limit(run_id, self.policy.bash.max_output_chars)
     }
 
+    pub fn status_for_session(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> AppResult<serde_json::Value> {
+        self.status_with_limit_for_session(session_id, run_id, self.policy.bash.max_output_chars)
+    }
+
     pub fn status_with_limit(
         &self,
         run_id: &str,
+        max_output: usize,
+    ) -> AppResult<serde_json::Value> {
+        self.status_record(run_id, None, max_output)
+    }
+
+    pub fn status_with_limit_for_session(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        max_output: usize,
+    ) -> AppResult<serde_json::Value> {
+        self.status_record(run_id, Some(session_id), max_output)
+    }
+
+    fn status_record(
+        &self,
+        run_id: &str,
+        session_id: Option<&str>,
         max_output: usize,
     ) -> AppResult<serde_json::Value> {
         let record = self.runs.lock().get(run_id).cloned().ok_or_else(|| {
@@ -483,12 +770,30 @@ impl BashSupervisor {
             )
         })?;
         let record = record.lock();
+        if session_id.is_some_and(|session_id| session_id != record.session_id) {
+            return Err(AppError::details(
+                "RUN_NOT_FOUND",
+                "Bash run not found in this session",
+                json!({"run_id": run_id}),
+            ));
+        }
         Ok(serde_json::to_value(view(&record, max_output))?)
     }
 
-    pub fn output_stream(
+    pub fn output_stream_for_session(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        continuation: Option<&str>,
+        requested_stream: Option<&str>,
+    ) -> AppResult<serde_json::Value> {
+        self.output_stream_for_owner(run_id, Some(session_id), continuation, requested_stream)
+    }
+
+    fn output_stream_for_owner(
         &self,
         run_id: &str,
+        session_id: Option<&str>,
         continuation: Option<&str>,
         requested_stream: Option<&str>,
     ) -> AppResult<serde_json::Value> {
@@ -502,6 +807,13 @@ impl BashSupervisor {
             )
         })?;
         let record = record.lock();
+        if session_id.is_some_and(|session_id| session_id != record.session_id) {
+            return Err(AppError::details(
+                "RUN_NOT_FOUND",
+                "Bash run not found in this session",
+                json!({"run_id": run_id}),
+            ));
+        }
         let full = fs::read(record.logs.path(stream))
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_else(|_| {
@@ -531,7 +843,19 @@ impl BashSupervisor {
         }))
     }
 
-    pub fn cancel(&self, run_id: &str) -> AppResult<serde_json::Value> {
+    pub fn cancel_for_session(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> AppResult<serde_json::Value> {
+        self.cancel_for_owner(run_id, Some(session_id))
+    }
+
+    fn cancel_for_owner(
+        &self,
+        run_id: &str,
+        session_id: Option<&str>,
+    ) -> AppResult<serde_json::Value> {
         let record = self.runs.lock().get(run_id).cloned().ok_or_else(|| {
             AppError::details(
                 "RUN_NOT_FOUND",
@@ -541,6 +865,13 @@ impl BashSupervisor {
         })?;
         let (pid, job) = {
             let mut item = record.lock();
+            if session_id.is_some_and(|session_id| session_id != item.session_id) {
+                return Err(AppError::details(
+                    "RUN_NOT_FOUND",
+                    "Bash run not found in this session",
+                    json!({"run_id": run_id}),
+                ));
+            }
             if item.ended_at.is_some() {
                 return Ok(serde_json::to_value(view(
                     &item,
@@ -557,7 +888,11 @@ impl BashSupervisor {
         Ok(json!({"run_id": run_id, "status": "cancelling"}))
     }
 
-    pub fn read_log(&self, run_id: &str) -> AppResult<String> {
+    pub fn read_log_for_session(&self, session_id: &str, run_id: &str) -> AppResult<String> {
+        self.read_log_for_owner(run_id, Some(session_id))
+    }
+
+    fn read_log_for_owner(&self, run_id: &str, session_id: Option<&str>) -> AppResult<String> {
         let record = self
             .runs
             .lock()
@@ -565,6 +900,12 @@ impl BashSupervisor {
             .cloned()
             .ok_or_else(|| AppError::new("RUN_NOT_FOUND", "Bash run not found"))?;
         let record = record.lock();
+        if session_id.is_some_and(|session_id| session_id != record.session_id) {
+            return Err(AppError::new(
+                "RUN_NOT_FOUND",
+                "Bash run not found in this session",
+            ));
+        }
         Ok(fs::read(&record.logs.combined)
             .map(|bytes| strip_ansi(&String::from_utf8_lossy(&bytes)))
             .unwrap_or_else(|_| record.output.clone()))
@@ -614,7 +955,21 @@ impl BashSupervisor {
         }
     }
 
-    pub fn recent_failures(&self, query: &str, limit: usize) -> Vec<serde_json::Value> {
+    pub fn recent_failures_for_session(
+        &self,
+        session_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        self.recent_failures_filtered(Some(session_id), query, limit)
+    }
+
+    fn recent_failures_filtered(
+        &self,
+        session_id: Option<&str>,
+        query: &str,
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
         let terms: Vec<String> = query
             .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
             .filter(|term| term.len() > 2)
@@ -637,6 +992,9 @@ impl BashSupervisor {
         let mut superseded_commands = HashSet::new();
         for (_, record) in keyed {
             let record = record.lock();
+            if session_id.is_some_and(|session_id| session_id != record.session_id) {
+                continue;
+            }
             let command_key = format!("{}\0{}", record.cwd.to_string_lossy(), record.command);
             if record.status == "succeeded" {
                 superseded_commands.insert(command_key);
@@ -1119,9 +1477,26 @@ mod tests {
         }
     }
 
+    fn policy_with_executable(executable: String) -> PolicyConfig {
+        let mut policy = policy();
+        policy.bash.executable = executable;
+        policy
+    }
+
     fn record(cache: &Path, run_id: &str, status: &str, output: &str) -> RunRecord {
+        record_for_session(cache, run_id, "test-session", status, output)
+    }
+
+    fn record_for_session(
+        cache: &Path,
+        run_id: &str,
+        session_id: &str,
+        status: &str,
+        output: &str,
+    ) -> RunRecord {
         RunRecord {
             run_id: run_id.to_owned(),
+            session_id: session_id.to_owned(),
             status: status.to_owned(),
             command: "printf test".to_owned(),
             cwd: cache.to_path_buf(),
@@ -1138,14 +1513,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_invalid_bash_path_reports_unavailable_before_starting() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let missing = cache.path().join("not-a-bash.exe");
+        let supervisor = BashSupervisor::new(
+            cache.path().to_path_buf(),
+            policy_with_executable(missing.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+        let readiness = supervisor.readiness();
+        assert_eq!(readiness.configured, true);
+        assert_eq!(readiness.readiness, "unavailable");
+        assert_eq!(readiness.resolved_executable, None);
+
+        let error = supervisor
+            .start_for_session(
+                root.path(),
+                "test-session",
+                StartRequest {
+                    command: "printf test".to_owned(),
+                    cwd: None,
+                    background: None,
+                    timeout_ms: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.0.code, "BASH_UNAVAILABLE");
+        assert!(supervisor.retained_run_ids().is_empty());
+    }
+
+    #[test]
+    fn non_default_relative_bash_name_fails_closed_after_probe_failure() {
+        let supervisor = BashSupervisor::new(
+            tempdir().unwrap().path().to_path_buf(),
+            policy_with_executable("missing-codeweave-bash".to_owned()),
+        )
+        .unwrap();
+
+        let readiness = supervisor.readiness();
+
+        assert_eq!(readiness.readiness, "unavailable");
+        assert_eq!(readiness.resolved_executable, None);
+    }
+
+    #[test]
+    fn recent_failures_can_be_scoped_to_session() {
+        let cache = tempdir().unwrap();
+        let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
+        supervisor.runs.lock().insert(
+            "a".to_owned(),
+            Arc::new(Mutex::new(record_for_session(
+                cache.path(),
+                "a",
+                "session-a",
+                "failed",
+                "alpha failure",
+            ))),
+        );
+        supervisor.runs.lock().insert(
+            "b".to_owned(),
+            Arc::new(Mutex::new(record_for_session(
+                cache.path(),
+                "b",
+                "session-b",
+                "failed",
+                "beta failure",
+            ))),
+        );
+
+        let scoped = supervisor.recent_failures_for_session("session-a", "failure", 10);
+
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0]["run_id"], "a");
+        assert!(scoped[0]["output"].as_str().unwrap().contains("alpha"));
+        assert!(!scoped[0]["output"].as_str().unwrap().contains("beta"));
+    }
+
+    #[tokio::test]
     async fn cwd_must_exist_inside_workspace() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
 
         let missing = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: "printf test".to_owned(),
                     cwd: Some("missing".to_owned()),
@@ -1161,8 +1617,9 @@ mod tests {
         ));
 
         let escaped = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: "printf test".to_owned(),
                     cwd: Some("../outside".to_owned()),
@@ -1181,8 +1638,9 @@ mod tests {
         let cache = tempdir().unwrap();
         let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
         let error = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: "printf test".to_owned(),
                     cwd: None,
@@ -1201,8 +1659,9 @@ mod tests {
         let cache = tempdir().unwrap();
         let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
         let succeeded = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: "printf stdout; printf stderr >&2".to_owned(),
                     cwd: None,
@@ -1218,8 +1677,9 @@ mod tests {
         assert!(succeeded["output"].as_str().unwrap().contains("stderr"));
 
         let failed = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: "printf failed >&2; exit 7".to_owned(),
                     cwd: None,
@@ -1240,8 +1700,9 @@ mod tests {
         let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
 
         let quoted = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: "printf \"first's\"".to_owned(),
                     cwd: None,
@@ -1255,8 +1716,9 @@ mod tests {
         assert!(quoted["output"].as_str().unwrap().contains("first's"));
 
         let binary = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: r"printf '\377'".to_owned(),
                     cwd: None,
@@ -1291,8 +1753,9 @@ mod tests {
         wsl_policy.bash.executable = wsl_bash.to_string_lossy().into_owned();
         let supervisor = BashSupervisor::new(cache.path().to_path_buf(), wsl_policy).unwrap();
         let result = supervisor
-            .start(
+            .start_for_session(
                 &root,
+                "test-session",
                 StartRequest {
                     command: "pwd".to_owned(),
                     cwd: None,
@@ -1317,8 +1780,9 @@ mod tests {
         let cache = tempdir().unwrap();
         let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
         let started = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: "echo started; sleep 30".to_owned(),
                     cwd: None,
@@ -1337,7 +1801,7 @@ mod tests {
             "queued" | "running"
         ));
         let mut output = supervisor
-            .output_stream(run_id, None, Some("combined"))
+            .output_stream_for_session("test-session", run_id, None, Some("combined"))
             .unwrap();
         for _ in 0..50 {
             if output["output"].as_str().unwrap().contains("started") {
@@ -1345,11 +1809,16 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
             output = supervisor
-                .output_stream(run_id, None, Some("combined"))
+                .output_stream_for_session("test-session", run_id, None, Some("combined"))
                 .unwrap();
         }
         assert!(output["output"].as_str().unwrap().contains("started"));
-        assert_eq!(supervisor.cancel(run_id).unwrap()["status"], "cancelling");
+        assert_eq!(
+            supervisor
+                .cancel_for_session("test-session", run_id)
+                .unwrap()["status"],
+            "cancelling"
+        );
 
         for _ in 0..50 {
             if supervisor.status(run_id).unwrap()["ended_at"].is_string() {
@@ -1379,8 +1848,9 @@ mod tests {
         let bg = supervisor.clone();
         let root_path = root.path().to_path_buf();
         let request_task = tokio::spawn(async move {
-            bg.start(
+            bg.start_for_session(
                 &root_path,
+                "test-session",
                 StartRequest {
                     command: "echo abandoned; sleep 5".to_owned(),
                     cwd: None,
@@ -1397,8 +1867,9 @@ mod tests {
         // The permit is still held by the detached command, so an identical
         // retry dedupes rather than colliding.
         let retry = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: "echo abandoned; sleep 5".to_owned(),
                     cwd: None,
@@ -1421,8 +1892,9 @@ mod tests {
 
         // The next warm run is clean: only its own output, no leakage.
         let fresh = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: "printf fresh-output".to_owned(),
                     cwd: None,
@@ -1447,8 +1919,9 @@ mod tests {
         promote_policy.bash.default_timeout_ms = 10_000;
         let supervisor = BashSupervisor::new(cache.path().to_path_buf(), promote_policy).unwrap();
         let result = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: "echo warming; sleep 30".to_owned(),
                     cwd: None,
@@ -1462,7 +1935,9 @@ mod tests {
         assert_eq!(result["detached"], true);
         assert_eq!(result["reason"], "foreground_budget_exceeded");
         let run_id = result["run_id"].as_str().unwrap().to_owned();
-        assert!(supervisor.cancel(&run_id).is_ok());
+        assert!(supervisor
+            .cancel_for_session("test-session", &run_id)
+            .is_ok());
     }
 
     #[tokio::test]
@@ -1479,19 +1954,26 @@ mod tests {
             background: None,
             timeout_ms: None,
         };
-        let first = supervisor.start(root.path(), request()).await.unwrap();
+        let first = supervisor
+            .start_for_session(root.path(), "test-session", request())
+            .await
+            .unwrap();
         assert_eq!(first["status"], "running");
         let run_id = first["run_id"].as_str().unwrap().to_owned();
 
-        let retry = supervisor.start(root.path(), request()).await.unwrap();
+        let retry = supervisor
+            .start_for_session(root.path(), "test-session", request())
+            .await
+            .unwrap();
         assert_eq!(retry["deduplicated"], true);
         assert_eq!(retry["run_id"], run_id);
 
         // A genuinely different command still gets a busy error carrying the
         // active run so the model can poll or cancel.
         let busy = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: "echo other".to_owned(),
                     cwd: None,
@@ -1504,7 +1986,9 @@ mod tests {
         assert_eq!(busy.0.code, "RUN_BUSY");
         let details = busy.0.details.unwrap();
         assert_eq!(details["active_run"]["run_id"], run_id);
-        assert!(supervisor.cancel(&run_id).is_ok());
+        assert!(supervisor
+            .cancel_for_session("test-session", &run_id)
+            .is_ok());
     }
 
     #[tokio::test]
@@ -1515,8 +1999,9 @@ mod tests {
         timeout_policy.bash.default_timeout_ms = 100;
         let supervisor = BashSupervisor::new(cache.path().to_path_buf(), timeout_policy).unwrap();
         let result = supervisor
-            .start(
+            .start_for_session(
                 root.path(),
+                "test-session",
                 StartRequest {
                     command: "printf partial; sleep 30".to_owned(),
                     cwd: None,
@@ -1545,13 +2030,13 @@ mod tests {
 
         assert_eq!(
             supervisor
-                .output_stream("streams", None, Some("stdout"))
+                .output_stream_for_session("test-session", "streams", None, Some("stdout"))
                 .unwrap()["output"],
             "stdout-only"
         );
         assert_eq!(
             supervisor
-                .output_stream("streams", None, Some("stderr"))
+                .output_stream_for_session("test-session", "streams", None, Some("stderr"))
                 .unwrap()["output"],
             "stderr-only"
         );

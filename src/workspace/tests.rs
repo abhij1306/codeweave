@@ -442,9 +442,12 @@ async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
     assert_eq!(started["status_fetch"]["value"], run_id);
 
     let fetched = actor
-        .code_fetch(&json!({
-            "items": [{"kind": "bash_status", "value": run_id}]
-        }))
+        .code_fetch_for_session(
+            "session",
+            &json!({
+                "items": [{"kind": "bash_status", "value": run_id}]
+            }),
+        )
         .unwrap();
 
     assert_eq!(fetched["result_count"], 1);
@@ -453,13 +456,16 @@ async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
     assert_eq!(fetched["results"][0]["status"], "succeeded");
 
     let bounded = actor
-        .code_fetch(&json!({
-            "items": [
-                {"kind": "bash_status", "value": run_id},
-                {"kind": "bash_status", "value": run_id}
-            ],
-            "max_chars": 5
-        }))
+        .code_fetch_for_session(
+            "session",
+            &json!({
+                "items": [
+                    {"kind": "bash_status", "value": run_id},
+                    {"kind": "bash_status", "value": run_id}
+                ],
+                "max_chars": 5
+            }),
+        )
         .unwrap();
     assert!(bounded["results"][0]["output"].as_str().unwrap().len() <= 5);
     assert_eq!(bounded["results"][0]["output_truncated"], true);
@@ -1034,6 +1040,87 @@ async fn failed_bash_validation_rolls_back_mutation() {
 }
 
 #[tokio::test]
+async fn unavailable_bash_validation_rejects_before_mutation() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("value.rs");
+    let original = "fn value() -> i32 { 1 }\n";
+    fs::write(&path, original).unwrap();
+    let mut policy = test_policy();
+    policy.bash.executable = root
+        .path()
+        .join("missing-bash.exe")
+        .to_string_lossy()
+        .into_owned();
+    let actor = test_actor_with_policy(root.path(), policy);
+
+    let summary = actor.summary("test-session", false).unwrap();
+    assert_eq!(summary["capabilities"]["bash_available"], false);
+    assert_eq!(summary["capabilities"]["bash"]["readiness"], "unavailable");
+
+    let error = actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [{
+                    "kind": "replace",
+                    "path": "value.rs",
+                    "old_text": "{ 1 }",
+                    "new_text": "{ 2 }",
+                    "expected_hash": content_hash(original)
+                }],
+                "validate": ["true"]
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.0.code, "BASH_UNAVAILABLE");
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
+}
+
+#[test]
+fn dirty_ownership_tracks_only_current_dirty_mcp_paths() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("still_dirty.rs"), "fn dirty() {}\n").unwrap();
+    fs::write(root.path().join("clean_now.rs"), "fn clean() {}\n").unwrap();
+    let actor = test_actor(root.path());
+    let generation = actor.generation();
+    actor.mutations.lock().extend([
+        MutationRecord {
+            mutation_id: "dirty".to_owned(),
+            session_id: "test-session".to_owned(),
+            path: "still_dirty.rs".to_owned(),
+            before_hash: None,
+            after_hash: Some("dirty".to_owned()),
+            source: "mcp_edit".to_owned(),
+            request_id: "request".to_owned(),
+            timestamp: Utc::now(),
+            generation,
+        },
+        MutationRecord {
+            mutation_id: "clean".to_owned(),
+            session_id: "test-session".to_owned(),
+            path: "clean_now.rs".to_owned(),
+            before_hash: None,
+            after_hash: Some("clean".to_owned()),
+            source: "mcp_edit".to_owned(),
+            request_id: "request".to_owned(),
+            timestamp: Utc::now(),
+            generation,
+        },
+    ]);
+    actor.repo_status.write().dirty_files = vec!["still_dirty.rs".to_owned()];
+
+    let summary = actor.summary("test-session", false).unwrap();
+    let changed = summary["dirty_ownership"]["changed_by_mcp"]
+        .as_array()
+        .unwrap();
+
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0], "still_dirty.rs");
+}
+
+#[tokio::test]
 async fn slow_bash_validation_detaches_and_reports_pending() {
     let root = tempdir().unwrap();
     let original = "fn value() -> i32 { 1 }\n";
@@ -1070,7 +1157,7 @@ async fn slow_bash_validation_detaches_and_reports_pending() {
         "fn value() -> i32 { 2 }\n"
     );
     let run_id = result["validation_run_id"].as_str().unwrap();
-    let _ = actor.bash.cancel(run_id);
+    let _ = actor.bash.cancel_for_session("test-session", run_id);
 }
 
 #[test]
@@ -1301,7 +1388,13 @@ fn workspace_summary_caps_and_groups_large_change_sets() {
             .chain((0..5).map(|index| format!("src/feature_{index}.rs"))),
     );
     actor.repo_status.write().dirty_files = (0..50)
-        .map(|index| format!("backend/artifacts/result_{index}.json"))
+        .map(|index| {
+            if index < 45 {
+                format!("backend/artifacts/result_{index}.json")
+            } else {
+                format!("src/feature_{}.rs", index - 45)
+            }
+        })
         .collect();
 
     let summary = actor.summary("test-session", false).unwrap();
