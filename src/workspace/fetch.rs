@@ -38,6 +38,7 @@ struct FetchPrecondition<'a> {
 }
 
 impl WorkspaceActor {
+    #[allow(dead_code)]
     pub fn code_fetch(&self, params: &Value) -> AppResult<Value> {
         self.code_fetch_for_session("default", params)
     }

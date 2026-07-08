@@ -234,6 +234,15 @@ impl std::fmt::Debug for BashSupervisor {
     }
 }
 
+struct ExecutionRequest {
+    bash_executable: String,
+    command: String,
+    cwd: PathBuf,
+    timeout_ms: u64,
+    max_output: usize,
+    completion_observer: Option<RunCompletionObserver>,
+}
+
 const MAX_RETAINED_RUNS: usize = 256;
 const OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 10;
 const READINESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -634,29 +643,18 @@ impl BashSupervisor {
         let execution_completion_observer = completion_observer.clone();
         let mut handle = tokio::spawn(async move {
             let _run_permit = run_permit;
+            let request = ExecutionRequest {
+                bash_executable,
+                command,
+                cwd,
+                timeout_ms,
+                max_output,
+                completion_observer: execution_completion_observer.clone(),
+            };
             let result = if background {
-                execute(
-                    record,
-                    bash_executable,
-                    command,
-                    cwd,
-                    timeout_ms,
-                    max_output,
-                    execution_completion_observer.clone(),
-                )
-                .await
+                execute(record, request).await
             } else {
-                execute_warm(
-                    warm_shell,
-                    record,
-                    bash_executable,
-                    command,
-                    cwd,
-                    timeout_ms,
-                    max_output,
-                    execution_completion_observer.clone(),
-                )
-                .await
+                execute_warm(warm_shell, record, request).await
             };
             if let Err(error) = &result {
                 finalize_run_error(
@@ -1082,13 +1080,16 @@ fn finalize_cancelled_before_start(
 async fn execute_warm(
     warm_shell: Arc<tokio::sync::Mutex<Option<WarmShell>>>,
     record: Arc<Mutex<RunRecord>>,
-    bash_executable: String,
-    command: String,
-    cwd: PathBuf,
-    timeout_ms: u64,
-    max_output: usize,
-    completion_observer: Option<RunCompletionObserver>,
+    request: ExecutionRequest,
 ) -> AppResult<()> {
+    let ExecutionRequest {
+        bash_executable,
+        command,
+        cwd,
+        timeout_ms,
+        max_output,
+        completion_observer,
+    } = request;
     if finalize_cancelled_before_start(&record, completion_observer.as_ref()) {
         return Ok(());
     }
@@ -1175,15 +1176,15 @@ async fn execute_warm(
     Ok(())
 }
 
-async fn execute(
-    record: Arc<Mutex<RunRecord>>,
-    bash_executable: String,
-    command: String,
-    cwd: PathBuf,
-    timeout_ms: u64,
-    max_output: usize,
-    completion_observer: Option<RunCompletionObserver>,
-) -> AppResult<()> {
+async fn execute(record: Arc<Mutex<RunRecord>>, request: ExecutionRequest) -> AppResult<()> {
+    let ExecutionRequest {
+        bash_executable,
+        command,
+        cwd,
+        timeout_ms,
+        max_output,
+        completion_observer,
+    } = request;
     if finalize_cancelled_before_start(&record, completion_observer.as_ref()) {
         return Ok(());
     }
@@ -1582,7 +1583,7 @@ mod tests {
         )
         .unwrap();
         let readiness = supervisor.readiness();
-        assert_eq!(readiness.configured, true);
+        assert!(readiness.configured);
         assert_eq!(readiness.readiness, "unavailable");
         assert_eq!(readiness.resolved_executable, None);
 

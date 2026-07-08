@@ -715,6 +715,7 @@ impl WorkspaceActor {
         self.summary(session_id, stateless_session)
     }
 
+    #[allow(dead_code)]
     pub fn code_context(&self, params: &Value) -> AppResult<Value> {
         self.code_context_for_session("default", params)
     }
@@ -1285,7 +1286,7 @@ impl WorkspaceActor {
                     baseline.completion = completion;
                 }
                 if terminal && baseline.completion.is_none() {
-                    if let Some(ended_at) = result_ended_at.clone() {
+                    if let Some(ended_at) = result_ended_at {
                         baseline.completion = Some(RunCompletion {
                             generation: self.generation(),
                             ended_at,
@@ -1300,7 +1301,7 @@ impl WorkspaceActor {
                                 .clone()
                                 .unwrap_or_else(|| RunCompletion {
                                     generation: self.generation(),
-                                    ended_at: result_ended_at.clone().unwrap_or_else(Utc::now),
+                                    ended_at: result_ended_at.unwrap_or_else(Utc::now),
                                 });
                         let baseline_snapshot = baseline.clone();
                         let paths = self.observed_run_changed_paths(
@@ -1388,7 +1389,7 @@ impl WorkspaceActor {
                 mutation.generation > baseline.generation
                     && mutation.generation <= end_generation
                     && ended_at
-                        .map(|ended| mutation.timestamp <= ended.clone())
+                        .map(|ended| mutation.timestamp <= *ended)
                         .unwrap_or(true)
             })
             .map(|mutation| mutation.path.clone())
@@ -1417,7 +1418,7 @@ impl WorkspaceActor {
             return false;
         };
         let modified: DateTime<Utc> = modified.into();
-        modified <= ended_at.clone()
+        modified <= *ended_at
     }
 }
 

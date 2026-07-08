@@ -324,6 +324,7 @@ dependencies = [
  "futures-util",
  "hyper-util",
  "ignore",
+ "libc",
  "notify",
  "parking_lot",
  "rayon",
