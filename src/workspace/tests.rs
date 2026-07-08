@@ -475,6 +475,77 @@ async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
     assert_eq!(bounded["truncated"], true);
 }
 
+#[tokio::test]
+async fn completed_bash_status_does_not_attribute_later_workspace_writes() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let actor = test_actor(root.path());
+
+    let started = actor
+        .run(
+            "session",
+            &json!({
+                "command": "printf codeweave-bash-test",
+                "background": true
+            }),
+        )
+        .await
+        .unwrap();
+    let run_id = started["run_id"].as_str().unwrap();
+
+    let mut raw_status = actor.bash.status(run_id).unwrap();
+    for _ in 0..100 {
+        if raw_status["ended_at"].is_string() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        raw_status = actor.bash.status(run_id).unwrap();
+    }
+    assert!(raw_status["ended_at"].is_string());
+
+    actor
+        .commit_plan(
+            "session",
+            &[PlannedFile {
+                path: ".ai-bridge/codeweave-audit-success.md".to_owned(),
+                before: None,
+                after: Some("created after bash exit\n".to_owned()),
+            }],
+            "later-write",
+        )
+        .unwrap();
+
+    let fetched = actor
+        .run(
+            "session",
+            &json!({
+                "action": "status",
+                "run_id": run_id
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fetched["status"], "succeeded");
+    assert_eq!(fetched["observed_changed_path_count"], 0);
+    assert_eq!(fetched["observed_changed_paths"], json!([]));
+
+    let fetched_again = actor
+        .run(
+            "session",
+            &json!({
+                "action": "status",
+                "run_id": run_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fetched_again["observed_changed_paths"],
+        fetched["observed_changed_paths"]
+    );
+}
+
 #[test]
 fn run_change_detection_includes_new_mutations_to_already_dirty_files() {
     let root = tempdir().unwrap();
@@ -482,10 +553,7 @@ fn run_change_detection_includes_new_mutations_to_already_dirty_files() {
     let actor = test_actor(root.path());
     let generation = actor.generation();
     let dirty_files = HashSet::from(["existing.rs".to_owned()]);
-    let baseline = RunBaseline {
-        generation,
-        dirty_files: dirty_files.clone(),
-    };
+    let baseline = RunBaseline::new(generation, dirty_files.clone());
     actor.mutations.lock().push_back(MutationRecord {
         mutation_id: "during-run".to_owned(),
         session_id: "external".to_owned(),
@@ -498,7 +566,7 @@ fn run_change_detection_includes_new_mutations_to_already_dirty_files() {
         generation: generation + 1,
     });
 
-    let observed = actor.observed_run_changed_paths(&baseline, &dirty_files);
+    let observed = actor.observed_run_changed_paths(&baseline, generation + 1, None, &dirty_files);
 
     assert_eq!(observed, HashSet::from(["existing.rs".to_owned()]));
 }

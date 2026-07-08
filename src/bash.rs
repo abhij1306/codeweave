@@ -21,6 +21,8 @@ use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
+pub(crate) type RunCompletionObserver = Arc<dyn Fn(&str, DateTime<Utc>) + Send + Sync>;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BashRunView {
     pub run_id: String,
@@ -207,7 +209,7 @@ fn cleanup_orphan_logs(log_root: &Path, retention_hours: i64) {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BashSupervisor {
     runs: Arc<Mutex<HashMap<String, Arc<Mutex<RunRecord>>>>>,
     run_permit: Arc<Semaphore>,
@@ -216,6 +218,20 @@ pub struct BashSupervisor {
     policy: PolicyConfig,
     retention_hours: i64,
     readiness: BashReadiness,
+    completion_observer: Arc<Mutex<Option<RunCompletionObserver>>>,
+}
+
+impl std::fmt::Debug for BashSupervisor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BashSupervisor")
+            .field("runs", &self.runs)
+            .field("cache_root", &self.cache_root)
+            .field("policy", &self.policy)
+            .field("retention_hours", &self.retention_hours)
+            .field("readiness", &self.readiness)
+            .finish_non_exhaustive()
+    }
 }
 
 const MAX_RETAINED_RUNS: usize = 256;
@@ -473,7 +489,12 @@ impl BashSupervisor {
             policy,
             retention_hours,
             readiness,
+            completion_observer: Arc::new(Mutex::new(None)),
         })
+    }
+
+    pub(crate) fn set_completion_observer(&self, observer: RunCompletionObserver) {
+        *self.completion_observer.lock() = Some(observer);
     }
 
     pub fn readiness(&self) -> BashReadiness {
@@ -602,6 +623,7 @@ impl BashSupervisor {
             .executable()
             .expect("ensure_available guarantees a resolved executable");
         let max_output = self.policy.bash.max_output_chars;
+        let completion_observer = self.completion_observer.lock().clone();
 
         // Execution always runs on a detached task, even for foreground calls.
         // If the client aborts the request (dropping the request future), the
@@ -609,6 +631,7 @@ impl BashSupervisor {
         // the warm shell cannot be handed to the next call mid-command.
         let warm_shell = self.warm_shell.clone();
         let execution_record = record.clone();
+        let execution_completion_observer = completion_observer.clone();
         let mut handle = tokio::spawn(async move {
             let _run_permit = run_permit;
             let result = if background {
@@ -619,6 +642,7 @@ impl BashSupervisor {
                     cwd,
                     timeout_ms,
                     max_output,
+                    execution_completion_observer.clone(),
                 )
                 .await
             } else {
@@ -630,11 +654,16 @@ impl BashSupervisor {
                     cwd,
                     timeout_ms,
                     max_output,
+                    execution_completion_observer.clone(),
                 )
                 .await
             };
             if let Err(error) = &result {
-                finalize_run_error(&execution_record, error);
+                finalize_run_error(
+                    &execution_record,
+                    error,
+                    execution_completion_observer.as_ref(),
+                );
             }
             result
         });
@@ -1026,13 +1055,17 @@ impl BashSupervisor {
     }
 }
 
-fn finalize_cancelled_before_start(record: &Arc<Mutex<RunRecord>>) -> bool {
+fn finalize_cancelled_before_start(
+    record: &Arc<Mutex<RunRecord>>,
+    completion_observer: Option<&RunCompletionObserver>,
+) -> bool {
     let mut item = record.lock();
     if !item.cancel_requested {
         return false;
     }
+    let ended_at = Utc::now();
     item.status = "cancelled".to_owned();
-    item.ended_at = Some(Utc::now());
+    item.ended_at = Some(ended_at);
     item.pid = None;
     item.job = None;
     if !item.output.is_empty() {
@@ -1040,6 +1073,9 @@ fn finalize_cancelled_before_start(record: &Arc<Mutex<RunRecord>>) -> bool {
     }
     item.output
         .push_str("Bash run was cancelled before the process started.");
+    if let Some(observer) = completion_observer {
+        observer(&item.run_id, ended_at);
+    }
     true
 }
 
@@ -1051,8 +1087,9 @@ async fn execute_warm(
     cwd: PathBuf,
     timeout_ms: u64,
     max_output: usize,
+    completion_observer: Option<RunCompletionObserver>,
 ) -> AppResult<()> {
-    if finalize_cancelled_before_start(&record) {
+    if finalize_cancelled_before_start(&record, completion_observer.as_ref()) {
         return Ok(());
     }
 
@@ -1129,6 +1166,7 @@ async fn execute_warm(
         outcome.exit_code,
         display_output,
         output_truncated,
+        completion_observer.as_ref(),
     );
     execution_guard.disarm();
     if reuse_shell {
@@ -1144,8 +1182,9 @@ async fn execute(
     cwd: PathBuf,
     timeout_ms: u64,
     max_output: usize,
+    completion_observer: Option<RunCompletionObserver>,
 ) -> AppResult<()> {
-    if finalize_cancelled_before_start(&record) {
+    if finalize_cancelled_before_start(&record, completion_observer.as_ref()) {
         return Ok(());
     }
 
@@ -1314,7 +1353,14 @@ async fn execute(
         status,
         max_output,
     );
-    finalize_record_output(&record, status, exit_code, display_output, output_truncated);
+    finalize_record_output(
+        &record,
+        status,
+        exit_code,
+        display_output,
+        output_truncated,
+        completion_observer.as_ref(),
+    );
     execution_guard.disarm();
     Ok(())
 }
@@ -1363,25 +1409,35 @@ fn finalize_record_output(
     exit_code: Option<i32>,
     display_output: String,
     output_truncated: bool,
+    completion_observer: Option<&RunCompletionObserver>,
 ) {
     let mut item = record.lock();
+    let ended_at = Utc::now();
     item.status = status.to_owned();
     item.exit_code = exit_code;
-    item.ended_at = Some(Utc::now());
+    item.ended_at = Some(ended_at);
     item.pid = None;
     item.job = None;
     item.output = display_output;
     item.output_truncated = output_truncated;
+    if let Some(observer) = completion_observer {
+        observer(&item.run_id, ended_at);
+    }
 }
 
-fn finalize_run_error(record: &Arc<Mutex<RunRecord>>, error: &AppError) {
+fn finalize_run_error(
+    record: &Arc<Mutex<RunRecord>>,
+    error: &AppError,
+    completion_observer: Option<&RunCompletionObserver>,
+) {
     let mut item = record.lock();
     if item.ended_at.is_some() {
         return;
     }
+    let ended_at = Utc::now();
     item.status = "failed".to_owned();
     item.exit_code = None;
-    item.ended_at = Some(Utc::now());
+    item.ended_at = Some(ended_at);
     item.pid = None;
     item.job = None;
     if !item.output.is_empty() {
@@ -1391,6 +1447,9 @@ fn finalize_run_error(record: &Arc<Mutex<RunRecord>>, error: &AppError) {
         "CodeWeave Bash execution failed: {}",
         error.0.message
     ));
+    if let Some(observer) = completion_observer {
+        observer(&item.run_id, ended_at);
+    }
 }
 
 fn view(record: &RunRecord, max_output: usize) -> BashRunView {

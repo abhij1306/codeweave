@@ -64,7 +64,8 @@ pub struct WorkspaceActor {
     journal_file: Mutex<Option<fs::File>>,
     journal_path: PathBuf,
     bash: BashSupervisor,
-    run_generations: Mutex<HashMap<String, RunBaseline>>,
+    run_generations: Arc<Mutex<HashMap<String, RunBaseline>>>,
+    run_completions: Arc<Mutex<HashMap<String, RunCompletion>>>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
     open_diagnostics: Value,
     _watcher: Mutex<RecommendedWatcher>,
@@ -74,6 +75,31 @@ pub struct WorkspaceActor {
 struct RunBaseline {
     generation: u64,
     dirty_files: HashSet<String>,
+    completion: Option<RunCompletion>,
+    frozen: Option<FrozenRunAttribution>,
+}
+
+#[derive(Debug, Clone)]
+struct RunCompletion {
+    generation: u64,
+    ended_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct FrozenRunAttribution {
+    generation: u64,
+    changed: ChangedPathSummary,
+}
+
+impl RunBaseline {
+    fn new(generation: u64, dirty_files: HashSet<String>) -> Self {
+        Self {
+            generation,
+            dirty_files,
+            completion: None,
+            frozen: None,
+        }
+    }
 }
 
 fn validated_push_target(params: &Value, current_branch: &str) -> AppResult<(String, String)> {
@@ -218,7 +244,19 @@ impl WorkspaceActor {
             .unwrap_or(1);
         generation.store(persisted_generation.max(1), Ordering::Release);
         let journal_file = open_journal(&journal_path)?;
+        let run_completions = Arc::new(Mutex::new(HashMap::new()));
+        let completion_generation = generation.clone();
+        let completion_store = run_completions.clone();
         let bash = BashSupervisor::new(workspace_cache, policy.clone())?;
+        bash.set_completion_observer(Arc::new(move |run_id, ended_at| {
+            completion_store.lock().insert(
+                run_id.to_owned(),
+                RunCompletion {
+                    generation: completion_generation.load(Ordering::Acquire),
+                    ended_at,
+                },
+            );
+        }));
         let journal_ms = journal_started.elapsed().as_millis();
         let open_diagnostics = json!({
             "cache_hit": index_cache_hit,
@@ -255,7 +293,8 @@ impl WorkspaceActor {
             journal_file: Mutex::new(Some(journal_file)),
             journal_path,
             bash,
-            run_generations: Mutex::new(HashMap::new()),
+            run_generations: Arc::new(Mutex::new(HashMap::new())),
+            run_completions,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             open_diagnostics,
             _watcher: Mutex::new(watcher),
@@ -1145,13 +1184,13 @@ impl WorkspaceActor {
                     let retained = self.bash.retained_run_ids();
                     let mut generations = self.run_generations.lock();
                     generations.retain(|known_run, _| retained.contains(known_run));
-                    generations.insert(
-                        run_id.to_owned(),
-                        RunBaseline {
-                            generation: before,
-                            dirty_files: before_dirty,
-                        },
-                    );
+                    self.run_completions
+                        .lock()
+                        .retain(|known_run, _| retained.contains(known_run));
+                    let completion = self.run_completions.lock().remove(run_id);
+                    let mut baseline = RunBaseline::new(before, before_dirty);
+                    baseline.completion = completion;
+                    generations.insert(run_id.to_owned(), baseline);
                 }
                 value
             }
@@ -1211,14 +1250,18 @@ impl WorkspaceActor {
             let terminal = result
                 .get("status")
                 .and_then(Value::as_str)
-                .map(|status| !matches!(status, "queued" | "running"))
+                .map(|status| !matches!(status, "queued" | "running" | "cancelling"))
                 .unwrap_or(true);
             self.reconcile_after_poll(terminal).await?;
         } else {
             self.reconcile_pending_async().await?;
         }
         let reconcile_after_ms = reconcile_after_started.elapsed().as_millis();
-        if let Some(run_id) = result.get("run_id").and_then(Value::as_str) {
+        if let Some(run_id) = result
+            .get("run_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
             let current_dirty: HashSet<String> = self
                 .repo_status
                 .read()
@@ -1226,25 +1269,78 @@ impl WorkspaceActor {
                 .iter()
                 .cloned()
                 .collect();
-            let baseline = self
-                .run_generations
-                .lock()
-                .get(run_id)
-                .cloned()
-                .unwrap_or_else(|| RunBaseline {
-                    generation: self.generation(),
-                    dirty_files: current_dirty.clone(),
-                });
-            let paths = self.observed_run_changed_paths(&baseline, &current_dirty);
-            let changed = summarize_changed_paths(paths);
+            let terminal = result
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|status| !matches!(status, "queued" | "running" | "cancelling"))
+                .unwrap_or(true);
+            let result_ended_at = run_result_ended_at(&result);
+            let (start_generation, attribution_generation, changed) = {
+                let completion = self.run_completions.lock().remove(&run_id);
+                let mut generations = self.run_generations.lock();
+                let baseline = generations
+                    .entry(run_id.clone())
+                    .or_insert_with(|| RunBaseline::new(self.generation(), current_dirty.clone()));
+                if baseline.completion.is_none() {
+                    baseline.completion = completion;
+                }
+                if terminal && baseline.completion.is_none() {
+                    if let Some(ended_at) = result_ended_at.clone() {
+                        baseline.completion = Some(RunCompletion {
+                            generation: self.generation(),
+                            ended_at,
+                        });
+                    }
+                }
+                if terminal {
+                    if baseline.frozen.is_none() {
+                        let completion =
+                            baseline
+                                .completion
+                                .clone()
+                                .unwrap_or_else(|| RunCompletion {
+                                    generation: self.generation(),
+                                    ended_at: result_ended_at.clone().unwrap_or_else(Utc::now),
+                                });
+                        let baseline_snapshot = baseline.clone();
+                        let paths = self.observed_run_changed_paths(
+                            &baseline_snapshot,
+                            completion.generation,
+                            Some(&completion.ended_at),
+                            &current_dirty,
+                        );
+                        baseline.frozen = Some(FrozenRunAttribution {
+                            generation: completion.generation,
+                            changed: summarize_changed_paths(paths),
+                        });
+                    }
+                    let frozen = baseline
+                        .frozen
+                        .clone()
+                        .expect("terminal run attribution is frozen");
+                    (baseline.generation, frozen.generation, frozen.changed)
+                } else {
+                    let paths = self.observed_run_changed_paths(
+                        baseline,
+                        self.generation(),
+                        None,
+                        &current_dirty,
+                    );
+                    (
+                        baseline.generation,
+                        self.generation(),
+                        summarize_changed_paths(paths),
+                    )
+                }
+            };
             if let Some(object) = result.as_object_mut() {
                 object.insert(
                     "workspace_generation_before".to_owned(),
-                    json!(baseline.generation),
+                    json!(start_generation),
                 );
                 object.insert(
                     "workspace_generation_after".to_owned(),
-                    json!(self.generation()),
+                    json!(attribution_generation),
                 );
                 object.insert("observed_changed_paths".to_owned(), json!(changed.paths));
                 object.insert(
@@ -1280,22 +1376,57 @@ impl WorkspaceActor {
     fn observed_run_changed_paths(
         &self,
         baseline: &RunBaseline,
+        end_generation: u64,
+        ended_at: Option<&DateTime<Utc>>,
         current_dirty: &HashSet<String>,
     ) -> HashSet<String> {
+        let mutation_paths: HashSet<String> = self
+            .mutations
+            .lock()
+            .iter()
+            .filter(|mutation| {
+                mutation.generation > baseline.generation
+                    && mutation.generation <= end_generation
+                    && ended_at
+                        .map(|ended| mutation.timestamp <= ended.clone())
+                        .unwrap_or(true)
+            })
+            .map(|mutation| mutation.path.clone())
+            .collect();
         let mut paths: HashSet<String> = current_dirty
             .symmetric_difference(&baseline.dirty_files)
+            .filter(|path| {
+                ended_at.is_none()
+                    || mutation_paths.contains(*path)
+                    || ended_at
+                        .map(|ended| self.path_modified_at_or_before(path, ended))
+                        .unwrap_or(true)
+            })
             .cloned()
             .collect();
-        paths.extend(
-            self.mutations
-                .lock()
-                .iter()
-                .filter(|mutation| mutation.generation > baseline.generation)
-                .map(|mutation| mutation.path.clone()),
-        );
+        paths.extend(mutation_paths);
         paths.retain(|path| !self.exclusions.is_ignored(Path::new(path), false));
         paths
     }
+
+    fn path_modified_at_or_before(&self, path: &str, ended_at: &DateTime<Utc>) -> bool {
+        let Ok(metadata) = fs::metadata(self.root.join(path)) else {
+            return false;
+        };
+        let Ok(modified) = metadata.modified() else {
+            return false;
+        };
+        let modified: DateTime<Utc> = modified.into();
+        modified <= ended_at.clone()
+    }
+}
+
+fn run_result_ended_at(result: &Value) -> Option<DateTime<Utc>> {
+    result
+        .get("ended_at")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
 }
 
 pub(super) fn add_reconcile_pending(value: &mut Value, pending: bool) {
