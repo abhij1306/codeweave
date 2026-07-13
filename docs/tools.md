@@ -1,6 +1,6 @@
 # Tool Reference
 
-All tools are defined in one registry and filtered by `server.toolProfile`. The `full` profile exposes every tool. `read-only` exposes repository inspection, retrieval, semantic intelligence, previews, and read-only Git operations. `edit` adds repository writes but excludes Bash and `git_push`. `custom` applies explicit include/exclude lists.
+All tools are defined in one registry and filtered by `server.toolProfile`. `full` remains the default and exposes every tool. The evaluated `coding` profile exposes the 18-tool coding core: workspace/retrieval/intelligence, narrow edits, preview/transaction, Git status/diff/log, and Bash lifecycle tools. `read-only` exposes seven inspection tools. `edit` adds file writes to that inspection core but remains Bash-free. Capability/admin, uncommon Git inspection, staging, commit, restore, and push remain `full`-only. `custom` applies explicit include/exclude lists.
 
 ## `workspace`
 

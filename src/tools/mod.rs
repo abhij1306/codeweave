@@ -54,6 +54,7 @@ impl ToolSafety {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
     Full,
+    Coding,
     ReadOnly,
     Edit,
 }
@@ -62,6 +63,7 @@ impl Profile {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "full" => Some(Profile::Full),
+            "coding" => Some(Profile::Coding),
             "read-only" | "read_only" => Some(Profile::ReadOnly),
             "edit" => Some(Profile::Edit),
             _ => None,
@@ -116,14 +118,14 @@ pub fn full_list_payload() -> Value {
 
 /// The complete, ordered tool set. Order is preserved in `tools/list`.
 pub fn registry() -> &'static [ToolDefinition] {
-    use Profile::{Edit, ReadOnly};
+    use Profile::{Coding, Edit, ReadOnly};
     &[
         ToolDefinition {
             name: "workspace",
             title: "Workspace",
             description: "View this server's repository summary or changes, refresh its index, inspect diagnostics, or explicitly list/read configured skills. The repository is fixed for the server's lifetime (configured in config.json). Skills must only be used when the user explicitly asks.",
             safety: ToolSafety::Read,
-            profiles: &[ReadOnly, Edit],
+            profiles: &[Coding, ReadOnly, Edit],
             input_schema: workspace::workspace,
         },
         ToolDefinition {
@@ -131,7 +133,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Code Retrieval",
             description: "Use this single tool for all repository discovery and exact reads. Submit one or more explicit operations: find_file, find_symbol, search_text, find_references, symbols_overview, repo_map, or read.",
             safety: ToolSafety::Read,
-            profiles: &[ReadOnly, Edit],
+            profiles: &[Coding, ReadOnly, Edit],
             input_schema: retrieval::code_retrieve,
         },
         ToolDefinition {
@@ -139,14 +141,14 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "CodeWeave Capabilities",
             description: "Return the code_retrieve operation contract, edit capabilities, limits, workspace identity, and known limitations.",
             safety: ToolSafety::Read,
-            profiles: &[ReadOnly, Edit],
+            profiles: &[],
             input_schema: retrieval::code_capabilities,
         },
         ToolDefinition {
             name: "code_intelligence",            title: "Code Intelligence",
             description: "Resolve definitions, references, diagnostics, or a rename preview through the optional semantic backend. Results always label semantic, syntactic, or lexical evidence.",
             safety: ToolSafety::Read,
-            profiles: &[ReadOnly, Edit],
+            profiles: &[Coding, ReadOnly, Edit],
             input_schema: intelligence::code_intelligence,
         },
         ToolDefinition {
@@ -154,7 +156,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Write One File",
             description: "Create or overwrite exactly one file. Use expected_hash when replacing an existing file.",
             safety: ToolSafety::WriteClosed,
-            profiles: &[Edit],
+            profiles: &[Coding, Edit],
             input_schema: edits::code_write,
         },
         ToolDefinition {
@@ -162,7 +164,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Replace Text in One File",
             description: "Replace exact text in exactly one file. The replacement count is checked before writing.",
             safety: ToolSafety::WriteClosed,
-            profiles: &[Edit],
+            profiles: &[Coding, Edit],
             input_schema: edits::code_replace,
         },
         ToolDefinition {
@@ -170,7 +172,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Replace Fetched Range in One File",
             description: "Replace the complete line range selected by a code_retrieve read handle in exactly one file.",
             safety: ToolSafety::WriteClosed,
-            profiles: &[Edit],
+            profiles: &[Coding, Edit],
             input_schema: edits::code_replace_range,
         },
         ToolDefinition {
@@ -178,7 +180,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Insert Text in One File",
             description: "Insert text before, after, or inside one named symbol in exactly one file.",
             safety: ToolSafety::WriteClosed,
-            profiles: &[Edit],
+            profiles: &[Coding, Edit],
             input_schema: edits::code_insert,
         },
         ToolDefinition {
@@ -186,7 +188,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Delete One File",
             description: "Delete exactly one file with an optional content-hash precondition.",
             safety: ToolSafety::DestructiveClosed,
-            profiles: &[Edit],
+            profiles: &[Coding, Edit],
             input_schema: edits::code_delete,
         },
         ToolDefinition {
@@ -194,7 +196,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Rename One File",
             description: "Rename exactly one file with an optional content-hash precondition.",
             safety: ToolSafety::WriteClosed,
-            profiles: &[Edit],
+            profiles: &[Coding, Edit],
             input_schema: edits::code_rename,
         },
         ToolDefinition {
@@ -202,7 +204,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Preview Code Transaction",
             description: "Preview a multi-file edit transaction and return the diff without writing files.",
             safety: ToolSafety::Read,
-            profiles: &[ReadOnly, Edit],
+            profiles: &[Coding, ReadOnly, Edit],
             input_schema: edits::code_preview,
         },
         ToolDefinition {
@@ -210,7 +212,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Apply Code Transaction",
             description: "Apply a multi-file edit transaction through the same precondition, non-destructive validation reporting, diff, and internal atomic-recovery engine as the narrow write tools.",
             safety: ToolSafety::WriteClosed,
-            profiles: &[Edit],
+            profiles: &[Coding, Edit],
             input_schema: edits::code_transaction,
         },
         ToolDefinition {
@@ -218,7 +220,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Git Status",
             description: "Show the working tree status: staged, unstaged, untracked, and partially staged files.",
             safety: ToolSafety::Read,
-            profiles: &[ReadOnly, Edit],
+            profiles: &[Coding, ReadOnly, Edit],
             input_schema: git::git_status,
         },
         ToolDefinition {
@@ -226,7 +228,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Git Diff",
             description: "Show the diff for the working tree or, with staged=true, the staged index. Limit to specific paths when given.",
             safety: ToolSafety::Read,
-            profiles: &[ReadOnly, Edit],
+            profiles: &[Coding, ReadOnly, Edit],
             input_schema: git::git_diff,
         },
         ToolDefinition {
@@ -234,7 +236,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Git Log",
             description: "Show recent commit history.",
             safety: ToolSafety::Read,
-            profiles: &[ReadOnly, Edit],
+            profiles: &[Coding, ReadOnly, Edit],
             input_schema: git::git_log,
         },
         ToolDefinition {
@@ -242,7 +244,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Git Show",
             description: "Show the patch for one commit ref (default HEAD).",
             safety: ToolSafety::Read,
-            profiles: &[ReadOnly, Edit],
+            profiles: &[],
             input_schema: git::git_show,
         },
         ToolDefinition {
@@ -250,7 +252,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Git Blame",
             description: "Show line-by-line authorship for one path, optionally bounded by start_line and end_line.",
             safety: ToolSafety::Read,
-            profiles: &[ReadOnly, Edit],
+            profiles: &[],
             input_schema: git::git_blame,
         },
         ToolDefinition {
@@ -258,7 +260,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Git Preflight",
             description: "Return staged_files, partially_staged_files, and the cached staged diff without committing.",
             safety: ToolSafety::Read,
-            profiles: &[Edit],
+            profiles: &[],
             input_schema: git::git_preflight,
         },
         ToolDefinition {
@@ -266,7 +268,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Git Stage",
             description: "Stage the given paths into the index.",
             safety: ToolSafety::WriteClosed,
-            profiles: &[Edit],
+            profiles: &[],
             input_schema: git::git_stage,
         },
         ToolDefinition {
@@ -274,7 +276,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Git Commit",
             description: "Commit the currently staged changes with the given message.",
             safety: ToolSafety::WriteClosed,
-            profiles: &[Edit],
+            profiles: &[],
             input_schema: git::git_commit,
         },
         ToolDefinition {
@@ -282,7 +284,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Git Restore",
             description: "Discard changes for the given paths, restoring them from the index or HEAD. Requires confirm=true because it overwrites local changes.",
             safety: ToolSafety::DestructiveClosed,
-            profiles: &[Edit],
+            profiles: &[],
             input_schema: git::git_restore,
         },
         ToolDefinition {
@@ -290,7 +292,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Git Push",
             description: "Push commits to a remote (default origin) and optional branch. This reaches the network and requires confirm=true, matching git_restore, because it is the only network-facing write.",
             safety: ToolSafety::WriteOpen,
-            // Excluded from `edit`: it is the only network-facing write.
+            // Full-only: network-facing write.
             profiles: &[],
             input_schema: git::git_push,
         },
@@ -299,8 +301,8 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Run Bash Command",
             description: "Run a Bash command as the CodeWeave OS user. This is trusted-client functionality, not a sandbox. When the configured foreground budget is enabled (default about 20s), commands that exceed it automatically continue in the background: the call returns status \"running\" with a run_id and detached:true. When that happens, do NOT re-issue the command — poll bash_status(run_id) until the status is terminal. Re-sending an identical command while it is still running returns the same run_id (deduplicated), not a second run. Output is capped at maxOutputChars (default 30000) and each run's default timeout is defaultTimeoutMs (default 120000). Use background:true for known long-running commands.",
             safety: ToolSafety::DestructiveOpen,
-            // Excluded from `edit`: edit profile is bash-free.
-            profiles: &[],
+            // Coding keeps validation-capable command execution; compatibility edit stays bash-free.
+            profiles: &[Coding],
             input_schema: bash::bash,
         },
         ToolDefinition {
@@ -308,7 +310,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Bash Run Status",
             description: "Return live or completed state and the retained output tail for a Bash run.",
             safety: ToolSafety::Read,
-            profiles: &[],
+            profiles: &[Coding],
             input_schema: bash::bash_status,
         },
         ToolDefinition {
@@ -316,7 +318,7 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Bash Run Output",
             description: "Page retained combined, stdout, or stderr output for a Bash run.",
             safety: ToolSafety::Read,
-            profiles: &[],
+            profiles: &[Coding],
             input_schema: bash::bash_output,
         },
         ToolDefinition {
@@ -324,12 +326,11 @@ pub fn registry() -> &'static [ToolDefinition] {
             title: "Cancel Bash Run",
             description: "Cancel a running background Bash run. Partial output is retained.",
             safety: ToolSafety::WriteClosed,
-            profiles: &[],
+            profiles: &[Coding],
             input_schema: bash::bash_cancel,
         },
     ]
 }
-
 /// Resolved, immutable view of which tools the running server exposes. Computed
 /// once at startup from `server.toolProfile` (+ optional custom include/exclude)
 /// and shared read-only through `AppState`.
@@ -432,8 +433,12 @@ pub fn resolve_access(
 mod tests {
     use super::*;
 
-    fn names_in(profile: Option<Profile>) -> Vec<String> {
-        let access = resolve_access(profile, &CustomSelection::default(), true).unwrap();
+    fn access(profile: Profile, bash_enabled: bool) -> ToolAccess {
+        resolve_access(Some(profile), &CustomSelection::default(), bash_enabled).unwrap()
+    }
+
+    fn names_in(profile: Profile) -> Vec<String> {
+        let access = access(profile, true);
         registry()
             .iter()
             .map(|tool| tool.name.to_owned())
@@ -441,58 +446,127 @@ mod tests {
             .collect()
     }
 
+    fn payload_bytes(profile: Profile) -> usize {
+        serde_json::to_vec(access(profile, true).list_payload())
+            .unwrap()
+            .len()
+    }
+
     #[test]
     fn full_profile_exposes_every_tool_in_registry_order() {
-        let full = names_in(Some(Profile::Full));
-        let expected: Vec<String> = registry().iter().map(|t| t.name.to_owned()).collect();
+        let full = names_in(Profile::Full);
+        let expected: Vec<String> = registry().iter().map(|tool| tool.name.to_owned()).collect();
         assert_eq!(full, expected);
         assert_eq!(full.len(), 26);
     }
 
     #[test]
-    fn read_only_profile_is_reads_plus_read_git() {
-        let read_only = names_in(Some(Profile::ReadOnly));
+    fn coding_profile_is_the_measured_core_surface() {
         assert_eq!(
-            read_only,
+            names_in(Profile::Coding),
             vec![
                 "workspace",
                 "code_retrieve",
-                "code_capabilities",
                 "code_intelligence",
+                "code_write",
+                "code_replace",
+                "code_replace_range",
+                "code_insert",
+                "code_delete",
+                "code_rename",
                 "code_preview",
+                "code_transaction",
                 "git_status",
                 "git_diff",
                 "git_log",
-                "git_show",
-                "git_blame",
+                "bash",
+                "bash_status",
+                "bash_output",
+                "bash_cancel",
             ]
         );
     }
 
     #[test]
-    fn edit_profile_excludes_bash_and_git_push() {
-        let edit = names_in(Some(Profile::Edit));
-        assert!(!edit.iter().any(|name| name.starts_with("bash")));
-        assert!(!edit.contains(&"git_push".to_owned()));
-        assert!(edit.contains(&"code_write".to_owned()));
-        assert!(edit.contains(&"git_commit".to_owned()));
+    fn compatibility_profiles_keep_bounded_surfaces() {
+        assert_eq!(
+            names_in(Profile::ReadOnly),
+            vec![
+                "workspace",
+                "code_retrieve",
+                "code_intelligence",
+                "code_preview",
+                "git_status",
+                "git_diff",
+                "git_log",
+            ]
+        );
+        assert_eq!(
+            names_in(Profile::Edit),
+            vec![
+                "workspace",
+                "code_retrieve",
+                "code_intelligence",
+                "code_write",
+                "code_replace",
+                "code_replace_range",
+                "code_insert",
+                "code_delete",
+                "code_rename",
+                "code_preview",
+                "code_transaction",
+                "git_status",
+                "git_diff",
+                "git_log",
+            ]
+        );
     }
 
     #[test]
-    fn edit_and_read_only_profiles_report_bash_unavailable() {
-        let edit = resolve_access(Some(Profile::Edit), &CustomSelection::default(), true).unwrap();
-        assert!(!edit.bash_tools_available());
-        let read_only =
-            resolve_access(Some(Profile::ReadOnly), &CustomSelection::default(), true).unwrap();
-        assert!(!read_only.bash_tools_available());
-        let full = resolve_access(Some(Profile::Full), &CustomSelection::default(), true).unwrap();
-        assert!(full.bash_tools_available());
+    fn uncommon_admin_and_destructive_git_tools_are_full_only() {
+        let full = access(Profile::Full, true);
+        let coding = access(Profile::Coding, true);
+        let read_only = access(Profile::ReadOnly, true);
+        let edit = access(Profile::Edit, true);
+        for name in [
+            "code_capabilities",
+            "git_show",
+            "git_blame",
+            "git_preflight",
+            "git_stage",
+            "git_commit",
+            "git_restore",
+            "git_push",
+        ] {
+            assert!(full.is_allowed(name), "{name} should remain in full");
+            assert!(!coding.is_allowed(name), "{name} leaked into coding");
+            assert!(!read_only.is_allowed(name), "{name} leaked into read-only");
+            assert!(!edit.is_allowed(name), "{name} leaked into edit");
+        }
     }
 
     #[test]
-    fn full_profile_with_bash_policy_disabled_reports_bash_unavailable() {
-        let full = resolve_access(Some(Profile::Full), &CustomSelection::default(), false).unwrap();
-        assert!(!full.bash_tools_available());
+    fn bash_availability_matches_profile_and_policy() {
+        assert!(access(Profile::Full, true).bash_tools_available());
+        assert!(access(Profile::Coding, true).bash_tools_available());
+        assert!(!access(Profile::ReadOnly, true).bash_tools_available());
+        assert!(!access(Profile::Edit, true).bash_tools_available());
+        assert!(!access(Profile::Full, false).bash_tools_available());
+        assert!(!access(Profile::Coding, false).bash_tools_available());
+    }
+
+    #[test]
+    fn coding_profile_reduces_visible_schema_footprint() {
+        let full = payload_bytes(Profile::Full);
+        let coding = payload_bytes(Profile::Coding);
+        let read_only = payload_bytes(Profile::ReadOnly);
+        let edit = payload_bytes(Profile::Edit);
+        eprintln!(
+            "tool_profile_schema_bytes full={full} coding={coding} read_only={read_only} edit={edit}"
+        );
+        assert!(coding < full);
+        assert!(read_only < coding);
+        assert!(edit < coding);
     }
 
     #[test]
@@ -530,8 +604,7 @@ mod tests {
 
     #[test]
     fn list_payload_shape_is_valid_and_flat() {
-        let access =
-            resolve_access(Some(Profile::Full), &CustomSelection::default(), true).unwrap();
+        let access = access(Profile::Full, true);
         let items = access.list_payload().as_array().unwrap();
         assert_eq!(items.len(), 26);
         for item in items {
@@ -554,6 +627,7 @@ mod tests {
     #[test]
     fn profile_parse_accepts_documented_names_only() {
         assert_eq!(Profile::parse("full"), Some(Profile::Full));
+        assert_eq!(Profile::parse("coding"), Some(Profile::Coding));
         assert_eq!(Profile::parse("read-only"), Some(Profile::ReadOnly));
         assert_eq!(Profile::parse("edit"), Some(Profile::Edit));
         assert_eq!(Profile::parse("nonsense"), None);

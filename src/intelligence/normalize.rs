@@ -4,6 +4,7 @@ use codeweave_rust::reference_service::{
     ReferencePosition, ReferenceRange, SemanticReferenceLocation,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -333,6 +334,7 @@ fn normalize_location_parts(
     canonical_root: &Path,
     item: &Value,
     encoding: PositionEncoding,
+    contents: &mut HashMap<PathBuf, String>,
 ) -> AppResult<(String, ReferenceRange)> {
     let uri = item
         .get("uri")
@@ -345,17 +347,22 @@ fn normalize_location_parts(
         .ok_or_else(|| AppError::new("INVALID_LSP_RESPONSE", "Location lacks range"))?;
     let path = uri_path(canonical_root, uri)?;
     let relative = workspace_relative_path(canonical_root, &path)?;
-    let content = fs::read_to_string(&path)?;
+    let content = match contents.entry(path.clone()) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(fs::read_to_string(&path)?)
+        }
+    };
     let start_line = range["start"]["line"].as_u64().unwrap_or(0) as usize;
     let end_line = range["end"]["line"].as_u64().unwrap_or(0) as usize;
     let start = utf16_character_from_server(
-        &content,
+        content,
         start_line,
         range["start"]["character"].as_u64().unwrap_or(0) as usize,
         encoding,
     )?;
     let end = utf16_character_from_server(
-        &content,
+        content,
         end_line,
         range["end"]["character"].as_u64().unwrap_or(0) as usize,
         encoding,
@@ -383,10 +390,12 @@ pub(crate) fn normalize_locations(
     encoding: PositionEncoding,
 ) -> AppResult<Vec<Value>> {
     let canonical_root = root.canonicalize()?;
+    let mut contents = HashMap::new();
     location_items(value)
         .into_iter()
         .map(|item| {
-            let (relative, range) = normalize_location_parts(&canonical_root, &item, encoding)?;
+            let (relative, range) =
+                normalize_location_parts(&canonical_root, &item, encoding, &mut contents)?;
             Ok(json!({
                 "path": relative,
                 "line": range.start.line,
@@ -405,10 +414,12 @@ pub(crate) fn normalize_reference_locations(
     encoding: PositionEncoding,
 ) -> AppResult<Vec<SemanticReferenceLocation>> {
     let canonical_root = root.canonicalize()?;
+    let mut contents = HashMap::new();
     location_items(value)
         .into_iter()
         .map(|item| {
-            let (path, range) = normalize_location_parts(&canonical_root, &item, encoding)?;
+            let (path, range) =
+                normalize_location_parts(&canonical_root, &item, encoding, &mut contents)?;
             Ok(SemanticReferenceLocation { path, range })
         })
         .collect()
@@ -438,6 +449,57 @@ mod tests {
             3
         );
         assert!(server_character_from_utf16(content, 1, 2, PositionEncoding::Utf8).is_err());
+    }
+
+    #[test]
+    fn location_normalization_reads_each_canonical_path_once_per_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let first_path = root.path().join("first.rs");
+        let second_path = root.path().join("second.rs");
+        fs::write(&first_path, "value\n").unwrap();
+        fs::write(&second_path, "other\n").unwrap();
+        let canonical_root = root.path().canonicalize().unwrap();
+        let first = json!({
+            "uri": path_uri(&first_path),
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 5}
+            }
+        });
+        let second = json!({
+            "uri": path_uri(&second_path),
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 5}
+            }
+        });
+        let mut contents = HashMap::new();
+
+        let initial = normalize_location_parts(
+            &canonical_root,
+            &first,
+            PositionEncoding::Utf16,
+            &mut contents,
+        )
+        .unwrap();
+        fs::write(&first_path, [0xff]).unwrap();
+        let cached = normalize_location_parts(
+            &canonical_root,
+            &first,
+            PositionEncoding::Utf16,
+            &mut contents,
+        )
+        .unwrap();
+        normalize_location_parts(
+            &canonical_root,
+            &second,
+            PositionEncoding::Utf16,
+            &mut contents,
+        )
+        .unwrap();
+
+        assert_eq!(cached, initial);
+        assert_eq!(contents.len(), 2);
     }
 
     #[test]

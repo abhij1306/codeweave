@@ -37,6 +37,14 @@ pub(super) fn line_offset(content: &str, line: usize) -> usize {
     content.len()
 }
 
+pub(super) fn char_boundary_at_or_before(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 pub(super) fn line_ending_label(content: &str) -> &'static str {
     let crlf = content.matches("\r\n").count();
     let lf = content.bytes().filter(|byte| *byte == b'\n').count() - crlf;
@@ -61,6 +69,36 @@ fn normalize_line_endings(text: &str, replacement: &str) -> String {
     text.replace("\r\n", "\n")
         .replace('\r', "\n")
         .replace('\n', replacement)
+}
+
+pub(super) fn preserve_terminal_line_ending(selected: &str, replacement: &str) -> String {
+    if replacement.is_empty() || replacement.ends_with('\n') || !selected.ends_with('\n') {
+        return replacement.to_owned();
+    }
+    let mut value = replacement.to_owned();
+    if selected.ends_with("\r\n") {
+        value.push_str("\r\n");
+    } else {
+        value.push('\n');
+    }
+    value
+}
+
+pub(super) fn matching_old_text(
+    content: &str,
+    selected: &str,
+    old: &str,
+    expected: usize,
+) -> (String, usize) {
+    let normalized = normalize_line_endings_for_content(content, old);
+    if normalized != old {
+        let normalized_count = selected.match_indices(&normalized).count();
+        if normalized_count == expected {
+            return (normalized, normalized_count);
+        }
+    }
+    let count = selected.match_indices(old).count();
+    (old.to_owned(), count)
 }
 
 pub(super) fn stale_snapshot(expected: &str, actual: &str) -> AppError {
@@ -111,13 +149,13 @@ pub(super) fn changes_without_independent_preconditions(changes: &[Value]) -> Ve
 pub(super) const MAX_OBSERVED_CHANGED_PATHS: usize = 30;
 pub(super) const MAX_CHANGED_PATH_GROUPS: usize = 20;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(super) struct ChangedPathGroup {
     pub path: String,
     pub count: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ChangedPathSummary {
     pub paths: Vec<String>,
     pub count: usize,

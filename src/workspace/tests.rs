@@ -958,7 +958,9 @@ fn run_change_detection_includes_new_mutations_to_already_dirty_files() {
         generation: generation + 1,
     });
 
-    let observed = actor.observed_run_changed_paths(&baseline, generation + 1, None, &dirty_files);
+    let mutations = actor.mutations.lock().iter().cloned().collect::<Vec<_>>();
+    let observed =
+        actor.observed_run_changed_paths(&mutations, &baseline, generation + 1, None, &dirty_files);
 
     assert_eq!(observed, HashSet::from(["existing.rs".to_owned()]));
 }
@@ -1214,6 +1216,12 @@ fn failed_write_does_not_leave_an_internal_write_marker() {
         .commit_plan("test-session", &plan, "failed-write")
         .unwrap_err();
     assert_eq!(error.0.code, "ATOMIC_WRITE_FAILED");
+    let details = error.0.details.as_ref().unwrap();
+    assert_eq!(details["failed_path"], "blocked");
+    assert_eq!(details["completed_before_failure"], json!([]));
+    assert_eq!(details["restored_paths"], json!([]));
+    assert_eq!(details["rollback_failures"], json!([]));
+    assert_eq!(details["manual_recovery_required"], false);
     assert!(!actor
         .internal_writes
         .lock()
@@ -1239,15 +1247,12 @@ fn journal_failure_rolls_back_applied_files_before_returning_error() {
         .unwrap_err();
 
     assert_eq!(error.0.code, "JOURNAL_COMMIT_FAILED");
-    assert_eq!(
-        error
-            .0
-            .details
-            .as_ref()
-            .unwrap()
-            .get("rollback_refresh_error"),
-        Some(&serde_json::Value::Null)
-    );
+    let details = error.0.details.as_ref().unwrap();
+    assert_eq!(details["completed_before_failure"], json!(["value.txt"]));
+    assert_eq!(details["restored_paths"], json!(["value.txt"]));
+    assert_eq!(details["rollback_failures"], json!([]));
+    assert_eq!(details["manual_recovery_required"], false);
+    assert_eq!(details["rollback_refresh_error"], serde_json::Value::Null);
     assert_eq!(
         fs::read_to_string(root.path().join("value.txt")).unwrap(),
         original

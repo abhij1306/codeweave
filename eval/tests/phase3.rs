@@ -13,7 +13,6 @@ const EXPECTED_SOURCE_LOC: usize = FILE_COUNT * LINES_PER_FILE;
 const DEFAULT_P95_GATE_MS: f64 = 250.0;
 
 #[test]
-#[ignore = "deterministic 300k-LOC fallback reference performance gate"]
 fn fallback_reference_300k_p95_stays_within_gate() {
     let base = unique_temp_dir("codeweave-phase3-300k");
     let root = base.join("repo");

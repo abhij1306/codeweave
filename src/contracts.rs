@@ -641,6 +641,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn error_code_registry_covers_every_variant() {
+        macro_rules! expected_variant_count {
+            ($($variant:path),+ $(,)?) => {{
+                fn assert_exhaustive(code: ErrorCode) {
+                    match code {
+                        $($variant => {}),+
+                    }
+                }
+                for code in ErrorCode::ALL {
+                    assert_exhaustive(code);
+                }
+                [$(stringify!($variant)),+].len()
+            }};
+        }
+
+        let expected = expected_variant_count!(
+            ErrorCode::MissingOperationField,
+            ErrorCode::InvalidOperationField,
+            ErrorCode::UnknownOperationField,
+            ErrorCode::UnsupportedRetrievalOperation,
+            ErrorCode::MissingChangeField,
+            ErrorCode::InvalidChangeField,
+            ErrorCode::UnknownChangeField,
+            ErrorCode::UnsupportedChangeKind,
+            ErrorCode::InvalidBashRequest,
+        );
+        assert_eq!(ErrorCode::ALL.len(), expected);
+    }
+
+    #[test]
     fn error_codes_are_unique() {
         let codes = ErrorCode::ALL
             .iter()

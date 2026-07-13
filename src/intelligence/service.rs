@@ -292,10 +292,6 @@ impl IntelligenceService {
             .unwrap_or(20)
             .min(200) as usize;
         let snapshot_id = self.snapshot_id.read().clone();
-        let target = {
-            let index = self.index.read();
-            ReferenceService::new(&index).resolve_position(&relative, line)?
-        };
 
         let semantic = self.worker_for(&path).map(|worker| {
             self.document_for(worker, &path)
@@ -311,35 +307,40 @@ impl IntelligenceService {
                     )?;
                     Ok((response, locations))
                 })
+                .and_then(|(response, locations)| {
+                    let target = {
+                        let index = self.index.read();
+                        ReferenceService::new(&index).resolve_position(&relative, line)?
+                    };
+                    Ok((response, locations, target))
+                })
         });
 
-        if let Some(Ok((response, locations))) = semantic.as_ref() {
-            let index = self.index.read();
-            let mut result = ReferenceService::new(&index).semantic(
-                &self.workspace_id,
-                &snapshot_id,
-                target,
-                locations.clone(),
-                max_results,
-                SemanticReferenceMetadata {
-                    freshness: "current",
-                    evidence_caveat: "Language-server locations were produced from a full-text synchronized document hash that still matches disk and the live index.",
-                },
-            )?;
-            if let Some(object) = result.as_object_mut() {
-                object.insert(
-                    "synchronization".to_owned(),
-                    Self::semantic_metadata(response),
-                );
+        match semantic {
+            Some(Ok((response, locations, target))) => {
+                let index = self.index.read();
+                let mut result = ReferenceService::new(&index).semantic(
+                    &self.workspace_id,
+                    &snapshot_id,
+                    target,
+                    locations,
+                    max_results,
+                    SemanticReferenceMetadata {
+                        freshness: "current",
+                        evidence_caveat: "Language-server locations were produced from a full-text synchronized document hash that still matches disk and the live index.",
+                    },
+                )?;
+                if let Some(object) = result.as_object_mut() {
+                    object.insert(
+                        "synchronization".to_owned(),
+                        Self::semantic_metadata(&response),
+                    );
+                }
+                Ok(result)
             }
-            return Ok(result);
+            Some(Err(error)) => self.reference_fallback(&relative, line, max_results, Some(error)),
+            None => self.reference_fallback(&relative, line, max_results, None),
         }
-
-        let reason = match semantic {
-            Some(Err(error)) => Some(error),
-            _ => None,
-        };
-        self.reference_fallback(&relative, line, max_results, reason)
     }
 
     fn reference_fallback(

@@ -80,13 +80,14 @@ pub(crate) fn workspace_edit_changes(
             after.replace_range(start..end, &text);
         }
         let relative = workspace_relative_path(&canonical_root, &path)?;
+        let expected_hash = codeweave_rust::index::content_hash(&before);
         output.push(json!({
             "kind": "replace",
             "path": relative,
             "old_text": before,
             "new_text": after,
             "expected_replacements": 1,
-            "expected_hash": codeweave_rust::index::content_hash(&fs::read_to_string(&path)?)
+            "expected_hash": expected_hash
         }));
     }
     Ok(output)
@@ -109,5 +110,9 @@ mod tests {
         let changes = workspace_edit_changes(root.path(), &edit, PositionEncoding::Utf8).unwrap();
         assert_eq!(changes[0]["kind"], "replace");
         assert!(changes[0]["new_text"].as_str().unwrap().contains("bistro"));
+        assert_eq!(
+            changes[0]["expected_hash"],
+            codeweave_rust::index::content_hash("def café():\n    return 1\n")
+        );
     }
 }

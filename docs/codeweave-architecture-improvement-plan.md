@@ -1017,6 +1017,8 @@ Exit:
 
 ## Phase 6 — evaluated default tool profile
 
+**Implementation status (2026-07-13): complete.** The non-default `coding` profile exposes 18 tools and reduces the serialized `tools/list` payload from 24,418 to 20,174 bytes (17.4%). ChatGPT and Claude both completed the reversible coding workflow with zero abandoned tasks and no need for a full-only tool. Claude required one client-side tool-loading retry and one correct stale-hash retry; its discovery layer did not surface `code_write`, although the production MCP `tools/list` independently confirmed all 18 tools. `full` remains the default; any default change belongs to a separate versioned release.
+
 Deliver:
 
 - run ChatGPT and Claude workflow suites against current profiles;
@@ -1032,6 +1034,8 @@ Exit:
 - no increase in tool calls or task failures.
 
 ## Phase 7 — state ownership and edit-engine simplification
+
+**Implementation status (2026-07-13): complete.** Bash attribution now has one `RunAttribution` owner and one mutex instead of separate baseline/completion maps; compatibility normalization lives in `src/compatibility.rs`; newline/range helpers live only in `workspace::util`; and commit progress, compensation, mutation persistence, and partial-commit reporting are isolated in `workspace::commit`. The workspace lock order is documented, concurrent terminal observers share one frozen attribution result, and the complete test/evaluation gates remain green. Retrieval quality was unchanged on both live fixture suites, and the deterministic 300k-LOC fallback-reference gate passed at 30.365 ms p95 against 250 ms. Cold/warm timing samples varied substantially between consecutive unchanged runs, so no performance-improvement or regression claim is made from those noisy samples.
 
 Deliver:
 

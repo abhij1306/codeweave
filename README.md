@@ -250,12 +250,13 @@ This execution surface is trusted-client functionality, not a sandbox. File tool
 
 `server.toolProfile` selects which tools the server advertises and accepts. It is resolved once at startup from a single tool registry that is the sole source of truth for every advertised tool:
 
-- `full` (default) — all 26 tools.
-- `read-only` — read/search/inspect only, including `workspace`, `code_retrieve`, `code_capabilities`, `code_intelligence`, `code_preview`, and the read-only git tools. No writes, no bash.
-- `edit` — read plus in-repo writes (`code_write`/`code_replace`/…/`code_transaction`, `git_stage`/`git_commit`/`git_restore`), but no `bash` and no network-facing `git_push`.
+- `full` (default) — all 26 tools. The default remains unchanged while the evaluated profile completes connector validation.
+- `coding` — the measured 18-tool coding surface: workspace/retrieval/intelligence, all narrow edit tools, preview/transaction, Git status/diff/log, and the complete Bash lifecycle. It excludes capability/admin tools and uncommon, staging, commit, restore, and push Git operations.
+- `read-only` — seven inspection tools: workspace, retrieval, intelligence, preview, and Git status/diff/log. No writes or Bash.
+- `edit` — the same inspection core plus in-repository file edits, but no Bash and no staging, commit, restore, or push.
 - `custom` — start from the full set and refine with `"tools": { "include": [...], "exclude": [...] }`. A non-empty `include` is an allowlist; `exclude` subtracts. Unknown tool names fail startup.
 
-A tool that exists but is not in the active profile returns a structured `TOOL_NOT_IN_PROFILE` error rather than being reported as unknown. Because edit `validate` commands run through bash, an edit that carries `validate` under a bash-free profile (or with `policy.bash.enabled: false`) is rejected up front with `VALIDATE_UNAVAILABLE` instead of silently skipping validation.
+A tool that exists but is not in the active profile returns a structured `TOOL_NOT_IN_PROFILE` error rather than being reported as unknown. Because edit validation commands run through Bash, a write carrying `validate` under a Bash-free profile—or with `policy.bash.enabled: false`—is rejected up front with `VALIDATE_UNAVAILABLE` instead of silently skipping validation.
 
 `server.idleTimeoutMs` defaults to `5000` and bounds how long an **idle keep-alive TCP connection** stays open. This is independent of request latency: even when every `POST /mcp` returns in milliseconds, Hyper keeps the underlying socket open for reuse, so a tunnel or connector (ngrok, the OpenAI connector) holds it until its own deadline — often ~90 seconds — and reports that as the **Connections** p50/p90, not the request duration. CodeWeave applies `idleTimeoutMs` as Hyper's `header_read_timeout` (the equivalent of Uvicorn's `timeout_keep_alive`, which is why Serena's dashboard reads ~5s): an idle connection is closed after the timeout, while an in-flight request — including a long foreground `bash` POST — is never interrupted, because the timeout resets per request. Set it to `0` to disable the bound and keep connections open until the peer closes them.
 

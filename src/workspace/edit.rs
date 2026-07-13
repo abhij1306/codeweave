@@ -1,12 +1,9 @@
-use super::io_helpers::{
-    atomic_write, diff_stat, read_optional, remove_if_exists, render_diff, restore_one,
-};
-use super::journal::{
-    open_journal, rotate_journal_now, trim_journal, MutationRecord, MAX_JOURNAL_BYTES,
-};
+use super::io_helpers::{diff_stat, read_optional, render_diff};
+use super::journal::MutationRecord;
 use super::util::{
-    changes_without_independent_preconditions, line_offset, line_range_bytes,
-    normalize_line_endings_for_content, stale_snapshot_for_paths,
+    changes_without_independent_preconditions, char_boundary_at_or_before, line_offset,
+    line_range_bytes, matching_old_text, normalize_line_endings_for_content,
+    preserve_terminal_line_ending, stale_snapshot_for_paths,
 };
 use super::validation::ValidationOutcome;
 use super::WorkspaceActor;
@@ -15,13 +12,9 @@ use crate::index::{content_hash, decode_handle, CodeIndex};
 use crate::model::{bool_value, required_str, string_list, usize_value, AppError, AppResult};
 use crate::security::validate_relative;
 use crate::symbols::{extract_symbols, parse_has_error};
-use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{Seek, SeekFrom, Write};
-use std::path::PathBuf;
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -687,263 +680,6 @@ impl WorkspaceActor {
         }
         Ok(())
     }
-
-    pub(super) fn commit_plan(
-        &self,
-        session_id: &str,
-        plan: &[PlannedFile],
-        request_id: &str,
-    ) -> AppResult<Vec<MutationRecord>> {
-        let generation = self.generation() + 1;
-        let timestamp = Utc::now();
-        let records: Vec<MutationRecord> = plan
-            .iter()
-            .map(|item| MutationRecord {
-                mutation_id: MutationRecord::new_id(),
-                session_id: session_id.to_owned(),
-                path: item.path.clone(),
-                before_hash: item.before.as_ref().map(|value| content_hash(value)),
-                after_hash: item.after.as_ref().map(|value| content_hash(value)),
-                source: "mcp_edit".to_owned(),
-                request_id: request_id.to_owned(),
-                timestamp,
-                generation,
-            })
-            .collect();
-        let mut completed_count = 0usize;
-        for item in plan {
-            let absolute = self.root.join(&item.path);
-            self.internal_writes
-                .lock()
-                .insert(absolute.clone(), Instant::now());
-            let result = match &item.after {
-                Some(content) => atomic_write(&self.root, &item.path, content),
-                None => remove_if_exists(&self.root, &item.path),
-            };
-            if let Err(error) = result {
-                self.internal_writes.lock().remove(&absolute);
-                let mut restored_paths = Vec::new();
-                let mut rollback_failures = Vec::new();
-                for rollback in plan[..completed_count].iter().rev() {
-                    self.internal_writes
-                        .lock()
-                        .insert(self.root.join(&rollback.path), Instant::now());
-                    match restore_one(&self.root, rollback) {
-                        Ok(()) => restored_paths.push(rollback.path.clone()),
-                        Err(rollback_error) => rollback_failures.push(json!({
-                            "path": rollback.path,
-                            "error": rollback_error.to_string()
-                        })),
-                    }
-                }
-                let manual_recovery_required = !rollback_failures.is_empty();
-                let code = if manual_recovery_required {
-                    "PARTIAL_COMMIT"
-                } else {
-                    "ATOMIC_WRITE_FAILED"
-                };
-                return Err(AppError::details(
-                    code,
-                    error.to_string(),
-                    json!({
-                        "failed_path": item.path,
-                        "completed_before_failure": plan[..completed_count].iter().map(|value| &value.path).collect::<Vec<_>>(),
-                        "restored_paths": restored_paths,
-                        "rollback_failures": rollback_failures,
-                        "manual_recovery_required": manual_recovery_required
-                    }),
-                ));
-            }
-            completed_count += 1;
-        }
-        let paths: HashSet<PathBuf> = plan.iter().map(|item| self.root.join(&item.path)).collect();
-        self.index
-            .write()
-            .refresh_paths(
-                &self.root,
-                &paths,
-                self.policy.max_file_bytes,
-                &self.exclusions,
-            )
-            .map_err(|error| {
-                self.failed_after_apply(
-                    plan,
-                    completed_count,
-                    "INDEX_REFRESH_FAILED",
-                    error.to_string(),
-                )
-            })?;
-        self.persist_mutations(&records).map_err(|error| {
-            self.failed_after_apply(
-                plan,
-                completed_count,
-                "JOURNAL_COMMIT_FAILED",
-                error.to_string(),
-            )
-        })?;
-        self.refresh_repo_status();
-        self.generation.store(generation, Ordering::Release);
-        self.recompute_snapshot();
-        self.publish_mutations(&records);
-        Ok(records)
-    }
-
-    fn failed_after_apply(
-        &self,
-        plan: &[PlannedFile],
-        completed_count: usize,
-        failure_code: &'static str,
-        message: String,
-    ) -> AppError {
-        let completed = &plan[..completed_count.min(plan.len())];
-        let mut restored_paths = Vec::new();
-        let mut rollback_failures = Vec::new();
-        for item in completed.iter().rev() {
-            self.internal_writes
-                .lock()
-                .insert(self.root.join(&item.path), Instant::now());
-            match restore_one(&self.root, item) {
-                Ok(()) => restored_paths.push(item.path.clone()),
-                Err(error) => rollback_failures.push(json!({
-                    "path": item.path,
-                    "error": error.to_string()
-                })),
-            }
-        }
-
-        let paths: HashSet<PathBuf> = completed
-            .iter()
-            .map(|item| self.root.join(&item.path))
-            .collect();
-        let rollback_refresh_error = if paths.is_empty() {
-            None
-        } else {
-            match self.index.write().refresh_paths(
-                &self.root,
-                &paths,
-                self.policy.max_file_bytes,
-                &self.exclusions,
-            ) {
-                Ok(_) => None,
-                Err(error) => {
-                    self.pending_paths.lock().extend(paths);
-                    self.needs_reconcile.store(true, Ordering::Release);
-                    Some(error.0)
-                }
-            }
-        };
-
-        let manual_recovery_required = !rollback_failures.is_empty();
-        AppError::details(
-            if manual_recovery_required {
-                "PARTIAL_COMMIT"
-            } else {
-                failure_code
-            },
-            message,
-            json!({
-                "completed_before_failure": completed.iter().map(|item| &item.path).collect::<Vec<_>>(),
-                "restored_paths": restored_paths,
-                "rollback_failures": rollback_failures,
-                "manual_recovery_required": manual_recovery_required,
-                "rollback_refresh_error": rollback_refresh_error
-            }),
-        )
-    }
-
-    fn persist_mutations(&self, records: &[MutationRecord]) -> AppResult<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        let mut encoded = Vec::new();
-        for record in records {
-            serde_json::to_writer(&mut encoded, record).map_err(|error| {
-                AppError::details(
-                    "JOURNAL_SERIALIZATION_FAILED",
-                    error.to_string(),
-                    json!({"mutation_id": record.mutation_id}),
-                )
-            })?;
-            encoded.push(b'\n');
-        }
-
-        let mut slot = self.journal_file.lock();
-        let mut file = slot
-            .take()
-            .ok_or_else(|| AppError::new("JOURNAL_UNAVAILABLE", "Mutation journal is not open"))?;
-        let current_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-        if current_len > 0 && current_len.saturating_add(encoded.len() as u64) > MAX_JOURNAL_BYTES {
-            if let Err(error) = file.flush() {
-                *slot = Some(file);
-                return Err(AppError::details(
-                    "JOURNAL_FLUSH_FAILED",
-                    error.to_string(),
-                    json!({}),
-                ));
-            }
-            drop(file);
-            if let Err(error) = rotate_journal_now(&self.journal_path) {
-                *slot = open_journal(&self.journal_path).ok();
-                return Err(error);
-            }
-            file = match open_journal(&self.journal_path) {
-                Ok(file) => file,
-                Err(error) => {
-                    let archive = self.journal_path.with_file_name("mutations.previous.jsonl");
-                    if self.journal_path.exists()
-                        || fs::rename(&archive, &self.journal_path).is_ok()
-                    {
-                        *slot = open_journal(&self.journal_path).ok();
-                    }
-                    return Err(AppError::details(
-                        "JOURNAL_OPEN_FAILED",
-                        error.to_string(),
-                        json!({"path": self.journal_path}),
-                    ));
-                }
-            };
-        }
-
-        let original_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-        if let Err(error) = file
-            .seek(SeekFrom::End(0))
-            .and_then(|_| file.write_all(&encoded))
-            .and_then(|_| file.flush())
-        {
-            let recovery_error = file
-                .set_len(original_len)
-                .and_then(|_| file.flush())
-                .err()
-                .map(|recovery| recovery.to_string());
-            *slot = Some(file);
-            return Err(AppError::details(
-                if recovery_error.is_some() {
-                    "JOURNAL_RECOVERY_FAILED"
-                } else {
-                    "JOURNAL_WRITE_FAILED"
-                },
-                error.to_string(),
-                json!({
-                    "original_len": original_len,
-                    "recovery_error": recovery_error
-                }),
-            ));
-        }
-        *slot = Some(file);
-        Ok(())
-    }
-
-    fn publish_mutations(&self, records: &[MutationRecord]) {
-        let mut journal = self.mutations.lock();
-        journal.extend(records.iter().cloned());
-        trim_journal(&mut journal);
-    }
-
-    pub(super) fn record_mutations(&self, records: &[MutationRecord]) -> AppResult<()> {
-        self.persist_mutations(records)?;
-        self.publish_mutations(records);
-        Ok(())
-    }
 }
 
 fn put_plan(
@@ -964,39 +700,6 @@ fn put_plan(
             },
         );
     }
-}
-
-fn char_boundary_at_or_before(value: &str, mut index: usize) -> usize {
-    index = index.min(value.len());
-    while index > 0 && !value.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
-fn preserve_terminal_line_ending(selected: &str, replacement: &str) -> String {
-    if replacement.is_empty() || replacement.ends_with('\n') || !selected.ends_with('\n') {
-        return replacement.to_owned();
-    }
-    let mut value = replacement.to_owned();
-    if selected.ends_with("\r\n") {
-        value.push_str("\r\n");
-    } else {
-        value.push('\n');
-    }
-    value
-}
-
-fn matching_old_text(content: &str, selected: &str, old: &str, expected: usize) -> (String, usize) {
-    let normalized = normalize_line_endings_for_content(content, old);
-    if normalized != old {
-        let normalized_count = selected.match_indices(&normalized).count();
-        if normalized_count == expected {
-            return (normalized, normalized_count);
-        }
-    }
-    let count = selected.match_indices(old).count();
-    (old.to_owned(), count)
 }
 
 #[cfg(test)]

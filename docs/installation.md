@@ -112,7 +112,7 @@ Do not commit `config.json` or `.mcp-token`.
 
 The token is an internal HTTP origin credential for the CodeWeave server. It is not an LLM API key and should not be entered into ChatGPT, Claude, or another AI client.
 
-`server.toolProfile` selects which tools the server advertises: `full` (default, all tools), `read-only` (read/search/inspect and read-only git only), `edit` (adds writes, no `bash` or `git_push`), or `custom` (refine the full set with `server.tools.include`/`exclude`). It is resolved once at startup; an unknown profile or an unknown tool name in a custom list fails startup with an actionable error. See the configuration reference in the README and `docs/tools.md`.
+`server.toolProfile` selects which tools the server advertises: `full` (default, all tools), `coding` (the evaluated 18-tool coding surface with Bash validation), `read-only` (seven inspection tools), `edit` (inspection plus file writes but no Bash), or `custom` (refine the full set with `server.tools.include`/`exclude`). Capability/admin tools and uncommon, staging, commit, restore, and push Git tools remain `full`-only. The profile is resolved once at startup; an unknown profile or custom tool name fails startup with an actionable error. See the configuration reference in the README and `docs/tools.md`.
 
 ## Run
 

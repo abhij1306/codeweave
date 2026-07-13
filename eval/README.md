@@ -35,11 +35,11 @@ enclosing symbol.
 
 ## 300k fallback reference gate
 
-The scale fixture is ignored during routine unit tests because it creates and
-scans a deterministic 300,000-source-LOC repository. Run it explicitly with:
+The scale fixture creates and scans a deterministic 300,000-source-LOC repository.
+It runs in the normal test suite and can also be run explicitly with:
 
 ```sh
-cargo test -p eval --test phase3 -- --ignored --nocapture
+cargo test -p eval --test phase3 -- --nocapture
 ```
 
 The initial p95 gate is 250 ms and can be overridden for a release environment

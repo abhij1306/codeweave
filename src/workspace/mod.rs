@@ -1,9 +1,11 @@
+mod commit;
 mod edit;
 mod fetch;
 mod git;
 mod io_helpers;
 mod journal;
 mod retrieve;
+mod run_attribution;
 mod util;
 mod validation;
 
@@ -11,7 +13,8 @@ mod validation;
 use git::validated_push_target;
 pub use journal::MutationRecord;
 use journal::{load_journal, open_journal, rotate_journal_if_needed};
-use util::{summarize_changed_paths, ChangedPathSummary};
+use run_attribution::{RunAttribution, RunBaseline};
+use util::{char_boundary_at_or_before, summarize_changed_paths, ChangedPathSummary};
 
 use crate::bash::{BashSupervisor, StartRequest};
 use crate::contracts;
@@ -44,9 +47,10 @@ const INSTRUCTION_INLINE_CAP: usize = 4_096;
 
 pub struct WorkspaceActor {
     // Lock ordering for code that needs more than one guard:
-    // write_lock -> reconcile_lock -> pending_paths -> index -> repo_status.
-    // internal_writes, mutations, and journal_file are terminal locks and must not
-    // be held while acquiring another workspace lock.
+    // write_lock -> reconcile_lock -> pending_paths -> index -> repo_status -> snapshot_id.
+    // run_attribution, internal_writes, mutations, journal_file, and _watcher are
+    // isolated owner locks. Capture their data and release the guard before
+    // acquiring another workspace lock.
     pub id: String,
     pub name: String,
     root: PathBuf,
@@ -75,42 +79,10 @@ pub struct WorkspaceActor {
     journal_file: Mutex<Option<fs::File>>,
     journal_path: PathBuf,
     bash: BashSupervisor,
-    run_generations: Arc<Mutex<HashMap<String, RunBaseline>>>,
-    run_completions: Arc<Mutex<HashMap<String, RunCompletion>>>,
+    run_attribution: Arc<RunAttribution>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
     open_diagnostics: Value,
     _watcher: Mutex<RecommendedWatcher>,
-}
-
-#[derive(Debug, Clone)]
-struct RunBaseline {
-    generation: u64,
-    dirty_files: HashSet<String>,
-    completion: Option<RunCompletion>,
-    frozen: Option<FrozenRunAttribution>,
-}
-
-#[derive(Debug, Clone)]
-struct RunCompletion {
-    generation: u64,
-    ended_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone)]
-struct FrozenRunAttribution {
-    generation: u64,
-    changed: ChangedPathSummary,
-}
-
-impl RunBaseline {
-    fn new(generation: u64, dirty_files: HashSet<String>) -> Self {
-        Self {
-            generation,
-            dirty_files,
-            completion: None,
-            frozen: None,
-        }
-    }
 }
 
 impl WorkspaceActor {
@@ -224,17 +196,15 @@ impl WorkspaceActor {
             .unwrap_or(1);
         generation.store(persisted_generation.max(1), Ordering::Release);
         let journal_file = open_journal(&journal_path)?;
-        let run_completions = Arc::new(Mutex::new(HashMap::new()));
+        let run_attribution = Arc::new(RunAttribution::new());
         let completion_generation = generation.clone();
-        let completion_store = run_completions.clone();
+        let completion_attribution = Arc::clone(&run_attribution);
         let bash = BashSupervisor::new(workspace_cache, policy.clone())?;
         bash.set_completion_observer(Arc::new(move |run_id, ended_at| {
-            completion_store.lock().insert(
-                run_id.to_owned(),
-                RunCompletion {
-                    generation: completion_generation.load(Ordering::Acquire),
-                    ended_at,
-                },
+            completion_attribution.record_completion(
+                run_id,
+                completion_generation.load(Ordering::Acquire),
+                ended_at,
             );
         }));
         let journal_ms = journal_started.elapsed().as_millis();
@@ -274,8 +244,7 @@ impl WorkspaceActor {
             journal_file: Mutex::new(Some(journal_file)),
             journal_path,
             bash,
-            run_generations: Arc::new(Mutex::new(HashMap::new())),
-            run_completions,
+            run_attribution,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             open_diagnostics,
             _watcher: Mutex::new(watcher),
@@ -420,23 +389,24 @@ impl WorkspaceActor {
             .filter(|path| changed_set.contains(path))
             .collect();
         if !external.is_empty() {
-            let mut known = self.external_changed.lock();
-            let mut records = Vec::new();
-            for path in external {
-                known.insert(path.clone());
-                let after_hash = self.index.read().get(&path).map(|file| file.hash.clone());
-                records.push(MutationRecord {
-                    mutation_id: MutationRecord::new_id(),
-                    session_id: "external".to_owned(),
-                    path,
-                    before_hash: None,
-                    after_hash,
-                    source: "external".to_owned(),
-                    request_id: "watcher".to_owned(),
-                    timestamp: Utc::now(),
-                    generation,
-                });
-            }
+            let records = {
+                let index = self.index.read();
+                external
+                    .iter()
+                    .map(|path| MutationRecord {
+                        mutation_id: MutationRecord::new_id(),
+                        session_id: "external".to_owned(),
+                        path: path.clone(),
+                        before_hash: None,
+                        after_hash: index.get(path).map(|file| file.hash.clone()),
+                        source: "external".to_owned(),
+                        request_id: "watcher".to_owned(),
+                        timestamp: Utc::now(),
+                        generation,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            self.external_changed.lock().extend(external);
             self.record_mutations(&records)?;
         }
         if !changed.is_empty() || head_changed {
@@ -478,7 +448,8 @@ impl WorkspaceActor {
 
     fn recompute_snapshot(&self) {
         let head = self.repo_status.read().head.clone();
-        *self.snapshot_id.write() = self.index.write().snapshot_id(&head);
+        let snapshot = self.index.write().snapshot_id(&head);
+        *self.snapshot_id.write() = snapshot;
     }
 
     fn read_reconcile_pending(&self) -> bool {
@@ -813,15 +784,8 @@ impl WorkspaceActor {
                 run_startup_ms = Some(run_started.elapsed().as_millis());
                 if let Some(run_id) = value.get("run_id").and_then(Value::as_str) {
                     let retained = self.bash.retained_run_ids();
-                    let mut generations = self.run_generations.lock();
-                    generations.retain(|known_run, _| retained.contains(known_run));
-                    self.run_completions
-                        .lock()
-                        .retain(|known_run, _| retained.contains(known_run));
-                    let completion = self.run_completions.lock().remove(run_id);
-                    let mut baseline = RunBaseline::new(before, before_dirty);
-                    baseline.completion = completion;
-                    generations.insert(run_id.to_owned(), baseline);
+                    self.run_attribution
+                        .start_run(run_id, before, before_dirty, &retained);
                 }
                 value
             }
@@ -906,64 +870,27 @@ impl WorkspaceActor {
                 .map(|status| !matches!(status, "queued" | "running" | "cancelling"))
                 .unwrap_or(true);
             let result_ended_at = run_result_ended_at(&result);
-            let (start_generation, attribution_generation, changed) = {
-                let completion = self.run_completions.lock().remove(&run_id);
-                let mut generations = self.run_generations.lock();
-                let baseline = generations
-                    .entry(run_id.clone())
-                    .or_insert_with(|| RunBaseline::new(self.generation(), current_dirty.clone()));
-                if baseline.completion.is_none() {
-                    baseline.completion = completion;
-                }
-                if terminal && baseline.completion.is_none() {
-                    if let Some(ended_at) = result_ended_at {
-                        baseline.completion = Some(RunCompletion {
-                            generation: self.generation(),
-                            ended_at,
-                        });
-                    }
-                }
-                if terminal {
-                    if baseline.frozen.is_none() {
-                        let completion =
-                            baseline
-                                .completion
-                                .clone()
-                                .unwrap_or_else(|| RunCompletion {
-                                    generation: self.generation(),
-                                    ended_at: result_ended_at.unwrap_or_else(Utc::now),
-                                });
-                        let baseline_snapshot = baseline.clone();
-                        let paths = self.observed_run_changed_paths(
-                            &baseline_snapshot,
-                            completion.generation,
-                            Some(&completion.ended_at),
-                            &current_dirty,
-                        );
-                        baseline.frozen = Some(FrozenRunAttribution {
-                            generation: completion.generation,
-                            changed: summarize_changed_paths(paths),
-                        });
-                    }
-                    let frozen = baseline
-                        .frozen
-                        .clone()
-                        .expect("terminal run attribution is frozen");
-                    (baseline.generation, frozen.generation, frozen.changed)
-                } else {
-                    let paths = self.observed_run_changed_paths(
+            let current_generation = self.generation();
+            let mutation_snapshot = self.mutations.lock().iter().cloned().collect::<Vec<_>>();
+            let attribution = self.run_attribution.observe(
+                &run_id,
+                current_generation,
+                current_dirty,
+                terminal,
+                result_ended_at,
+                |baseline, end_generation, ended_at, current_dirty| {
+                    self.observed_run_changed_paths(
+                        &mutation_snapshot,
                         baseline,
-                        self.generation(),
-                        None,
-                        &current_dirty,
-                    );
-                    (
-                        baseline.generation,
-                        self.generation(),
-                        summarize_changed_paths(paths),
+                        end_generation,
+                        ended_at,
+                        current_dirty,
                     )
-                }
-            };
+                },
+            );
+            let start_generation = attribution.start_generation;
+            let attribution_generation = attribution.attribution_generation;
+            let changed = attribution.changed;
             if let Some(object) = result.as_object_mut() {
                 object.insert(
                     "workspace_generation_before".to_owned(),
@@ -1006,14 +933,13 @@ impl WorkspaceActor {
 
     fn observed_run_changed_paths(
         &self,
+        mutations: &[MutationRecord],
         baseline: &RunBaseline,
         end_generation: u64,
         ended_at: Option<&DateTime<Utc>>,
         current_dirty: &HashSet<String>,
     ) -> HashSet<String> {
-        let mutation_paths: HashSet<String> = self
-            .mutations
-            .lock()
+        let mutation_paths: HashSet<String> = mutations
             .iter()
             .filter(|mutation| {
                 mutation.generation > baseline.generation
@@ -1079,14 +1005,6 @@ pub(super) fn add_phase_metrics(value: &mut Value, phases: &[(&str, u128)]) {
             ),
         );
     }
-}
-
-fn char_boundary_at_or_before(value: &str, mut index: usize) -> usize {
-    index = index.min(value.len());
-    while index > 0 && !value.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 #[cfg(test)]

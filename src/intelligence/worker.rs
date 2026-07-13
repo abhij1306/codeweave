@@ -387,7 +387,9 @@ impl LspWorker {
             .map_err(|_| {
                 AppError::new("LSP_WORKER_STOPPED", "Language-server worker has stopped")
             })?;
-        let wait = self.timeout.saturating_mul(2) + Duration::from_secs(2);
+        // A restart cycle can spend one timeout initializing and one timeout on the
+        // request for each of two attempts. Keep the existing fixed scheduling buffer.
+        let wait = self.timeout.saturating_mul(4) + Duration::from_secs(2);
         response_rx.recv_timeout(wait).map_err(|error| {
             AppError::details(
                 "LSP_TIMEOUT",

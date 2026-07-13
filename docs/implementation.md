@@ -54,12 +54,21 @@ Every advertised tool is defined once in the tool registry (`src/tools/`), which
 
 `server.toolProfile` is resolved once at startup into an immutable `ToolAccess` stored in `AppState`:
 
-- `full` (default) exposes every tool.
-- `read-only` exposes read/search/inspect tools and the read-only git tools only.
-- `edit` adds in-repo writes but excludes `bash` and the network-facing `git_push`.
+- `full` (default) exposes every tool and remains unchanged for compatibility.
+- `coding` exposes the measured 18-tool coding surface: repository context, retrieval/intelligence, narrow and transactional edits, Git status/diff/log, and the full Bash lifecycle.
+- `read-only` exposes seven inspection tools: workspace, retrieval, intelligence, preview, and Git status/diff/log.
+- `edit` adds file writes to the inspection core but excludes Bash and all full-only Git administration.
 - `custom` starts from the full set and applies `server.tools.include` (allowlist when non-empty) then `server.tools.exclude`. An unknown tool name in either list fails startup.
 
-`tools/list` returns only the tools in the active profile. A call to a real tool that the profile does not expose returns a structured `TOOL_NOT_IN_PROFILE` error, distinct from the hard "unknown tool" error for a name not in the registry. Because edit `validate` commands execute through bash, `ToolAccess` reports `bash_tools_available` only when the bash tools are both in the profile and enabled by `policy.bash.enabled`; when they are not, an edit that carries a non-empty `validate` list is rejected with `VALIDATE_UNAVAILABLE` before any mutation, rather than silently dropping validation.
+`tools/list` returns only the tools in the active profile. A call to a real tool that the profile does not expose returns a structured `TOOL_NOT_IN_PROFILE` error, distinct from the hard "unknown tool" error for a name not in the registry. `ToolAccess` reports `bash_tools_available` only when every Bash lifecycle tool is present and `policy.bash.enabled` is true. A write carrying non-empty `validate` commands under a Bash-free profile is rejected with `VALIDATE_UNAVAILABLE` before mutation rather than silently dropping validation.
+
+## State ownership and compatibility
+
+`src/compatibility.rs` is the only public request-normalization boundary. It strips the accepted legacy repository-routing fields, ignores the deprecated rollback field, maps narrow edit tools onto the transaction language, assigns Git actions, and rejects validation commands when the active profile cannot execute Bash. Transport and workspace code consume the normalized request rather than carrying additional compatibility branches.
+
+Bash run attribution is owned by `workspace::run_attribution::RunAttribution`. One mutex protects baselines, completions that arrive before the start response is recorded, and frozen terminal attribution. Workspace mutation records are copied before attribution begins, so the attribution lock is never nested with the mutation journal lock. Concurrent terminal status requests return the same frozen generation and changed-path summary.
+
+The workspace lock order is `write_lock -> reconcile_lock -> pending_paths -> index -> repo_status -> snapshot_id`. Run attribution, internal-write markers, mutation publication, journal I/O, and the watcher handle are isolated owner locks; callers capture their data and release them before acquiring another workspace lock.
 
 ## Editing model
 
@@ -74,7 +83,7 @@ CodeWeave exposes narrow write tools:
 
 For coordinated changes, `code_preview` accepts a `changes` array and returns the planned diff without writing files. `code_transaction` accepts the same `changes` array and applies it through the same edit engine.
 
-The internal edit pipeline plans changes, checks preconditions, runs syntax preflight, writes atomically, records mutations, and runs optional Bash validation commands sequentially from the workspace root. Validation failures are reported while preserving the applied edit. Reverse recovery is reserved for internal commit failures such as a partial file write, index refresh failure, or mutation-journal failure.
+The internal edit pipeline plans changes, checks preconditions, runs syntax preflight, writes atomically, records mutations, and runs optional Bash validation commands sequentially from the workspace root. `workspace::commit` owns commit progress, reverse compensation, index refresh, mutation persistence, and publication. Both file-write failures and post-write index/journal failures use the same compensation routine. Validation failures are reported while preserving the applied edit; internal commit failures retain complete `completed_before_failure`, `restored_paths`, `rollback_failures`, `manual_recovery_required`, and `rollback_refresh_error` reporting.
 
 Existing-file changes require a current snapshot, expected content hash, or provenance handle.
 

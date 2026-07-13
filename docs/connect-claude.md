@@ -36,4 +36,6 @@ Claude only receives the public HTTPS Connector URL.
 
 ## Verify safely
 
-Start with workspace summary, search, and exact reads against a disposable repository before allowing edits, Git actions, or commands.
+For the Phase 6 connector evaluation, set `server.toolProfile` to `coding`, restart CodeWeave, and reconnect the Claude Connector. The `coding` profile includes repository inspection, file edits, preview/transaction, Git status/diff/log, and Bash validation, while capability/admin, staging, commit, restore, and push tools remain hidden.
+
+Run the reversible workflow in `docs/tool-profile-evaluation.md` using temporary `.ai-bridge/claude-phase6-*` files. Record the visible tool set, calls and retries, malformed calls, task failures, semantic/fallback evidence, and whether final Git status matches the initial state. Do not stage, commit, restore, or push during this test.
