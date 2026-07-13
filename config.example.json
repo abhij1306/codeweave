@@ -35,6 +35,20 @@
   "index": {
     "ranking": "v1"
   },
+  "intelligence": {
+    "python": {
+      "enabled": false,
+      "command": "basedpyright-langserver",
+      "args": ["--stdio"],
+      "timeoutMs": 10000
+    },
+    "typescript": {
+      "enabled": false,
+      "command": "typescript-language-server",
+      "args": ["--stdio"],
+      "timeoutMs": 10000
+    }
+  },
   "policy": {
     "maxFileBytes": 2000000,
     "maxContextChars": 50000,

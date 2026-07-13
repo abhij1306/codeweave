@@ -184,6 +184,7 @@ impl WorkspaceActor {
             }
             "symbol" => self.fetch_symbol(
                 value,
+                item.get("path").and_then(Value::as_str),
                 remaining,
                 usize_value(item, "context_lines", 0).min(200),
                 bool_value(item, "include_imports", false),
@@ -238,18 +239,58 @@ impl WorkspaceActor {
     fn fetch_symbol(
         &self,
         symbol_name: &str,
+        requested_path: Option<&str>,
         limit: usize,
         context_lines: usize,
         include_imports: bool,
     ) -> AppResult<Value> {
+        let (qualified_path, symbol_name) = match symbol_name.rsplit_once("::") {
+            Some((path, name)) if !path.is_empty() && !name.is_empty() => (Some(path), name),
+            _ => (None, symbol_name),
+        };
+        let requested_path = requested_path.or(qualified_path);
         let index = self.index.read();
-        let (path, symbol, _) = index.find_symbol(None, symbol_name).ok_or_else(|| {
-            AppError::details(
+        let candidates = index.find_symbols(requested_path, symbol_name);
+        if candidates.is_empty() {
+            return Err(AppError::details(
                 "SYMBOL_NOT_FOUND",
                 "Symbol not found",
-                json!({"symbol": symbol_name}),
-            )
-        })?;
+                json!({"symbol": symbol_name, "path": requested_path}),
+            ));
+        }
+        if candidates.len() > 1 {
+            let candidates = candidates
+                .into_iter()
+                .take(20)
+                .map(|(path, symbol, hash)| {
+                    let handle = encode_handle(&RangeHandle {
+                        version: 1,
+                        workspace_id: self.id.clone(),
+                        path: path.clone(),
+                        start_line: symbol.start_line,
+                        end_line: symbol.end_line,
+                        content_hash: hash,
+                        symbol: Some(symbol.name.clone()),
+                    })
+                    .ok();
+                    json!({
+                        "path": path,
+                        "symbol": symbol.name,
+                        "kind": symbol.kind,
+                        "start_line": symbol.start_line,
+                        "end_line": symbol.end_line,
+                        "signature": symbol.signature,
+                        "handle": handle,
+                    })
+                })
+                .collect::<Vec<_>>();
+            return Err(AppError::details(
+                "AMBIGUOUS_SYMBOL",
+                "Symbol name matches multiple declarations; specify path or fetch a candidate handle",
+                json!({"symbol": symbol_name, "candidates": candidates}),
+            ));
+        }
+        let (path, symbol, _) = candidates.into_iter().next().expect("checked non-empty");
         let file = index.get(&path).ok_or_else(|| {
             AppError::details(
                 "PATH_NOT_INDEXED",

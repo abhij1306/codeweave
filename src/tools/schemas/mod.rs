@@ -5,5 +5,6 @@
 pub mod bash;
 pub mod edits;
 pub mod git;
+pub mod intelligence;
 pub mod retrieval;
 pub mod workspace;

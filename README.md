@@ -11,6 +11,7 @@ CodeWeave is a fast, local-first Model Context Protocol (MCP) server for AI-assi
 
 - **Single Rust process** — no Node.js gateway or companion daemon.
 - **Repository-aware retrieval** — ranked context, symbols, references, outlines, regex, filename search, and repository maps.
+- **Optional semantic intelligence** — persistent Python and TypeScript language servers for definitions, references, diagnostics, and safe rename previews, with tree-sitter/lexical fallback.
 - **Safe edits** — narrow single-operation tools with snapshot and content-hash preconditions, validation, and rollback.
 - **Supervised Bash execution** — focused commands, timeouts, cancellation, retained logs, and process-tree cleanup.
 - **Git integration** — status, diff, log, show, blame, staging, commits, and confirmed restores.
@@ -213,6 +214,10 @@ Detailed guides:
   "index": {
     "ranking": "v1"
   },
+  "intelligence": {
+    "python": {"enabled": false, "command": "basedpyright-langserver", "args": ["--stdio"], "timeoutMs": 10000},
+    "typescript": {"enabled": false, "command": "typescript-language-server", "args": ["--stdio"], "timeoutMs": 10000}
+  },
   "policy": {
     "maxFileBytes": 2000000,
     "maxContextChars": 50000,
@@ -234,6 +239,8 @@ Detailed guides:
 `workspace.artifactPaths` has the opposite purpose: it explicitly indexes configured paths even when normal Git ignore rules would skip them. Do not list the same directory in both settings.
 
 `index.ranking` selects the `code_context` scorer. `"v1"` (default) is the exact-match scorer with short excerpts. `"v2"` adds a filename-affinity boost — so filename and configuration lookups rank the right file first — and renders results bounded to the enclosing symbol (whole symbol when it fits, otherwise a window centered on the match), tagging each result with additive `chunk_kind` and `complete_symbol` fields. The request schema and every other response field are identical between the two modes.
+
+`intelligence` configures optional persistent language servers. Disabled adapters retain tree-sitter and lexical behavior. Enabled adapters start lazily on the first `code_intelligence` request and restart once after failure. CodeWeave never installs these executables automatically; run `codeweave doctor --config config.json` after changing their paths.
 
 `bash` executes a command string through the configured executable as `bash -c <command>`. For example, a focused Windows repository test can run as `cd backend && ./.venv/Scripts/python.exe -m pytest tests/unit/test_file.py -q`. `cwd` may select an existing workspace-relative directory, `background` returns immediately with a `run_id`, and `timeout_ms` may override the configured default up to `maxTimeoutMs`.
 

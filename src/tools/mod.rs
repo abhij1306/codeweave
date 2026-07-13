@@ -105,7 +105,7 @@ impl ToolDefinition {
     }
 }
 
-use schemas::{bash, edits, git, retrieval, workspace};
+use schemas::{bash, edits, git, intelligence, retrieval, workspace};
 
 /// The full, unfiltered `tools/list` payload (every advertised tool, in
 /// registry order). Used for schema-shape tests and as the `full` profile body.
@@ -157,6 +157,14 @@ pub fn registry() -> &'static [ToolDefinition] {
             safety: ToolSafety::Read,
             profiles: &[ReadOnly, Edit],
             input_schema: retrieval::code_search,
+        },
+        ToolDefinition {
+            name: "code_intelligence",
+            title: "Code Intelligence",
+            description: "Resolve definitions, references, diagnostics, or a rename preview through the optional semantic backend. Results always label semantic, syntactic, or lexical evidence.",
+            safety: ToolSafety::Read,
+            profiles: &[ReadOnly, Edit],
+            input_schema: intelligence::code_intelligence,
         },
         ToolDefinition {
             name: "code_write",
@@ -455,7 +463,7 @@ mod tests {
         let full = names_in(Some(Profile::Full));
         let expected: Vec<String> = registry().iter().map(|t| t.name.to_owned()).collect();
         assert_eq!(full, expected);
-        assert_eq!(full.len(), 27);
+        assert_eq!(full.len(), 28);
     }
 
     #[test]
@@ -469,6 +477,7 @@ mod tests {
                 "code_capabilities",
                 "code_fetch",
                 "code_search",
+                "code_intelligence",
                 "code_preview",
                 "git_status",
                 "git_diff",
@@ -543,7 +552,7 @@ mod tests {
         let access =
             resolve_access(Some(Profile::Full), &CustomSelection::default(), true).unwrap();
         let items = access.list_payload().as_array().unwrap();
-        assert_eq!(items.len(), 27);
+        assert_eq!(items.len(), 28);
         for item in items {
             let schema = &item["inputSchema"];
             assert_eq!(schema["type"], "object");

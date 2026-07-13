@@ -1,4 +1,5 @@
 use crate::index::Ranking;
+use crate::intelligence::IntelligenceService;
 use crate::model::{required_str, AppError, AppResult, DaemonConfig, WorkspaceConfig};
 use crate::security::{canonical_root, validate_relative};
 use crate::workspace::WorkspaceActor;
@@ -55,6 +56,7 @@ impl Default for SessionKey {
 pub struct WorkspaceManager {
     config: RwLock<Option<DaemonConfig>>,
     actor: RwLock<Option<Arc<WorkspaceActor>>>,
+    intelligence: RwLock<Option<Arc<IntelligenceService>>>,
     latency: Mutex<HashMap<String, VecDeque<u128>>>,
     lifecycle: Mutex<()>,
     operation_gate: tokio::sync::RwLock<()>,
@@ -249,7 +251,56 @@ impl WorkspaceManager {
             }
             "code_capabilities" => {
                 let actor = self.actor()?;
-                run_blocking(move || actor.code_capabilities()).await
+                let intelligence = self.intelligence.read().clone();
+                run_blocking(move || {
+                    let mut result = actor.code_capabilities()?;
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert(
+                            "intelligence".to_owned(),
+                            intelligence
+                                .map(|service| service.capabilities())
+                                .unwrap_or(Value::Null),
+                        );
+                    }
+                    Ok(result)
+                })
+                .await
+            }
+            "code_intelligence" => {
+                let service = self.intelligence.read().clone().ok_or_else(|| {
+                    AppError::new("NOT_INITIALIZED", "Workspace has not been initialized")
+                })?;
+                let params = params.clone();
+                let operation = params
+                    .get("operation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let semantic = run_blocking(move || service.execute(&params)).await?;
+                if operation == "rename_preview" {
+                    let actor = self.actor()?;
+                    let changes = semantic
+                        .get("changes")
+                        .cloned()
+                        .unwrap_or_else(|| json!([]));
+                    let snapshot = actor
+                        .summary_ids()?
+                        .get("snapshot_id")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let mut preview = actor
+                        .code_edit(
+                            session.as_str(),
+                            &json!({"preview":true,"changes":changes,"snapshot_id":snapshot}),
+                        )
+                        .await?;
+                    if let Some(object) = preview.as_object_mut() {
+                        object.insert("intelligence".to_owned(), semantic);
+                    }
+                    Ok(preview)
+                } else {
+                    Ok(semantic)
+                }
             }
             "code_write" | "code_replace" | "code_replace_range" | "code_insert"
             | "code_delete" | "code_rename" | "code_preview" | "code_transaction" => {
@@ -351,6 +402,10 @@ impl WorkspaceManager {
             ranking,
             PathBuf::from(config.cache_root.clone()),
         )?);
+        let intelligence = Arc::new(IntelligenceService::new(
+            PathBuf::from(&repo.path),
+            config.intelligence.clone(),
+        ));
         let open_ms = open_started.elapsed().as_millis();
 
         let bash_probe_started = Instant::now();
@@ -360,6 +415,7 @@ impl WorkspaceManager {
         let _lifecycle = self.lifecycle.lock();
         *self.config.write() = Some(config);
         *self.actor.write() = Some(actor.clone());
+        *self.intelligence.write() = Some(intelligence);
         self.latency.lock().clear();
 
         tracing::info!(
@@ -596,6 +652,7 @@ mod tests {
             },
             skills: SkillsConfig::default(),
             index: IndexSettings::default(),
+            intelligence: crate::model::IntelligenceSettings::default(),
             policy: PolicyConfig {
                 max_file_bytes,
                 max_context_chars: 50_000,

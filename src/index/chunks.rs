@@ -43,9 +43,8 @@ pub struct Chunk {
     pub end_line: usize,
 }
 
+#[cfg(test)]
 impl Chunk {
-    /// True when this chunk represents a whole symbol (not a split part or
-    /// remainder) — used to report `complete_symbol` on results.
     pub fn is_complete_symbol(&self) -> bool {
         matches!(self.kind, ChunkKind::Symbol)
     }

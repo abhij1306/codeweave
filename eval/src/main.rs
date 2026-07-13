@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use codeweave_rust::index::{CodeIndex, ContextParams, Ranking, WorkspaceExclusions};
+use codeweave_rust::index::{CodeIndex, ContextParams, Ranking, SymbolDetail, WorkspaceExclusions};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -165,6 +165,7 @@ fn main() {
                 workspace_id: "eval",
                 snapshot_id: "eval",
                 query: &query.query,
+                terms: &[],
                 required_terms: &[],
                 optional_terms: &optional,
                 exclude_terms: &[],
@@ -176,6 +177,7 @@ fn main() {
                 recent_mutations: &recent_mutations,
                 budget_chars: BUDGET_CHARS,
                 max_results: MAX_RESULTS,
+                symbol_detail: SymbolDetail::Auto,
                 ranking: ranking_mode,
             })
             .expect("context query");

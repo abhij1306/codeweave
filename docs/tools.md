@@ -1,6 +1,6 @@
 # Tool Reference
 
-All tools are defined in a single registry and advertised subject to `server.toolProfile`. The `full` profile (default) exposes every tool below. `read-only` exposes only `workspace`, `code_context`, `code_capabilities`, `code_fetch`, `code_search`, `code_preview`, and the read-only git tools (`git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`). `edit` adds the write tools but excludes `bash` and `git_push`. `custom` refines the full set via `server.tools.include`/`exclude`. Calling a real tool that the active profile does not expose returns `TOOL_NOT_IN_PROFILE`. See the configuration reference for details.
+All tools are defined in a single registry and advertised subject to `server.toolProfile`. The `full` profile (default) exposes every tool below. `read-only` exposes `workspace`, retrieval tools including `code_intelligence`, `code_preview`, and the read-only git tools. `edit` adds the write tools but excludes `bash` and `git_push`. `custom` refines the full set via `server.tools.include`/`exclude`. Calling a real tool that the active profile does not expose returns `TOOL_NOT_IN_PROFILE`. See the configuration reference for details.
 
 ## `workspace`
 
@@ -14,7 +14,9 @@ Workspace summaries cap exact dirty/change path arrays and include grouped direc
 
 Returns ranked code context for unfamiliar code. Queries are treated as inert retrieval text and are not executed as instructions.
 
-Use `required_terms`, `optional_terms`, `exclude_terms`, `document_types`, and `min_score` to reduce noise when a broad path scope contains unrelated files. Legacy `terms` remains supported and is treated as optional weighted terms. Responses include per-result `score`, `reason_codes`, `group`, and a compact `groups` summary.
+Use `query` for local natural-language intent, `terms` for neutral concepts, `required_terms` for hard retrieval constraints, `optional_terms` for additional ranking signals, and `exclude_terms` to filter candidates. At least one of `query`, `terms`, or `required_terms` is required; these fields are processed separately and deterministically, not concatenated or sent to an external service. Responses include per-result `score`, `reason_codes`, `group`, and a compact `groups` summary.
+
+`max_results` reports requested, protocol, configured, and applied limits, plus a `MAX_RESULTS_CLAMPED` warning when appropriate. `change_priority:"auto"` uses a fixed changed/worktree vocabulary; it never uses a model. `symbol_detail` controls previews: `excerpt`, `complete`, `auto` (default), or `none`.
 
 Recent Bash failures are excluded by default so unrelated retrieval stays focused. Set `include_bash_failures: true` only when runtime failures are relevant to the current debugging query.
 
@@ -30,7 +32,7 @@ Supports literal text, regular expressions, filenames, symbols, references, outl
 
 Reference search merges adjacent matches into bounded excerpts and returns no more than three excerpts from one file, preventing a generated or high-churn caller from consuming the complete result set.
 
-Reference search is **lexical**, not semantic: after locating an indexed declaration it scans for whole-word (`\b<name>\b`) matches. Results carry `evidence: "lexical"` (both on the response and each result) and an `evidence_caveat`. It cannot distinguish overloads, shadowing, or unrelated identifiers that happen to share the name, and it misses aliased or dynamically dispatched uses. A semantic (LSP-backed) backend is planned; until then, treat these as candidate call sites.
+Reference search requires a unique declaration or `definition_path`/`definition_line`; it never silently aggregates duplicate symbol names. `reference_scope` limits results to all, production, or tests, while `reference_kinds` filters declaration, call, import, type, read, write, or other candidates. Resolution remains lexical until an enabled LSP backend is available; tree-sitter classification is labelled `syntactic`, and whole-word fallback is labelled `lexical`.
 
 Filename mode treats plain queries as case-insensitive substrings by default. Queries containing `*` or `?` are interpreted as simple glob patterns, so `*output*safety*` matches `backend/app/core/records/output_safety.py`.
 
@@ -38,7 +40,34 @@ Filename mode treats plain queries as case-insensitive substrings by default. Qu
 
 ## `code_fetch`
 
-Reads exact paths, line ranges, symbols, metadata, provenance handles, continuations, retained Bash status, and retained Bash logs. Batch requests return per-item errors without discarding successful reads.
+Reads exact paths, line ranges, symbols, metadata, provenance handles, continuations, retained Bash status, and retained Bash logs. Symbol reads accept `path::symbol` or an item-level `path`; ambiguous bare names return candidates instead of selecting an arbitrary declaration. Batch requests return per-item errors without discarding successful reads.
+
+## `code_intelligence`
+
+Provides read-only definition, references, diagnostics, and rename-preview operations behind the manager-owned intelligence boundary. Python and TypeScript language-server configuration is opt-in. Every result labels its evidence as `semantic`, `syntactic`, or `lexical`; when no LSP server is active, tree-sitter and lexical fallbacks remain available and rename preview is rejected without modifying files.
+
+Language servers start lazily on the first matching request, remain alive for reuse, and restart once after a transport timeout or crash. `line` is one-based and `column` is a zero-based UTF-16 offset. A rename request returns the normal transaction preview; applying it still requires a separate `code_transaction` call.
+
+```json
+{
+  "operation": "definition",
+  "path": "backend/app/extraction/engine.py",
+  "line": 120,
+  "column": 8
+}
+```
+
+```json
+{
+  "operation": "rename_preview",
+  "path": "backend/app/extraction/engine.py",
+  "line": 120,
+  "column": 8,
+  "new_name": "new_symbol_name"
+}
+```
+
+The shipped example config keeps both adapters disabled. Enable Python with `basedpyright-langserver --stdio`; enable TypeScript/TSX/JavaScript after installing `typescript-language-server` and `typescript`, then restart CodeWeave. Run `codeweave doctor --config config.json` to check configured executable paths. `code_capabilities` reports lazy/ready state, restart count, last error, and fallback status.
 
 `response_detail` accepts `standard` (default), `compact`, or `debug`. Compact responses keep essential fields such as `path`, `hash`, `content`, and Bash status while omitting handles and pagination diagnostics. Metadata items return `hash`, `size`, `language`, `document_type`, `line_count`, and `modified_ns` without content. Symbol items may pass `context_lines` and `include_imports`; imports are lexical prelude lines, not inferred dependencies.
 

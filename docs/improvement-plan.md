@@ -65,11 +65,11 @@ Hard constraints (must remain true):
 
 **A2. Retrieval v2 = chunk-granular BM25F, hand-rolled, in-memory.** No Tantivy, no embeddings, no reranker in the default path. Chunks are symbol-bounded (from the tree-sitter symbols already extracted per file), with a whole-file chunk for symbol-less files and sub-chunking for oversized symbols. Scoring is BM25 (k1=1.2, b=0.75) over weighted fields (content / symbol name / path), followed by a small set of *documented, benchmark-gated* deterministic boosts. The old scorer remains behind a config flag during transition, then is deleted. Embeddings/hybrid retrieval is explicitly deferred (§4).
 
-**A3. Three tool profiles, config-driven.** `server.toolProfile` ∈ `full` (default, all 27 — zero behavior change), `read-only` (retrieval + git inspection, no mutation/execution), `edit` (everything except `bash*` and `git_push` — for connector sessions where command execution isn't wanted). Plus `custom` include/exclude lists. Profiles are deployment-level (one connector = one config). This replaces the earlier five-profile proposal — single-repo local use doesn't need more.
+**A3. Three tool profiles, config-driven.** `server.toolProfile` ∈ `full` (default, all 28), `read-only` (retrieval including `code_intelligence` + git inspection, no mutation/execution), `edit` (everything except `bash*` and `git_push` — for connector sessions where command execution isn't wanted). Plus `custom` include/exclude lists. Profiles are deployment-level (one connector = one config). This replaces the earlier five-profile proposal — single-repo local use doesn't need more.
 
 **A4. Single source of truth for tools.** A typed registry generates: the `tools/list` payload, the transport allowlist, the annotations, profile membership, the capabilities output, the docs tool table, and schema snapshots that tests assert against. The flat-schema rule (no `oneOf`/`allOf`/`not`/`const`) becomes registry-level validation at startup and in tests.
 
-**A5. LSP is an optional, replaceable backend — later.** Behind a `CodeIntelligenceBackend` trait with tree-sitter as the always-available default; LSP servers as supervised child processes on the existing process runtime; LSP `WorkspaceEdit`s compile into `changes[]` (A1); every response labels evidence `semantic | syntactic | lexical`. Until then, the lexical `references` mode must say it is lexical in its output (P0 fix).
+**A5. LSP is an optional, replaceable backend — shipped.** `CodeIntelligenceBackend` keeps tree-sitter as the always-available default; configured LSP servers are supervised persistent children; LSP `WorkspaceEdit`s compile into preview-only `changes[]` (A1); every response labels evidence `semantic | syntactic | lexical`.
 
 **A6. Benchmarks gate retrieval changes.** No new scoring heuristic, weight, or boost lands without a committed baseline showing the delta on the fixture query set. **crawlerai is a pinned fixture repo** — the benchmark must reflect the project this is actually used on.
 
@@ -371,13 +371,32 @@ Independent; can run parallel to P4. Simpler now — single-repo config has one 
 
 ---
 
-## 4. Deferred — do not start
+## 4. Post-audit delivery — shipped
+
+The CrawlerAI ChatGPT workflow audit supplied the hosted-session evidence
+required by A5: lexical reference discovery mixed imports, tests, and calls,
+and forced extra reads. The LSP work is therefore no longer deferred. The
+implementation remains optional and local-first: `code_intelligence` is a
+read-only manager-owned boundary with tree-sitter/lexical fallback, Python
+(`basedpyright-langserver --stdio`) and TypeScript
+(`typescript-language-server --stdio`) configuration disabled by default, and
+all evidence labelled `semantic`, `syntactic`, or `lexical`. Language servers
+are persistent, start lazily, and restart once after transport failure. Rename
+edits are root-checked, UTF-16 converted, overlap-checked, compiled to existing
+hash-preconditioned `changes[]`, and passed through `code_preview`; no
+intelligence backend writes files directly.
+
+The same audit also drives the retrieval contract work: natural-language
+`code_context.query` remains distinct from structured terms, result caps report
+protocol/configured/effective limits and warnings, bare duplicate symbols fail
+with candidates, v2 down-ranks historical plans for implementation intent, and
+Git diff supports hunk-focused review plus snapshot-bound continuation.
+
+## 5. Deferred — do not start
 
 **Hybrid retrieval (embeddings + RRF).** Blocked on P4 shipped + P3 benchmarks showing a query category where BM25F measurably plateaus. If built: optional provider trait (local ONNX or OpenAI-compatible), RRF fusion, skip vectors for decisive identifier/path queries, hard fallback to BM25, off by default, no repo content leaves the machine unless explicitly configured.
 
-**LSP semantic backend.** Blocked on P4 shipped + workflow-audit evidence that lexical references are a real bottleneck in ChatGPT/Claude sessions. Scope when started: `CodeIntelligenceBackend` trait (tree-sitter impl extracted first as a no-op refactor), LSP child processes on the process runtime, definitions/references/diagnostics, rename compiled to `code_preview`/`code_transaction` (A1), evidence labels everywhere, per-language opt-in. Never in the workspace actor; never writes files.
-
-## 5. Explicitly not doing (and why)
+## 6. Explicitly not doing (and why)
 
 - **No multi-workspace support** — decision A7; deleted, not just hidden.
 - **No Perplexity compatibility work** — decision A8; flat schemas stay for token/reliability reasons.
@@ -398,7 +417,7 @@ P2 (registry/profiles)  — after P1 (registry wraps the slimmed tool set once)
 P3 (eval harness)       — anytime after P1; blocks P4 merges (gates)
 P4 (retrieval v2)       — needs P3 gates; benefits from P2 (flags, capabilities)
 P5 (onboarding)         — anytime after P1 (single config shape)
-Deferred: hybrid retrieval, LSP — evidence-gated
+Deferred: hybrid retrieval — evidence-gated. LSP shipped in the post-audit phase.
 ```
 
 Suggested PR sizing: P0 as 3–4 small PRs (config/docs, git safety, edit-pipeline visibility, tests). P1 as config-shape PR → manager-deletion PR → eager-startup PR. P2 as move-only PR → registry PR → profiles PR. P4 as index-model PR → scoring PR → rendering PR, each behind the `ranking` flag until gates pass.

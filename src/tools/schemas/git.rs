@@ -19,7 +19,12 @@ pub fn git_diff() -> Value {
         "properties": {
             "paths": {"type": "array", "items": {"type": "string"}},
             "staged": {"type": "boolean", "default": false},
-            "max_chars": {"type": "integer", "minimum": 1, "maximum": 200000}
+            "max_chars": {"type": "integer", "minimum": 1, "maximum": 200000},
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1},
+            "symbol": {"type": "string"},
+            "hunk_ids": {"type": "array", "items": {"type": "string"}},
+            "continuation": {"type": "string", "description": "Snapshot-bound continuation returned by a truncated git_diff response."}
         },
         "additionalProperties": false,
         "$schema": "http://json-schema.org/draft-07/schema#"

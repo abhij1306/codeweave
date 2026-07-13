@@ -1,5 +1,6 @@
 mod bash;
 mod index;
+mod intelligence;
 mod manager;
 mod mcp_transport;
 mod model;
@@ -375,20 +376,6 @@ async fn prepare(
         }
     }
     let mut params = object(input);
-    if method == "code_context" {
-        if let Some(terms) = params.remove("terms").and_then(|v| v.as_array().cloned()) {
-            params.insert(
-                "query".into(),
-                Value::String(
-                    terms
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                ),
-            );
-        }
-    }
     // A CodeWeave server serves exactly one repository, fixed at startup. Legacy
     // workspace_id/workspace arguments are accepted but stripped so they can never
     // redirect a tool call.
@@ -599,6 +586,30 @@ struct Check {
     detail: String,
 }
 
+fn executable_on_path(command: &str) -> bool {
+    let direct = Path::new(command);
+    if direct.components().count() > 1 {
+        return direct.is_file();
+    }
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE;.CMD;.BAT".into())
+            .split(';')
+            .map(str::to_owned)
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .any(|dir| {
+            extensions.iter().any(|ext| {
+                dir.join(format!("{command}{ext}")).is_file() || dir.join(command).is_file()
+            })
+        })
+}
+
 impl Check {
     fn ok(name: &'static str, detail: impl Into<String>) -> Self {
         Self {
@@ -703,6 +714,44 @@ async fn doctor_checks(cli: &Cli) -> Vec<Check> {
             "git",
             format!("{error}; install Git and add it to PATH"),
         )),
+    }
+
+    for (language, default_command) in [
+        ("python", "basedpyright-langserver"),
+        ("typescript", "typescript-language-server"),
+    ] {
+        let check_name = match language {
+            "python" => "intelligence python",
+            "typescript" => "intelligence typescript",
+            _ => unreachable!("fixed language list"),
+        };
+        let settings = config
+            .get("intelligence")
+            .and_then(|value| value.get(language));
+        let enabled = settings
+            .and_then(|value| value.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !enabled {
+            checks.push(Check::ok(
+                check_name,
+                "disabled; syntactic and lexical fallback remain available",
+            ));
+            continue;
+        }
+        let command = settings
+            .and_then(|value| value.get("command"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default_command);
+        if executable_on_path(command) {
+            checks.push(Check::ok(
+                check_name,
+                format!("{command} is available; server starts lazily"),
+            ));
+        } else {
+            checks.push(Check::fail(check_name, format!("{command} is unavailable; install it, fix intelligence.{language}.command, or disable the adapter")));
+        }
     }
 
     if matches!(cli.transport, Transport::Stdio) {
@@ -1117,6 +1166,7 @@ mod tests {
             ("code_capabilities", true, false, true, false),
             ("code_fetch", true, false, true, false),
             ("code_search", true, false, true, false),
+            ("code_intelligence", true, false, true, false),
             ("code_write", false, false, false, false),
             ("code_replace", false, false, false, false),
             ("code_replace_range", false, false, false, false),
@@ -1664,7 +1714,7 @@ mod tests {
         let access = resolve_tool_access(&server, &root).expect("example profile must resolve");
         assert!(access.is_allowed("bash"));
         assert!(access.bash_tools_available());
-        assert_eq!(access.list_payload().as_array().unwrap().len(), 27);
+        assert_eq!(access.list_payload().as_array().unwrap().len(), 28);
     }
 
     #[test]

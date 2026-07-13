@@ -156,6 +156,32 @@ pub struct IndexSettings {
     pub ranking: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LanguageServerSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_lsp_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_lsp_timeout_ms() -> u64 {
+    10_000
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct IntelligenceSettings {
+    #[serde(default)]
+    pub python: LanguageServerSettings,
+    #[serde(default)]
+    pub typescript: LanguageServerSettings,
+}
+
 fn default_ranking() -> String {
     "v1".to_owned()
 }
@@ -175,6 +201,8 @@ pub struct DaemonConfig {
     pub skills: SkillsConfig,
     #[serde(default)]
     pub index: IndexSettings,
+    #[serde(default)]
+    pub intelligence: IntelligenceSettings,
     pub policy: PolicyConfig,
     pub cache_root: String,
 }

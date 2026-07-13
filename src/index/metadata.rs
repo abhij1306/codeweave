@@ -79,6 +79,26 @@ pub(super) fn classify_document(path: &str) -> String {
     "source".to_owned()
 }
 
+pub(super) fn classify_lifecycle(path: &str, content: &str) -> String {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    if !normalized.starts_with("docs/plans/") {
+        return "current".to_owned();
+    }
+    let header = content
+        .chars()
+        .take(8_192)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if ["SUPERSEDED", "HISTORICAL", "COMPLETE"]
+        .iter()
+        .any(|marker| header.contains(marker))
+    {
+        "historical_plan".to_owned()
+    } else {
+        "active_plan".to_owned()
+    }
+}
+
 pub(super) fn query_terms(query: &str) -> Vec<String> {
     static TERM_REGEX: OnceLock<Regex> = OnceLock::new();
     static STOP_WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();

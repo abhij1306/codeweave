@@ -114,7 +114,7 @@ pub fn code_preview() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "changes": {"type": "array", "items": {"type": "object"}},
+            "changes": {"type": "array", "items": change_schema()},
             "snapshot_id": {"type": "string"}
         },
         "required": ["changes"],
@@ -127,7 +127,7 @@ pub fn code_transaction() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "changes": {"type": "array", "items": {"type": "object"}},
+            "changes": {"type": "array", "items": change_schema()},
             "snapshot_id": {"type": "string"},
             "validate": {"type": "array", "items": {"type": "string"}},
             "rollback_on_failure": {"type": "boolean"},
@@ -136,5 +136,30 @@ pub fn code_transaction() -> Value {
         "required": ["changes"],
         "additionalProperties": false,
         "$schema": "http://json-schema.org/draft-07/schema#"
+    })
+}
+
+/// A deliberately flat superset schema. Per-kind required fields are published
+/// by `code_capabilities`; conditional JSON Schema would make hosted clients
+/// less reliable and is rejected by the registry's flat-schema checks.
+fn change_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["create", "replace", "replace_range", "insert", "delete", "rename"], "description": "Required operation kind."},
+            "path": {"type": "string"},
+            "to": {"type": "string"},
+            "content": {"type": "string"},
+            "old_text": {"type": "string"},
+            "new_text": {"type": "string"},
+            "handle": {"type": "string"},
+            "anchor_symbol": {"type": "string"},
+            "position": {"type": "string", "enum": ["before", "after", "inside_start", "inside_end"]},
+            "overwrite": {"type": "boolean"},
+            "expected_hash": {"type": "string"},
+            "expected_replacements": {"type": "integer", "minimum": 1}
+        },
+        "required": ["kind"],
+        "additionalProperties": false
     })
 }

@@ -10,7 +10,8 @@ use util::{stale_snapshot, summarize_changed_paths, ChangedPathSummary};
 
 use crate::bash::{BashSupervisor, StartRequest};
 use crate::index::{
-    content_hash, CodeIndex, ContextParams, Ranking, SearchParams, WorkspaceExclusions,
+    content_hash, CodeIndex, ContextParams, Ranking, SearchParams, SymbolDetail,
+    WorkspaceExclusions,
 };
 use crate::model::{
     bool_value, required_str, string_list, usize_value, AppError, AppResult, PolicyConfig,
@@ -37,6 +38,174 @@ const POLL_RECONCILE_DEBOUNCE: Duration = Duration::from_secs(2);
 /// Maximum bytes of an instruction file (AGENTS.md/CLAUDE.md) inlined into a summary
 /// response before it is truncated and the caller is pointed at code_fetch.
 const INSTRUCTION_INLINE_CAP: usize = 4_096;
+const PROTOCOL_MAX_RESULTS: usize = 200;
+
+fn result_limit(
+    params: &Value,
+    default: usize,
+    configured_max: usize,
+) -> (usize, usize, Vec<Value>) {
+    let requested = usize_value(params, "max_results", default);
+    let applied = requested.min(PROTOCOL_MAX_RESULTS).min(configured_max);
+    let mut warnings = Vec::new();
+    if requested > applied {
+        let limit_message = if configured_max < PROTOCOL_MAX_RESULTS {
+            format!("Requested {requested} results; the effective configured maximum is {configured_max}.")
+        } else {
+            format!("Requested {requested} results; protocol maximum is {PROTOCOL_MAX_RESULTS}.")
+        };
+        warnings.push(json!({"code": "MAX_RESULTS_CLAMPED", "message": limit_message}));
+    }
+    (requested, applied, warnings)
+}
+
+fn add_result_limits(
+    result: &mut Value,
+    requested: usize,
+    applied: usize,
+    configured_max: usize,
+    configured_default: usize,
+    warnings: Vec<Value>,
+) {
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "limits".to_owned(),
+            json!({
+                "requested_results": requested,
+                "protocol_max_results": PROTOCOL_MAX_RESULTS,
+                "configured_max_results": configured_max,
+                "applied_results": applied,
+                "configured_default_results": configured_default,
+            }),
+        );
+        if !warnings.is_empty() {
+            object.insert("warnings".to_owned(), Value::Array(warnings));
+        }
+    }
+}
+
+/// A deliberately small deterministic vocabulary. This is an opt-in ranking
+/// hint, never an inferred semantic judgement or model call.
+fn should_prioritize_changes(
+    value: Option<&str>,
+    query: &str,
+    evidence: &[String],
+) -> AppResult<bool> {
+    match value.unwrap_or("auto") {
+        "prefer" => Ok(true),
+        "ignore" => Ok(false),
+        "auto" => {
+            if evidence.iter().any(|item| item == "changes") {
+                return Ok(true);
+            }
+            let words = crate::index::query_terms_for_intent(query);
+            Ok(words.iter().any(|word| {
+                matches!(
+                    word.as_str(),
+                    "changed"
+                        | "change"
+                        | "changes"
+                        | "dirty"
+                        | "worktree"
+                        | "unstaged"
+                        | "staged"
+                        | "diff"
+                        | "modified"
+                )
+            }))
+        }
+        other => Err(AppError::details(
+            "INVALID_CHANGE_PRIORITY",
+            "change_priority must be auto, prefer, or ignore",
+            json!({"change_priority": other}),
+        )),
+    }
+}
+
+#[derive(Clone)]
+struct DiffHunk {
+    id: String,
+    path: String,
+    old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
+    text: String,
+}
+
+fn parse_hunk_range(value: &str) -> (usize, usize) {
+    let value = value.trim_start_matches(['-', '+']);
+    let (start, count) = value.split_once(',').unwrap_or((value, "1"));
+    (start.parse().unwrap_or(0), count.parse().unwrap_or(1))
+}
+
+fn parse_diff_hunks(diff: &str) -> Vec<DiffHunk> {
+    let mut hunks = Vec::new();
+    let mut path = String::new();
+    let mut header = String::new();
+    let mut active: Option<(usize, usize, usize, usize, String)> = None;
+    let finish = |active: &mut Option<(usize, usize, usize, usize, String)>,
+                  path: &str,
+                  hunks: &mut Vec<DiffHunk>| {
+        if let Some((old_start, old_count, new_start, new_count, text)) = active.take() {
+            let id = content_hash(&format!("{path}\0{old_start}\0{new_start}\0{text}"));
+            hunks.push(DiffHunk {
+                id,
+                path: path.to_owned(),
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                text,
+            });
+        }
+    };
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            finish(&mut active, &path, &mut hunks);
+            header.clear();
+            path.clear();
+            header.push_str(line);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("+++ b/") {
+            path = value.trim_end().to_owned();
+        }
+        if line.starts_with("@@ ") {
+            finish(&mut active, &path, &mut hunks);
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let (old_start, old_count) = fields
+                .get(1)
+                .map(|value| parse_hunk_range(value))
+                .unwrap_or((0, 0));
+            let (new_start, new_count) = fields
+                .get(2)
+                .map(|value| parse_hunk_range(value))
+                .unwrap_or((0, 0));
+            active = Some((
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                format!("{header}{line}"),
+            ));
+        } else if let Some((_, _, _, _, text)) = active.as_mut() {
+            text.push_str(line);
+        } else {
+            header.push_str(line);
+        }
+    }
+    finish(&mut active, &path, &mut hunks);
+    hunks
+}
+
+fn hunk_overlaps(hunk: &DiffHunk, start: usize, end: usize) -> bool {
+    let overlaps = |line: usize, count: usize| {
+        let last = line.saturating_add(count.saturating_sub(1));
+        count == 0 || (line <= end && last >= start)
+    };
+    overlaps(hunk.old_start, hunk.old_count) || overlaps(hunk.new_start, hunk.new_count)
+}
 
 pub struct WorkspaceActor {
     // Lock ordering for code that needs more than one guard:
@@ -571,13 +740,23 @@ impl WorkspaceActor {
             "search_modes": ["literal", "regex", "filename", "symbol", "references", "outline", "repo_map"],
             "fetch_kinds": ["path", "handle", "symbol", "metadata", "bash_status", "bash_log", "continuation"],
             "context": {
+                "query_max_chars": 2000,
                 "supports_required_terms": true,
                 "supports_optional_terms": true,
                 "supports_exclude_terms": true,
                 "supports_document_types": true,
                 "supports_min_score": true,
+                "supports_change_priority": true,
+                "symbol_detail": {
+                    "default": "auto",
+                    "values": ["excerpt", "complete", "auto", "none"]
+                },
                 "returns_scores": true,
                 "returns_groups": true
+            },
+            "fetch": {
+                "supports_qualified_symbols": true,
+                "ambiguous_symbols_return_candidates": true
             },
             "editing": {
                 "supports_preview": true,
@@ -587,6 +766,14 @@ impl WorkspaceActor {
                 "supports_bash_validation_commands": bash_available,
                 "supports_rollback_on_failure": true
             },
+            "change_contracts": {
+                "create": {"required": ["kind", "path", "content"], "optional": ["overwrite", "expected_hash"]},
+                "replace": {"required": ["kind", "path", "old_text", "new_text"], "optional": ["expected_replacements", "expected_hash", "handle"]},
+                "replace_range": {"required": ["kind", "path", "handle", "new_text"], "optional": []},
+                "insert": {"required": ["kind", "path", "content", "anchor_symbol", "position"], "optional": ["expected_hash"]},
+                "delete": {"required": ["kind", "path"], "optional": ["expected_hash"]},
+                "rename": {"required": ["kind", "path", "to"], "optional": ["expected_hash"]}
+            },
             "execution": {
                 "bash": bash
             },
@@ -594,6 +781,7 @@ impl WorkspaceActor {
                 "max_file_bytes": self.policy.max_file_bytes,
                 "max_context_chars": self.policy.max_context_chars,
                 "max_search_results": self.policy.max_search_results,
+                "protocol_max_search_results": PROTOCOL_MAX_RESULTS,
                 "max_bash_output_chars": self.policy.bash.max_output_chars,
                 "max_bash_timeout_ms": self.policy.bash.max_timeout_ms
             },
@@ -785,7 +973,7 @@ impl WorkspaceActor {
                 return Err(stale_snapshot(expected, &current));
             }
         }
-        let budget = match params
+        let default_budget = match params
             .get("budget")
             .and_then(Value::as_str)
             .unwrap_or("medium")
@@ -794,8 +982,11 @@ impl WorkspaceActor {
             "large" => self.policy.max_context_chars,
             _ => 20_000.min(self.policy.max_context_chars),
         };
+        let requested_chars = usize_value(params, "max_chars", default_budget);
+        let budget = requested_chars.min(self.policy.max_context_chars);
         let paths = string_list(params, "paths");
         let evidence = string_list(params, "evidence");
+        let terms = string_list(params, "terms");
         let required_terms = string_list(params, "required_terms");
         let optional_terms = string_list(params, "optional_terms");
         let exclude_terms = string_list(params, "exclude_terms");
@@ -804,7 +995,17 @@ impl WorkspaceActor {
             .get("min_score")
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
-        let max_results = usize_value(params, "max_results", 10).min(50);
+        if query.trim().is_empty() && terms.is_empty() && required_terms.is_empty() {
+            return Err(AppError::details(
+                "QUERY_REJECTED",
+                "code_context requires query, terms, or required_terms",
+                json!({"fields": ["query", "terms", "required_terms"]}),
+            ));
+        }
+        let (requested_results, max_results, limit_warnings) =
+            result_limit(params, 10, self.policy.max_search_results);
+        let symbol_detail =
+            SymbolDetail::parse(params.get("symbol_detail").and_then(Value::as_str))?;
         let mut dirty: HashSet<String> = self
             .repo_status
             .read()
@@ -823,12 +1024,26 @@ impl WorkspaceActor {
             .filter(|item| item.source != "external" || !external.contains(&item.path))
             .map(|item| item.path.clone())
             .collect();
+        let prioritize_changes = should_prioritize_changes(
+            params.get("change_priority").and_then(Value::as_str),
+            query,
+            &evidence,
+        )?;
+        if !prioritize_changes {
+            dirty.clear();
+        }
+        let recent = if prioritize_changes {
+            recent
+        } else {
+            HashSet::new()
+        };
         let snapshot = self.snapshot();
         let index_started = Instant::now();
         let mut result = self.index.read().context(ContextParams {
             workspace_id: &self.id,
             snapshot_id: &snapshot,
             query,
+            terms: &terms,
             required_terms: &required_terms,
             optional_terms: &optional_terms,
             exclude_terms: &exclude_terms,
@@ -840,6 +1055,7 @@ impl WorkspaceActor {
             recent_mutations: &recent,
             budget_chars: budget,
             max_results,
+            symbol_detail,
             ranking: self.ranking,
         })?;
         let index_ms = index_started.elapsed().as_millis();
@@ -853,6 +1069,24 @@ impl WorkspaceActor {
                 );
             }
             object.insert("reconcile_pending".to_owned(), json!(reconcile_pending));
+        }
+        add_result_limits(
+            &mut result,
+            requested_results,
+            max_results,
+            self.policy.max_search_results,
+            10,
+            limit_warnings,
+        );
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "char_limits".to_owned(),
+                json!({
+                    "requested_chars": requested_chars,
+                    "applied_chars": budget,
+                    "configured_max_chars": self.policy.max_context_chars,
+                }),
+            );
         }
         add_phase_metrics(
             &mut result,
@@ -890,6 +1124,33 @@ impl WorkspaceActor {
             return Err(AppError::invalid("queries cannot be empty"));
         }
         let paths = string_list(params, "paths");
+        let reference_scope = params
+            .get("reference_scope")
+            .and_then(Value::as_str)
+            .unwrap_or("all");
+        if !matches!(reference_scope, "all" | "production" | "tests") {
+            return Err(AppError::invalid(
+                "reference_scope must be all, production, or tests",
+            ));
+        }
+        let reference_kinds = string_list(params, "reference_kinds");
+        if reference_kinds.iter().any(|kind| {
+            !matches!(
+                kind.as_str(),
+                "declaration" | "call" | "import" | "type" | "read" | "write" | "other"
+            )
+        }) {
+            return Err(AppError::invalid(
+                "reference_kinds contains an unsupported kind",
+            ));
+        }
+        let definition_path = params.get("definition_path").and_then(Value::as_str);
+        let definition_line = params
+            .get("definition_line")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        let (requested_results, applied_results, limit_warnings) =
+            result_limit(params, 20, self.policy.max_search_results);
         let snapshot = self.snapshot();
         let index = self.index.read();
         if mode == "outline" && queries.len() == 1 && queries[0].is_empty() && paths.len() > 1 {
@@ -904,9 +1165,12 @@ impl WorkspaceActor {
                     query: path,
                     path_filters: &[],
                     case_sensitive: bool_value(params, "case_sensitive", false),
-                    max_results: usize_value(params, "max_results", 20)
-                        .min(self.policy.max_search_results),
+                    max_results: applied_results,
                     context_lines: usize_value(params, "context_lines", 2).min(20),
+                    reference_scope,
+                    reference_kinds: &reference_kinds,
+                    definition_path,
+                    definition_line,
                 }) {
                     Ok(result) => results.push(result),
                     Err(error) => errors.push(json!({
@@ -926,6 +1190,14 @@ impl WorkspaceActor {
                 "errors": errors,
             });
             add_reconcile_pending(&mut result, reconcile_pending);
+            add_result_limits(
+                &mut result,
+                requested_results,
+                applied_results,
+                self.policy.max_search_results,
+                20,
+                limit_warnings,
+            );
             add_phase_metrics(
                 &mut result,
                 &[
@@ -964,15 +1236,26 @@ impl WorkspaceActor {
                 query: effective_query,
                 path_filters: &paths,
                 case_sensitive: bool_value(params, "case_sensitive", false),
-                max_results: usize_value(params, "max_results", 20)
-                    .min(self.policy.max_search_results),
+                max_results: applied_results,
                 context_lines: usize_value(params, "context_lines", 2).min(20),
+                reference_scope,
+                reference_kinds: &reference_kinds,
+                definition_path,
+                definition_line,
             })
         };
         if queries.len() == 1 {
             let search_started = Instant::now();
             let mut result = run_search(queries[0])?;
             add_reconcile_pending(&mut result, reconcile_pending);
+            add_result_limits(
+                &mut result,
+                requested_results,
+                applied_results,
+                self.policy.max_search_results,
+                20,
+                limit_warnings,
+            );
             add_phase_metrics(
                 &mut result,
                 &[
@@ -1002,6 +1285,14 @@ impl WorkspaceActor {
             "errors": errors,
         });
         add_reconcile_pending(&mut result, reconcile_pending);
+        add_result_limits(
+            &mut result,
+            requested_results,
+            applied_results,
+            self.policy.max_search_results,
+            20,
+            limit_warnings,
+        );
         add_phase_metrics(
             &mut result,
             &[
@@ -1062,7 +1353,105 @@ impl WorkspaceActor {
         }
         let staged = bool_value(params, "staged", false);
         let git_started = Instant::now();
+        if action == "diff" {
+            let snapshot = self.snapshot();
+            let requested_chars = usize_value(params, "max_chars", self.policy.max_context_chars);
+            let applied_chars = requested_chars.min(self.policy.max_context_chars);
+            let raw =
+                self.repository
+                    .diff(&self.root, staged, &paths, self.policy.max_context_chars)?;
+            let mut hunks = parse_diff_hunks(&raw);
+            if let Some(symbol) = params.get("symbol").and_then(Value::as_str) {
+                if paths.len() != 1 {
+                    return Err(AppError::invalid(
+                        "git_diff symbol focus requires exactly one path",
+                    ));
+                }
+                let symbols = self
+                    .index
+                    .read()
+                    .find_symbols(paths.first().map(String::as_str), symbol);
+                if symbols.len() != 1 {
+                    return Err(AppError::details(
+                        if symbols.is_empty() {
+                            "SYMBOL_NOT_FOUND"
+                        } else {
+                            "AMBIGUOUS_SYMBOL"
+                        },
+                        "git_diff symbol focus requires one indexed declaration",
+                        json!({"path": paths[0], "symbol": symbol, "candidates": symbols.into_iter().map(|(path, symbol, _)| json!({"path": path, "symbol": symbol})).collect::<Vec<_>>() }),
+                    ));
+                }
+                let (_, symbol, _) = symbols.into_iter().next().expect("checked one symbol");
+                hunks.retain(|hunk| hunk_overlaps(hunk, symbol.start_line, symbol.end_line));
+            }
+            if let (Some(start), Some(end)) = (
+                params.get("start_line").and_then(Value::as_u64),
+                params.get("end_line").and_then(Value::as_u64),
+            ) {
+                hunks.retain(|hunk| hunk_overlaps(hunk, start as usize, end as usize));
+            }
+            let requested_hunks = string_list(params, "hunk_ids");
+            if !requested_hunks.is_empty() {
+                hunks.retain(|hunk| requested_hunks.iter().any(|id| id == &hunk.id));
+            }
+            let offset = if let Some(token) = params.get("continuation").and_then(Value::as_str) {
+                let (token_snapshot, offset) = token
+                    .rsplit_once(':')
+                    .ok_or_else(|| AppError::invalid("Invalid git diff continuation"))?;
+                if token_snapshot != snapshot {
+                    return Err(AppError::details(
+                        "STALE_CONTINUATION",
+                        "Repository changed after the diff continuation was created",
+                        json!({"expected_snapshot": token_snapshot, "current_snapshot": snapshot}),
+                    ));
+                }
+                offset
+                    .parse::<usize>()
+                    .map_err(|_| AppError::invalid("Invalid git diff continuation"))?
+            } else {
+                0
+            };
+            let mut output = String::new();
+            let mut selected = Vec::new();
+            let mut next = None;
+            for (index, hunk) in hunks.iter().enumerate().skip(offset) {
+                if !output.is_empty()
+                    && output.len().saturating_add(hunk.text.len()) > applied_chars
+                {
+                    next = Some(index);
+                    break;
+                }
+                if output.is_empty() && hunk.text.len() > applied_chars {
+                    next = Some(index);
+                    break;
+                }
+                output.push_str(&hunk.text);
+                selected.push(json!({
+                    "id": hunk.id, "path": hunk.path,
+                    "old": {"start_line": hunk.old_start, "line_count": hunk.old_count},
+                    "new": {"start_line": hunk.new_start, "line_count": hunk.new_count}
+                }));
+            }
+            let continuation = next.map(|index| format!("{snapshot}:{index}"));
+            let mut response = json!({
+                "action": "diff", "output": output, "hunks": selected,
+                "truncated": continuation.is_some(), "continuation": continuation,
+                "limits": {"requested_chars": requested_chars, "applied_chars": applied_chars, "configured_max_chars": self.policy.max_context_chars},
+                "generation": self.generation(), "snapshot_id": snapshot
+            });
+            add_phase_metrics(
+                &mut response,
+                &[
+                    ("reconcile", reconcile_ms),
+                    ("git", git_started.elapsed().as_millis()),
+                    ("total_local", started.elapsed().as_millis()),
+                ],
+            );
+            return Ok(response);
+        }
         let result = match action {
+            "diff" => unreachable!("handled before generic Git dispatch"),
             "status" => {
                 let status = self.repository.status(&self.root)?;
                 let git_ms = git_started.elapsed().as_millis();
@@ -1083,10 +1472,6 @@ impl WorkspaceActor {
                     ],
                 );
                 return Ok(result);
-            }
-            "diff" => {
-                self.repository
-                    .diff(&self.root, staged, &paths, self.policy.max_context_chars)?
             }
             "log" => self
                 .repository
