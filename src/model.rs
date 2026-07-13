@@ -97,29 +97,6 @@ fn default_bash_retention_hours() -> i64 {
     1
 }
 
-#[cfg(test)]
-pub fn test_bash_executable() -> String {
-    #[cfg(windows)]
-    {
-        for root in [
-            std::env::var_os("ProgramW6432"),
-            std::env::var_os("ProgramFiles"),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let candidate = std::path::PathBuf::from(root)
-                .join("Git")
-                .join("bin")
-                .join("bash.exe");
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-    }
-    "bash".to_owned()
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSettings {

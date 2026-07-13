@@ -139,57 +139,6 @@ impl Drop for ExecutionGuard {
     }
 }
 
-/// Guards a warm-shell execution running on a detached task. If the task is
-/// aborted or panics mid-command (so the marker is never consumed), the guard
-/// terminates the shell's process tree and marks the run record terminal. The
-/// shell is removed from the shared slot before execution, so a shell whose
-/// marker was not consumed can never be reused: its next output would interleave
-/// with the previous command's.
-struct WarmExecutionGuard {
-    record: Arc<Mutex<RunRecord>>,
-    pid: Option<u32>,
-    job: Option<Arc<WindowsJob>>,
-    armed: bool,
-}
-
-impl WarmExecutionGuard {
-    fn new(record: Arc<Mutex<RunRecord>>, pid: Option<u32>, job: Option<Arc<WindowsJob>>) -> Self {
-        Self {
-            record,
-            pid,
-            job,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for WarmExecutionGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Some(pid) = self.pid {
-            terminate_process_tree(pid, self.job.as_deref());
-        }
-        let mut item = self.record.lock();
-        if item.ended_at.is_none() {
-            item.status = "cancelled".to_owned();
-            item.ended_at = Some(Utc::now());
-            item.pid = None;
-            item.job = None;
-            if !item.output.is_empty() {
-                item.output.push('\n');
-            }
-            item.output
-                .push_str("Bash run was abandoned; the process tree was terminated.");
-        }
-    }
-}
-
 fn cleanup_orphan_logs(log_root: &Path, retention_hours: i64) {
     let Ok(entries) = fs::read_dir(log_root) else {
         return;
@@ -1075,7 +1024,9 @@ async fn execute_warm(
         }
     };
 
-    let mut execution_guard = WarmExecutionGuard::new(record.clone(), shell.pid(), shell.job());
+    // A warm shell is removed from the shared slot while executing, so the same
+    // abandonment guard can terminate it safely without allowing later reuse.
+    let mut execution_guard = ExecutionGuard::new(record.clone(), shell.pid(), shell.job());
     {
         // Expose the shell pid so bash_cancel can terminate a warm run. The
         // shell dies with the command's process group; needs_respawn handles
@@ -1478,7 +1429,8 @@ fn char_boundary(value: &str, mut index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{test_bash_executable, BashConfig};
+    use crate::model::BashConfig;
+    use crate::test_bash_executable;
     use tempfile::tempdir;
 
     fn policy() -> PolicyConfig {

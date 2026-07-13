@@ -1,14 +1,9 @@
 mod bash;
-#[allow(dead_code)]
-mod index;
 mod intelligence;
 mod manager;
 mod mcp_transport;
-mod model;
 mod process_runtime;
 mod repository;
-mod security;
-mod symbols;
 mod tools;
 mod workspace;
 
@@ -20,6 +15,7 @@ use axum::{
     Json,
 };
 use clap::{Parser, Subcommand, ValueEnum};
+use codeweave_rust::{index, model, security, symbols};
 use manager::{SessionKey, WorkspaceManager};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -33,6 +29,26 @@ use std::{
 use subtle::ConstantTimeEq;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+#[cfg(test)]
+fn test_bash_executable() -> String {
+    #[cfg(windows)]
+    {
+        for root in [
+            std::env::var_os("ProgramW6432"),
+            std::env::var_os("ProgramFiles"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let candidate = PathBuf::from(root).join("Git").join("bin").join("bash.exe");
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "bash".to_owned()
+}
 
 const SERVER_NAME: &str = "codeweave-rust";
 
@@ -1421,7 +1437,7 @@ mod tests {
                 "maxSearchResults": 100,
                 "bash": {
                     "enabled": true,
-                    "executable": crate::model::test_bash_executable(),
+                    "executable": crate::test_bash_executable(),
                     "defaultTimeoutMs": 120000,
                     "maxTimeoutMs": 300000,
                     "maxOutputChars": 30000,
@@ -1639,12 +1655,12 @@ mod tests {
         assert_eq!(resolved, PathBuf::from("C:/path/to/codeweave/.mcp-token"));
     }
 
-    /// D1: `config.example.json` must deserialize through the *real* config path
-    /// (`load_config` + `DaemonConfig`) and its advertised defaults must match the
-    /// code defaults, so the shipped example can never silently drift from what the
-    /// server actually does. Regression guard for the historical `8813` vs `8820` skew.
+    /// `config.example.json` must deserialize through the *real* config path
+    /// (`load_config` + `DaemonConfig`) and preserve the runtime contracts the
+    /// shipped template advertises. This guards both the historical port skew and
+    /// accidental reintroduction of an unsafe wildcard Host policy.
     #[test]
-    fn shipped_config_example_deserializes_and_matches_code_defaults() {
+    fn shipped_config_example_deserializes_and_matches_runtime_contracts() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
         let (server, root) = load_config(&path).expect("config.example.json must load");
 
@@ -1652,7 +1668,11 @@ mod tests {
         // start hits the port the README and connectors expect.
         assert_eq!(server.port, default_port());
         assert_eq!(server.port, 8813);
-        assert!(server.allowed_hosts.is_empty());
+        assert_eq!(
+            server.allowed_hosts,
+            ["localhost", "127.0.0.1", "::1", "codeweave.example.com"].map(str::to_owned)
+        );
+        assert!(!server.allowed_hosts.iter().any(|host| host == "*"));
 
         // The remainder must deserialize as the daemon config the server actually
         // uses at startup (load_config injects cache_root).

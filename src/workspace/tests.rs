@@ -6,7 +6,8 @@ use super::util::{
 };
 use super::{validated_push_target, RunBaseline, WorkspaceActor};
 use crate::index::content_hash;
-use crate::model::{test_bash_executable, BashConfig, PolicyConfig, WorkspaceConfig};
+use crate::model::{BashConfig, PolicyConfig, WorkspaceConfig};
+use crate::test_bash_executable;
 use chrono::Utc;
 use serde_json::json;
 use std::collections::HashSet;

@@ -607,9 +607,8 @@ fn add_latency_metrics(value: &mut Value, metrics: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{
-        test_bash_executable, BashConfig, PolicyConfig, SkillsConfig, WorkspaceSettings,
-    };
+    use crate::model::{BashConfig, PolicyConfig, SkillsConfig, WorkspaceSettings};
+    use crate::test_bash_executable;
     use tempfile::tempdir;
 
     fn test_bash_config() -> BashConfig {

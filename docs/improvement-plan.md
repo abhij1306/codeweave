@@ -4,6 +4,8 @@
 **Written:** 2026-07-11, revised 2026-07-12 (dropped Perplexity support; single-repo model; latency/efficiency/accuracy as primary metrics); P4 shipped 2026-07-13
 **Audience:** the implementing agent (Opus) and maintainers. Every phase lists concrete files, invariants that must not break, and acceptance criteria.
 
+> **Historical record:** this document preserves the observations, counts, line references, and proposed sequence from the dated implementation pass. It is not maintained as current architecture documentation. Use `docs/implementation.md`, the live tool registry, and current tests as the source of truth for the shipped system.
+
 ---
 
 ## 0. Goals and constraints
