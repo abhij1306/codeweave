@@ -250,7 +250,7 @@ This execution surface is trusted-client functionality, not a sandbox. File tool
 
 `server.toolProfile` selects which tools the server advertises and accepts. It is resolved once at startup from a single tool registry that is the sole source of truth for every advertised tool:
 
-- `full` (default) — all 26 tools. The default remains unchanged while the evaluated profile completes connector validation.
+- `full` (default) — all 26 tools. The connector-validation evaluation is complete, and `full` remains the default for this release.
 - `coding` — the measured 18-tool coding surface: workspace/retrieval/intelligence, all narrow edit tools, preview/transaction, Git status/diff/log, and the complete Bash lifecycle. It excludes capability/admin tools and uncommon, staging, commit, restore, and push Git operations.
 - `read-only` — seven inspection tools: workspace, retrieval, intelligence, preview, and Git status/diff/log. No writes or Bash.
 - `edit` — the same inspection core plus in-repository file edits, but no Bash and no staging, commit, restore, or push.

@@ -86,7 +86,7 @@ async fn explicit_invalid_bash_path_reports_unavailable_before_starting() {
         .unwrap_err();
 
     assert_eq!(error.0.code, "BASH_UNAVAILABLE");
-    assert!(supervisor.retained_run_ids().is_empty());
+    assert!(supervisor.runs.lock().is_empty());
 }
 
 #[test]
@@ -101,6 +101,28 @@ fn non_default_relative_bash_name_fails_closed_after_probe_failure() {
 
     assert_eq!(readiness.readiness, "unavailable");
     assert_eq!(readiness.resolved_executable, None);
+}
+
+#[test]
+fn trim_runs_notifies_actual_evictions() {
+    let cache = tempdir().unwrap();
+    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
+    let evicted = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&evicted);
+    supervisor.set_eviction_observer(Arc::new(move |run_ids| {
+        observed.lock().extend_from_slice(run_ids);
+    }));
+    let mut expired = record(cache.path(), "expired", "succeeded", "");
+    expired.ended_at = Some(Utc::now() - ChronoDuration::hours(2));
+    supervisor
+        .runs
+        .lock()
+        .insert("expired".to_owned(), Arc::new(Mutex::new(expired)));
+
+    supervisor.trim_runs();
+
+    assert_eq!(*evicted.lock(), vec!["expired".to_owned()]);
+    assert!(!supervisor.runs.lock().contains_key("expired"));
 }
 
 #[tokio::test]

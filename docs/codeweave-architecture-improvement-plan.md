@@ -1054,6 +1054,8 @@ Exit:
 
 ## Phase 8 — measured optimizations only
 
+**Implementation status (2026-07-13): complete for this release; no optimization adopted.** Five CodeWeave runs, three CrawlerAI runs, five deterministic 300k-LOC reference runs, memory counters, schema bytes, and existing workflow evidence were reviewed. CodeWeave quality and latency gates passed; the 300k maximum was 26.609 ms against 250 ms. CrawlerAI showed broad runner-sensitive latency increases across indexing and unrelated operation types, but no controlled algorithm-specific regression was established. The candidate indexes and caches therefore remain unimplemented. See [`phase8-optimization-evaluation.md`](phase8-optimization-evaluation.md).
+
 Candidates:
 
 - exact identifier posting list;

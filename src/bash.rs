@@ -14,7 +14,7 @@ use readiness::resolve_bash;
 pub use readiness::BashReadiness;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -26,6 +26,7 @@ use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
 pub(crate) type RunCompletionObserver = Arc<dyn Fn(&str, DateTime<Utc>) + Send + Sync>;
+pub(crate) type RunEvictionObserver = Arc<dyn Fn(&[String]) + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BashRunView {
@@ -137,6 +138,7 @@ pub struct BashSupervisor {
     retention_hours: i64,
     readiness: BashReadiness,
     completion_observer: Arc<Mutex<Option<RunCompletionObserver>>>,
+    eviction_observer: Arc<Mutex<Option<RunEvictionObserver>>>,
 }
 
 impl std::fmt::Debug for BashSupervisor {
@@ -236,11 +238,16 @@ impl BashSupervisor {
             retention_hours,
             readiness,
             completion_observer: Arc::new(Mutex::new(None)),
+            eviction_observer: Arc::new(Mutex::new(None)),
         })
     }
 
     pub(crate) fn set_completion_observer(&self, observer: RunCompletionObserver) {
         *self.completion_observer.lock() = Some(observer);
+    }
+
+    pub(crate) fn set_eviction_observer(&self, observer: RunEvictionObserver) {
+        *self.eviction_observer.lock() = Some(observer);
     }
 
     pub fn readiness(&self) -> BashReadiness {
@@ -274,10 +281,6 @@ impl BashSupervisor {
             .values()
             .filter(|record| record.lock().ended_at.is_none())
             .count()
-    }
-
-    pub fn retained_run_ids(&self) -> HashSet<String> {
-        self.runs.lock().keys().cloned().collect()
     }
 
     fn prepare_start_request(
@@ -771,6 +774,7 @@ impl BashSupervisor {
         let retention_hours = self.retention_hours;
         let cutoff = Utc::now() - ChronoDuration::hours(retention_hours);
         let mut removed_logs = Vec::new();
+        let mut removed_run_ids = Vec::new();
         {
             let mut runs = self.runs.lock();
             let expired: Vec<String> = runs
@@ -785,6 +789,7 @@ impl BashSupervisor {
                 .collect();
             for run_id in expired {
                 if let Some(record) = runs.remove(&run_id) {
+                    removed_run_ids.push(run_id);
                     removed_logs.push(record.lock().logs.clone());
                 }
             }
@@ -801,9 +806,15 @@ impl BashSupervisor {
                 let remove_count = runs.len().saturating_sub(MAX_RETAINED_RUNS);
                 for (run_id, _) in completed.into_iter().take(remove_count) {
                     if let Some(record) = runs.remove(&run_id) {
+                        removed_run_ids.push(run_id);
                         removed_logs.push(record.lock().logs.clone());
                     }
                 }
+            }
+        }
+        if !removed_run_ids.is_empty() {
+            if let Some(observer) = self.eviction_observer.lock().clone() {
+                observer(&removed_run_ids);
             }
         }
         for logs in removed_logs {

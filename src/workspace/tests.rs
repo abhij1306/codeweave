@@ -8,7 +8,7 @@ use super::{validated_push_target, RunBaseline, WorkspaceActor};
 use crate::index::content_hash;
 use crate::model::{BashConfig, PolicyConfig, WorkspaceConfig};
 use crate::test_bash_executable;
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::json;
 use std::collections::HashSet;
 use std::fs;
@@ -961,6 +961,41 @@ fn run_change_detection_includes_new_mutations_to_already_dirty_files() {
     let mutations = actor.mutations.lock().iter().cloned().collect::<Vec<_>>();
     let observed =
         actor.observed_run_changed_paths(&mutations, &baseline, generation + 1, None, &dirty_files);
+
+    assert_eq!(observed, HashSet::from(["existing.rs".to_owned()]));
+}
+
+#[test]
+fn delayed_reconcile_uses_file_modification_time_for_run_attribution() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("existing.rs");
+    fs::write(&path, "fn existing() {}\n").unwrap();
+    let actor = test_actor(root.path());
+    let generation = actor.generation();
+    let dirty_files = HashSet::from(["existing.rs".to_owned()]);
+    let baseline = RunBaseline::new(generation, dirty_files.clone());
+    fs::write(&path, "fn existing() { println!(\"changed\"); }\n").unwrap();
+    let ended_at = Utc::now() + ChronoDuration::seconds(5);
+    actor.mutations.lock().push_back(MutationRecord {
+        mutation_id: "delayed-watcher".to_owned(),
+        session_id: "external".to_owned(),
+        path: "existing.rs".to_owned(),
+        before_hash: Some("before".to_owned()),
+        after_hash: Some("after".to_owned()),
+        source: "external".to_owned(),
+        request_id: "watcher".to_owned(),
+        timestamp: ended_at + ChronoDuration::seconds(1),
+        generation: generation + 1,
+    });
+
+    let mutations = actor.mutations.lock().iter().cloned().collect::<Vec<_>>();
+    let observed = actor.observed_run_changed_paths(
+        &mutations,
+        &baseline,
+        generation + 1,
+        Some(&ended_at),
+        &dirty_files,
+    );
 
     assert_eq!(observed, HashSet::from(["existing.rs".to_owned()]));
 }

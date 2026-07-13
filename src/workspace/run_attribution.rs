@@ -13,7 +13,6 @@ pub(super) struct RunBaseline {
 
 #[derive(Debug, Clone)]
 struct RunCompletion {
-    generation: u64,
     ended_at: DateTime<Utc>,
 }
 
@@ -64,11 +63,8 @@ impl RunAttribution {
         }
     }
 
-    pub(super) fn record_completion(&self, run_id: &str, generation: u64, ended_at: DateTime<Utc>) {
-        let completion = RunCompletion {
-            generation,
-            ended_at,
-        };
+    pub(super) fn record_completion(&self, run_id: &str, ended_at: DateTime<Utc>) {
+        let completion = RunCompletion { ended_at };
         let mut state = self.state.lock();
         if let Some(baseline) = state.baselines.get_mut(run_id) {
             if baseline.completion.is_none() {
@@ -81,24 +77,20 @@ impl RunAttribution {
         }
     }
 
-    pub(super) fn start_run(
-        &self,
-        run_id: &str,
-        generation: u64,
-        dirty_files: HashSet<String>,
-        retained_run_ids: &HashSet<String>,
-    ) {
+    pub(super) fn start_run(&self, run_id: &str, generation: u64, dirty_files: HashSet<String>) {
         let mut state = self.state.lock();
-        state
-            .baselines
-            .retain(|known_run, _| retained_run_ids.contains(known_run));
-        state
-            .pending_completions
-            .retain(|known_run, _| retained_run_ids.contains(known_run));
         let completion = state.pending_completions.remove(run_id);
         let mut baseline = RunBaseline::new(generation, dirty_files);
         baseline.completion = completion;
         state.baselines.insert(run_id.to_owned(), baseline);
+    }
+
+    pub(super) fn evict_runs(&self, run_ids: &[String]) {
+        let mut state = self.state.lock();
+        for run_id in run_ids {
+            state.baselines.remove(run_id);
+            state.pending_completions.remove(run_id);
+        }
     }
 
     pub(super) fn observe<F>(
@@ -124,10 +116,7 @@ impl RunAttribution {
         }
         if terminal && baseline.completion.is_none() {
             if let Some(ended_at) = result_ended_at {
-                baseline.completion = Some(RunCompletion {
-                    generation: current_generation,
-                    ended_at,
-                });
+                baseline.completion = Some(RunCompletion { ended_at });
             }
         }
         if let Some(frozen) = &baseline.frozen {
@@ -138,17 +127,17 @@ impl RunAttribution {
             };
         }
 
-        let (attribution_generation, ended_at) = if terminal {
+        let attribution_generation = current_generation;
+        let ended_at = if terminal {
             let completion = baseline
                 .completion
                 .clone()
                 .unwrap_or_else(|| RunCompletion {
-                    generation: current_generation,
                     ended_at: Utc::now(),
                 });
-            (completion.generation, Some(completion.ended_at))
+            Some(completion.ended_at)
         } else {
-            (current_generation, None)
+            None
         };
         let changed = summarize_changed_paths(changed_paths(
             baseline,
@@ -177,25 +166,63 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn completion_recorded_before_start_is_attached_to_the_baseline() {
+    fn completion_recorded_before_start_uses_post_reconcile_generation() {
         let attribution = RunAttribution::new();
         let ended_at = Utc::now();
-        attribution.record_completion("run", 4, ended_at);
-        attribution.start_run("run", 2, HashSet::new(), &HashSet::from(["run".into()]));
+        attribution.record_completion("run", ended_at);
+        attribution.start_run("run", 2, HashSet::new());
 
-        let snapshot = attribution.observe("run", 7, HashSet::new(), true, None, |_, _, _, _| {
-            HashSet::new()
-        });
+        let snapshot = attribution.observe(
+            "run",
+            7,
+            HashSet::new(),
+            true,
+            None,
+            |_, generation, completion, _| {
+                assert_eq!(generation, 7);
+                assert_eq!(completion, Some(&ended_at));
+                HashSet::new()
+            },
+        );
 
         assert_eq!(snapshot.start_generation, 2);
-        assert_eq!(snapshot.attribution_generation, 4);
+        assert_eq!(snapshot.attribution_generation, 7);
+    }
+
+    #[test]
+    fn later_serialized_start_does_not_remove_newer_run() {
+        let attribution = RunAttribution::new();
+        attribution.start_run("newer", 5, HashSet::new());
+        attribution.start_run("older", 2, HashSet::new());
+
+        let snapshot =
+            attribution.observe("newer", 6, HashSet::new(), false, None, |_, _, _, _| {
+                HashSet::new()
+            });
+
+        assert_eq!(snapshot.start_generation, 5);
+    }
+
+    #[test]
+    fn eviction_removes_only_notified_run_state() {
+        let attribution = RunAttribution::new();
+        attribution.start_run("old", 1, HashSet::new());
+        attribution.start_run("current", 2, HashSet::new());
+        attribution.record_completion("pending", Utc::now());
+
+        attribution.evict_runs(&["old".to_owned(), "pending".to_owned()]);
+
+        let state = attribution.state.lock();
+        assert!(!state.baselines.contains_key("old"));
+        assert!(state.baselines.contains_key("current"));
+        assert!(!state.pending_completions.contains_key("pending"));
     }
 
     #[test]
     fn concurrent_terminal_observers_share_one_frozen_result() {
         let attribution = Arc::new(RunAttribution::new());
-        attribution.start_run("run", 1, HashSet::new(), &HashSet::from(["run".into()]));
-        attribution.record_completion("run", 2, Utc::now());
+        attribution.start_run("run", 1, HashSet::new());
+        attribution.record_completion("run", Utc::now());
         let barrier = Arc::new(Barrier::new(3));
         let mut handles = Vec::new();
         for path in ["one.rs", "two.rs"] {
@@ -213,7 +240,7 @@ mod tests {
         let second = handles.remove(0).join().unwrap();
 
         assert_eq!(first, second);
-        assert_eq!(first.attribution_generation, 2);
+        assert_eq!(first.attribution_generation, 3);
         assert_eq!(first.changed.count, 1);
     }
 }

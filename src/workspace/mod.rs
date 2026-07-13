@@ -197,15 +197,14 @@ impl WorkspaceActor {
         generation.store(persisted_generation.max(1), Ordering::Release);
         let journal_file = open_journal(&journal_path)?;
         let run_attribution = Arc::new(RunAttribution::new());
-        let completion_generation = generation.clone();
         let completion_attribution = Arc::clone(&run_attribution);
+        let eviction_attribution = Arc::clone(&run_attribution);
         let bash = BashSupervisor::new(workspace_cache, policy.clone())?;
         bash.set_completion_observer(Arc::new(move |run_id, ended_at| {
-            completion_attribution.record_completion(
-                run_id,
-                completion_generation.load(Ordering::Acquire),
-                ended_at,
-            );
+            completion_attribution.record_completion(run_id, ended_at);
+        }));
+        bash.set_eviction_observer(Arc::new(move |run_ids| {
+            eviction_attribution.evict_runs(run_ids);
         }));
         let journal_ms = journal_started.elapsed().as_millis();
         let open_diagnostics = json!({
@@ -783,9 +782,7 @@ impl WorkspaceActor {
                     .await?;
                 run_startup_ms = Some(run_started.elapsed().as_millis());
                 if let Some(run_id) = value.get("run_id").and_then(Value::as_str) {
-                    let retained = self.bash.retained_run_ids();
-                    self.run_attribution
-                        .start_run(run_id, before, before_dirty, &retained);
+                    self.run_attribution.start_run(run_id, before, before_dirty);
                 }
                 value
             }
@@ -945,7 +942,10 @@ impl WorkspaceActor {
                 mutation.generation > baseline.generation
                     && mutation.generation <= end_generation
                     && ended_at
-                        .map(|ended| mutation.timestamp <= *ended)
+                        .map(|ended| {
+                            mutation.timestamp <= *ended
+                                || self.path_modified_at_or_before(&mutation.path, ended)
+                        })
                         .unwrap_or(true)
             })
             .map(|mutation| mutation.path.clone())

@@ -145,7 +145,8 @@ pub fn registry() -> &'static [ToolDefinition] {
             input_schema: retrieval::code_capabilities,
         },
         ToolDefinition {
-            name: "code_intelligence",            title: "Code Intelligence",
+            name: "code_intelligence",
+            title: "Code Intelligence",
             description: "Resolve definitions, references, diagnostics, or a rename preview through the optional semantic backend. Results always label semantic, syntactic, or lexical evidence.",
             safety: ToolSafety::Read,
             profiles: &[Coding, ReadOnly, Edit],
