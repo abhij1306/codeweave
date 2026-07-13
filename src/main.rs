@@ -601,11 +601,19 @@ struct Check {
 
 impl Check {
     fn ok(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, ok: true, detail: detail.into() }
+        Self {
+            name,
+            ok: true,
+            detail: detail.into(),
+        }
     }
 
     fn fail(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, ok: false, detail: detail.into() }
+        Self {
+            name,
+            ok: false,
+            detail: detail.into(),
+        }
     }
 }
 
@@ -615,22 +623,40 @@ async fn doctor_checks(cli: &Cli) -> Vec<Check> {
     let mut checks = Vec::new();
     let (server, config) = match load_config(&cli.config) {
         Ok(value) => {
-            checks.push(Check::ok("config", format!("parsed {}", cli.config.display())));
+            checks.push(Check::ok(
+                "config",
+                format!("parsed {}", cli.config.display()),
+            ));
             value
         }
         Err(error) => {
-            checks.push(Check::fail("config", format!("{error}; fix the JSON or pass --config <path>")));
+            checks.push(Check::fail(
+                "config",
+                format!("{error}; fix the JSON or pass --config <path>"),
+            ));
             return checks;
         }
     };
 
     match validate_auth_mode(&server.auth_mode) {
-        Ok(()) => checks.push(Check::ok("auth", format!("{} authentication", server.auth_mode))),
-        Err(error) => checks.push(Check::fail("auth", format!("{error}; set server.authMode to bearer or none"))),
+        Ok(()) => checks.push(Check::ok(
+            "auth",
+            format!("{} authentication", server.auth_mode),
+        )),
+        Err(error) => checks.push(Check::fail(
+            "auth",
+            format!("{error}; set server.authMode to bearer or none"),
+        )),
     }
     match resolve_tool_access(&server, &config) {
-        Ok(_) => checks.push(Check::ok("tool profile", format!("{} resolves", server.tool_profile))),
-        Err(error) => checks.push(Check::fail("tool profile", format!("{error}; fix server.toolProfile or server.tools"))),
+        Ok(_) => checks.push(Check::ok(
+            "tool profile",
+            format!("{} resolves", server.tool_profile),
+        )),
+        Err(error) => checks.push(Check::fail(
+            "tool profile",
+            format!("{error}; fix server.toolProfile or server.tools"),
+        )),
     }
 
     let workspace_path = config
@@ -645,20 +671,38 @@ async fn doctor_checks(cli: &Cli) -> Vec<Check> {
                 true
             }
             Err(error) => {
-                checks.push(Check::fail("workspace", format!("{error}; set workspace.path to an existing directory")));
+                checks.push(Check::fail(
+                    "workspace",
+                    format!("{error}; set workspace.path to an existing directory"),
+                ));
                 false
             }
         },
         None => {
-            checks.push(Check::fail("workspace", "workspace.path is missing; set it to the project directory"));
+            checks.push(Check::fail(
+                "workspace",
+                "workspace.path is missing; set it to the project directory",
+            ));
             false
         }
     };
 
     match ProcessCommand::new("git").arg("--version").output() {
-        Ok(output) if output.status.success() => checks.push(Check::ok("git", String::from_utf8_lossy(&output.stdout).trim().to_owned())),
-        Ok(output) => checks.push(Check::fail("git", format!("git --version exited {}; install Git and add it to PATH", output.status))),
-        Err(error) => checks.push(Check::fail("git", format!("{error}; install Git and add it to PATH"))),
+        Ok(output) if output.status.success() => checks.push(Check::ok(
+            "git",
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        )),
+        Ok(output) => checks.push(Check::fail(
+            "git",
+            format!(
+                "git --version exited {}; install Git and add it to PATH",
+                output.status
+            ),
+        )),
+        Err(error) => checks.push(Check::fail(
+            "git",
+            format!("{error}; install Git and add it to PATH"),
+        )),
     }
 
     if matches!(cli.transport, Transport::Stdio) {
@@ -679,44 +723,88 @@ async fn doctor_checks(cli: &Cli) -> Vec<Check> {
     if matches!(cli.transport, Transport::Http) && server.auth_mode == "bearer" {
         let token_path = config_relative_path(&cli.config, &server.token_file);
         match std::fs::read_to_string(&token_path) {
-            Ok(value) if !value.trim().is_empty() => checks.push(Check::ok("token", format!("{} is present", token_path.display()))),
-            Ok(_) => checks.push(Check::fail("token", format!("{} is empty; delete it and run serve, or write a token", token_path.display()))),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(Check::fail("token", format!("{} is missing; run serve once or run init", token_path.display()))),
-            Err(error) => checks.push(Check::fail("token", format!("cannot read {}: {error}", token_path.display()))),
+            Ok(value) if !value.trim().is_empty() => checks.push(Check::ok(
+                "token",
+                format!("{} is present", token_path.display()),
+            )),
+            Ok(_) => checks.push(Check::fail(
+                "token",
+                format!(
+                    "{} is empty; delete it and run serve, or write a token",
+                    token_path.display()
+                ),
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(Check::fail(
+                "token",
+                format!(
+                    "{} is missing; run serve once or run init",
+                    token_path.display()
+                ),
+            )),
+            Err(error) => checks.push(Check::fail(
+                "token",
+                format!("cannot read {}: {error}", token_path.display()),
+            )),
         }
     } else {
-        checks.push(Check::ok("token", "not required for this transport/auth mode"));
+        checks.push(Check::ok(
+            "token",
+            "not required for this transport/auth mode",
+        ));
     }
 
     if workspace_ok {
         let manager = Arc::new(WorkspaceManager::default());
-        match manager.dispatch(SessionKey::stdio(), "initialize", &config).await {
+        match manager
+            .dispatch(SessionKey::stdio(), "initialize", &config)
+            .await
+        {
             Ok(init) => {
                 let indexed = init["index_ready"].as_bool().unwrap_or(false);
                 let files = init["file_count"].as_u64().unwrap_or_default();
                 if indexed {
                     checks.push(Check::ok("index", format!("ready; {files} files indexed")));
                 } else {
-                    checks.push(Check::fail("index", "initialization returned index_ready=false"));
+                    checks.push(Check::fail(
+                        "index",
+                        "initialization returned index_ready=false",
+                    ));
                 }
-                let bash_enabled = config["policy"]["bash"]["enabled"].as_bool().unwrap_or(false);
+                let bash_enabled = config["policy"]["bash"]["enabled"]
+                    .as_bool()
+                    .unwrap_or(false);
                 let bash_available = init["bash_available"].as_bool().unwrap_or(false);
                 if !bash_enabled {
                     checks.push(Check::ok("bash", "disabled by policy"));
                 } else if bash_available {
-                    checks.push(Check::ok("bash", "available (pre-probed during initialization)"));
+                    checks.push(Check::ok(
+                        "bash",
+                        "available (pre-probed during initialization)",
+                    ));
                 } else {
                     checks.push(Check::fail("bash", "configured bash is unavailable; install it or update policy.bash.executable"));
                 }
             }
             Err(error) => {
-                checks.push(Check::fail("index", format!("{error}; fix the workspace or index configuration")));
-                checks.push(Check::fail("bash", "not checked because initialization failed"));
+                checks.push(Check::fail(
+                    "index",
+                    format!("{error}; fix the workspace or index configuration"),
+                ));
+                checks.push(Check::fail(
+                    "bash",
+                    "not checked because initialization failed",
+                ));
             }
         }
     } else {
-        checks.push(Check::fail("index", "not checked until workspace.path is fixed"));
-        checks.push(Check::fail("bash", "not checked until workspace.path is fixed"));
+        checks.push(Check::fail(
+            "index",
+            "not checked until workspace.path is fixed",
+        ));
+        checks.push(Check::fail(
+            "bash",
+            "not checked until workspace.path is fixed",
+        ));
     }
     checks
 }
@@ -742,22 +830,37 @@ fn run_init(cli: &Cli, requested_path: Option<PathBuf>, force: bool) -> Result<(
             print!("Project directory [{}]: ", cwd.display());
             io::stdout().flush().context("flushing prompt")?;
             let mut input = String::new();
-            io::stdin().read_line(&mut input).context("reading project directory")?;
+            io::stdin()
+                .read_line(&mut input)
+                .context("reading project directory")?;
             let trimmed = input.trim();
-            if trimmed.is_empty() { cwd } else { PathBuf::from(trimmed) }
+            if trimmed.is_empty() {
+                cwd
+            } else {
+                PathBuf::from(trimmed)
+            }
         }
     };
     let project = security::canonical_root(&project).map_err(|error| anyhow::anyhow!(error))?;
     if cli.config.exists() && !force {
-        anyhow::bail!("{} already exists; rerun with --force to replace it", cli.config.display());
+        anyhow::bail!(
+            "{} already exists; rerun with --force to replace it",
+            cli.config.display()
+        );
     }
 
     let mut template: Value = serde_json::from_str(include_str!("../config.example.json"))
         .context("parsing embedded config.example.json")?;
     template["workspace"]["path"] = Value::String(project.to_string_lossy().into_owned());
-    let rendered = serde_json::to_string_pretty(&template).context("serializing config template")?;
-    if let Some(parent) = cli.config.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let rendered =
+        serde_json::to_string_pretty(&template).context("serializing config template")?;
+    if let Some(parent) = cli
+        .config
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
     std::fs::write(&cli.config, format!("{rendered}\n"))
         .with_context(|| format!("writing {}", cli.config.display()))?;
@@ -767,7 +870,11 @@ fn run_init(cli: &Cli, requested_path: Option<PathBuf>, force: bool) -> Result<(
     if server.auth_mode == "bearer" {
         load_or_create_bearer_token(&token_path)?;
     }
-    println!("Created {} for {}.", cli.config.display(), project.display());
+    println!(
+        "Created {} for {}.",
+        cli.config.display(),
+        project.display()
+    );
     println!("Local MCP URL: http://{}:{}/mcp", server.host, server.port);
     if server.auth_mode == "bearer" {
         println!("Origin bearer token: {}", token_path.display());
@@ -865,10 +972,21 @@ mod tests {
             host: None,
             port: None,
         };
-        run_init(&init_cli, Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))), false).unwrap();
+        run_init(
+            &init_cli,
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            false,
+        )
+        .unwrap();
 
         let checks = doctor_checks(&cli_for(config_path)).await;
-        assert!(checks.iter().find(|check| check.name == "workspace").unwrap().ok);
+        assert!(
+            checks
+                .iter()
+                .find(|check| check.name == "workspace")
+                .unwrap()
+                .ok
+        );
         let index = checks.iter().find(|check| check.name == "index").unwrap();
         assert!(index.ok, "{}", index.detail);
         assert!(index.detail.contains("files indexed"));
@@ -878,12 +996,16 @@ mod tests {
     async fn doctor_checks_reports_missing_workspace_without_panicking() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.json");
-        let mut template: Value = serde_json::from_str(include_str!("../config.example.json")).unwrap();
+        let mut template: Value =
+            serde_json::from_str(include_str!("../config.example.json")).unwrap();
         template["workspace"]["path"] = json!(temp.path().join("does-not-exist").to_string_lossy());
         std::fs::write(&config_path, serde_json::to_vec(&template).unwrap()).unwrap();
 
         let checks = doctor_checks(&cli_for(config_path)).await;
-        let workspace = checks.iter().find(|check| check.name == "workspace").unwrap();
+        let workspace = checks
+            .iter()
+            .find(|check| check.name == "workspace")
+            .unwrap();
         assert!(!workspace.ok);
         assert!(workspace.detail.contains("WORKSPACE_NOT_FOUND"));
     }
@@ -908,7 +1030,10 @@ mod tests {
         run_init(&cli, Some(project.path().to_path_buf()), false).unwrap();
         let (_, root) = load_config(&config_path).unwrap();
         let daemon: crate::model::DaemonConfig = serde_json::from_value(root).unwrap();
-        assert_eq!(PathBuf::from(daemon.workspace.path), project.path().canonicalize().unwrap());
+        assert_eq!(
+            PathBuf::from(daemon.workspace.path),
+            project.path().canonicalize().unwrap()
+        );
         assert!(config_relative_path(&config_path, ".mcp-token").is_file());
         assert!(run_init(&cli, Some(project.path().to_path_buf()), false).is_err());
     }
@@ -926,8 +1051,12 @@ mod tests {
     /// Full-profile tool access with bash available — the default context for
     /// `prepare` tests that are not specifically exercising profile gating.
     fn full_access() -> tools::ToolAccess {
-        tools::resolve_access(Some(tools::Profile::Full), &tools::CustomSelection::default(), true)
-            .unwrap()
+        tools::resolve_access(
+            Some(tools::Profile::Full),
+            &tools::CustomSelection::default(),
+            true,
+        )
+        .unwrap()
     }
 
     fn tool<'a>(all: &'a Value, name: &str) -> &'a Value {
@@ -1198,15 +1327,27 @@ mod tests {
             ("git_restore", "restore"),
             ("git_push", "push"),
         ] {
-            let prepared = prepare(&manager, &config, &full_access(), method, json!({"action": "spoofed"}))
-                .await
-                .unwrap();
+            let prepared = prepare(
+                &manager,
+                &config,
+                &full_access(),
+                method,
+                json!({"action": "spoofed"}),
+            )
+            .await
+            .unwrap();
             assert_eq!(prepared["action"], action, "{method}");
         }
 
-        let bash = prepare(&manager, &config, &full_access(), "bash", json!({"command": "printf test"}))
-            .await
-            .unwrap();
+        let bash = prepare(
+            &manager,
+            &config,
+            &full_access(),
+            "bash",
+            json!({"command": "printf test"}),
+        )
+        .await
+        .unwrap();
         assert!(bash.get("action").is_none());
         for (method, input) in [
             ("bash_status", json!({"run_id": "run_test"})),
@@ -1216,12 +1357,20 @@ mod tests {
             ),
             ("bash_cancel", json!({"run_id": "run_test"})),
         ] {
-            let prepared = prepare(&manager, &config, &full_access(), method, input).await.unwrap();
+            let prepared = prepare(&manager, &config, &full_access(), method, input)
+                .await
+                .unwrap();
             assert!(prepared.get("action").is_none(), "{method}");
         }
-        assert!(prepare(&manager, &config, &full_access(), "bash", json!({"command": "  "}))
-            .await
-            .is_err());
+        assert!(prepare(
+            &manager,
+            &config,
+            &full_access(),
+            "bash",
+            json!({"command": "  "})
+        )
+        .await
+        .is_err());
         assert!(prepare(
             &manager,
             &config,
@@ -1240,9 +1389,15 @@ mod tests {
         )
         .await
         .is_err());
-        let removed = prepare(&manager, &config, &full_access(), "task_run", json!({"profile": "test"}))
-            .await
-            .unwrap_err();
+        let removed = prepare(
+            &manager,
+            &config,
+            &full_access(),
+            "task_run",
+            json!({"profile": "test"}),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(removed.0.code, "METHOD_NOT_FOUND");
     }
 
@@ -1278,7 +1433,9 @@ mod tests {
             json!({"command": "printf command-only"}),
             json!({"command": "printf command-with-timeout", "timeout_ms": 5000}),
         ] {
-            let prepared = prepare(&manager, &config, &full_access(), "bash", input).await.unwrap();
+            let prepared = prepare(&manager, &config, &full_access(), "bash", input)
+                .await
+                .unwrap();
             let result = manager
                 .dispatch(SessionKey::stdio(), "bash", &prepared)
                 .await

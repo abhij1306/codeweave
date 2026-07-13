@@ -465,10 +465,12 @@ impl WorkspaceActor {
                             json!({"path": item.path}),
                         ));
                     }
-                    Some(false) => syntax_checks
-                        .push(json!({"path": item.path, "syntax_check": "checked"})),
-                    None => syntax_checks
-                        .push(json!({"path": item.path, "syntax_check": "skipped"})),
+                    Some(false) => {
+                        syntax_checks.push(json!({"path": item.path, "syntax_check": "checked"}))
+                    }
+                    None => {
+                        syntax_checks.push(json!({"path": item.path, "syntax_check": "skipped"}))
+                    }
                 }
             }
         }

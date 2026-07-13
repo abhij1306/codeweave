@@ -1,6 +1,6 @@
+use crate::index::Ranking;
 use crate::model::{required_str, AppError, AppResult, DaemonConfig, WorkspaceConfig};
 use crate::security::{canonical_root, validate_relative};
-use crate::index::Ranking;
 use crate::workspace::WorkspaceActor;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -629,7 +629,10 @@ mod tests {
         // The actor is available immediately (eager start) — the first code tool
         // pays zero index-build cost.
         let actor = manager.actor().unwrap();
-        assert_eq!(actor.root_path(), std::fs::canonicalize(root.path()).unwrap());
+        assert_eq!(
+            actor.root_path(),
+            std::fs::canonicalize(root.path()).unwrap()
+        );
     }
 
     #[test]

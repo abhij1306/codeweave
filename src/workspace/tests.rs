@@ -1647,7 +1647,10 @@ async fn json_edits_are_syntax_checked_and_yaml_edits_are_reported_skipped() {
 #[tokio::test]
 async fn symbol_anchored_insert_positions_place_content_relative_to_the_symbol() {
     let cases = [
-        ("before", "// before-marker\nfn target() {\n    body();\n}\n"),
+        (
+            "before",
+            "// before-marker\nfn target() {\n    body();\n}\n",
+        ),
         ("after", "fn target() {\n    body();\n}\n// after-marker\n"),
         (
             "inside_start",

@@ -731,13 +731,8 @@ impl CodeIndex {
                 }))
             }
             "symbol" => {
-                let results = self.symbol_results(
-                    workspace_id,
-                    query,
-                    &path_filters,
-                    max_results,
-                    false,
-                );
+                let results =
+                    self.symbol_results(workspace_id, query, &path_filters, max_results, false);
                 Ok(
                     json!({"mode": mode, "snapshot_id": snapshot_id, "result_count": results.len(), "results": results}),
                 )

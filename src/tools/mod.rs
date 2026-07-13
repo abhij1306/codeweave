@@ -540,7 +540,8 @@ mod tests {
 
     #[test]
     fn list_payload_shape_is_valid_and_flat() {
-        let access = resolve_access(Some(Profile::Full), &CustomSelection::default(), true).unwrap();
+        let access =
+            resolve_access(Some(Profile::Full), &CustomSelection::default(), true).unwrap();
         let items = access.list_payload().as_array().unwrap();
         assert_eq!(items.len(), 27);
         for item in items {
@@ -550,7 +551,12 @@ mod tests {
             assert_eq!(item["execution"]["taskSupport"], "forbidden");
             let encoded = schema.to_string();
             for forbidden in ["\"oneOf\"", "\"allOf\"", "\"not\"", "\"const\""] {
-                assert!(!encoded.contains(forbidden), "{} in {}", forbidden, item["name"]);
+                assert!(
+                    !encoded.contains(forbidden),
+                    "{} in {}",
+                    forbidden,
+                    item["name"]
+                );
             }
         }
     }

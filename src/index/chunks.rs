@@ -160,7 +160,13 @@ fn push_remainder(chunks: &mut Vec<Chunk>, lines: &[&str], start: usize, end: us
 pub(super) fn path_field(path_lower: &str) -> HashMap<String, u32> {
     let separated: String = path_lower
         .chars()
-        .map(|c| if matches!(c, '/' | '\\' | '_' | '.' | '-') { ' ' } else { c })
+        .map(|c| {
+            if matches!(c, '/' | '\\' | '_' | '.' | '-') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let mut counts: HashMap<String, u32> = HashMap::new();
     for word in separated.split(|c: char| c.is_whitespace()) {

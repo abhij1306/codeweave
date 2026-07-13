@@ -6,11 +6,11 @@
 //! duplicated; the same source files back both targets. Keeping it minimal
 //! avoids turning the whole server into a library (the P2 "no reorg" decision).
 
+#[path = "index/mod.rs"]
+pub mod index;
 #[path = "model.rs"]
 pub mod model;
 #[path = "security.rs"]
 pub mod security;
 #[path = "symbols.rs"]
 pub mod symbols;
-#[path = "index/mod.rs"]
-pub mod index;

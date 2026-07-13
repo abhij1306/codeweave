@@ -750,7 +750,8 @@ fn exclusion_patterns_reject_reinclusion_rules() {
 
 #[test]
 fn build_chunks_bounds_symbols_and_covers_remainder() {
-    let content = "use std::io;\n\nfn alpha() {\n    let _ = 1;\n}\n\nfn beta() {\n    let _ = 2;\n}\n";
+    let content =
+        "use std::io;\n\nfn alpha() {\n    let _ = 1;\n}\n\nfn beta() {\n    let _ = 2;\n}\n";
     let symbols = extract_symbols(Path::new("src/sample.rs"), content);
     let built = chunks::build_chunks(content, &symbols);
 
