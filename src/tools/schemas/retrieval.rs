@@ -1,5 +1,6 @@
 //! Input schemas for the single public retrieval tool and capability discovery.
 
+use crate::contracts::retrieval_operation_names;
 use serde_json::{json, Value};
 
 pub fn code_retrieve() -> Value {
@@ -14,7 +15,7 @@ pub fn code_retrieve() -> Value {
                     "type": "object",
                     "properties": {
                         "id": {"type": "string", "minLength": 1, "maxLength": 80},
-                        "operation": {"type": "string", "enum": ["find_file", "find_symbol", "search_text", "find_references", "symbols_overview", "repo_map", "read"]},
+                        "operation": {"type": "string", "enum": retrieval_operation_names()},
                         "name": {"type": "string", "minLength": 1, "description": "Filename substring or glob for find_file."},
                         "symbol": {"type": "string", "minLength": 1, "description": "Symbol selector for find_symbol or find_references."},
                         "pattern": {"type": "string", "minLength": 1, "description": "Literal text or regular expression for search_text."},

@@ -643,15 +643,24 @@ fn code_capabilities_reports_public_contracts() {
         capabilities["editing"]["supports_handle_range_replace"],
         true
     );
+    assert_eq!(capabilities["contract_version"], 2);
+    assert_eq!(capabilities["editing"]["atomic_file_replace"], true);
+    assert_eq!(capabilities["editing"]["atomic_multi_file_commit"], false);
     assert_eq!(
-        capabilities["editing"]["supports_rollback_on_failure"],
-        false
+        capabilities["editing"]["compensating_restore"],
+        "best_effort"
     );
+    assert_eq!(capabilities["editing"]["manual_recovery_possible"], true);
     assert_eq!(
         capabilities["editing"]["validation_failures_preserve_edits"],
         true
     );
     assert_eq!(capabilities["editing"]["validation_may_run_detached"], true);
+    assert!(capabilities["editing"]
+        .get("supports_rollback_on_failure")
+        .is_none());
+    assert_eq!(capabilities["dynamic"]["workspace_id"], "main");
+    assert!(capabilities["error_registry"].is_array());
 }
 
 #[test]
@@ -1450,6 +1459,7 @@ async fn failed_bash_validation_preserves_mutation() {
     assert_eq!(result["applied"], true);
     assert_eq!(result["rolled_back"], false);
     assert_eq!(result["validation_failed"], true);
+    assert_eq!(result["validation_status"], "failed");
     assert_eq!(result["reason"], "validation_failed");
     assert_eq!(result["validation"].as_array().unwrap().len(), 2);
     assert_eq!(
@@ -1578,6 +1588,7 @@ async fn slow_bash_validation_queues_remaining_commands() {
         .unwrap();
     assert_eq!(result["applied"], true);
     assert_eq!(result["validation_pending"], true);
+    assert_eq!(result["validation_status"], "pending");
     assert_eq!(result["validation"].as_array().unwrap().len(), 2);
     assert_eq!(
         result["validation"][1]["command"],
@@ -1665,6 +1676,7 @@ async fn detached_validation_keeps_leading_failure_as_primary_run() {
         .await
         .unwrap();
 
+    assert_eq!(result["validation_status"], "pending");
     let leading_run_id = result["validation_run_id"].as_str().unwrap();
     let deferred_run_id = result["deferred_validation_run_id"].as_str().unwrap();
     assert_eq!(result["validation"][0]["result"]["run_id"], leading_run_id);
@@ -2296,6 +2308,7 @@ async fn deprecated_rollback_flag_does_not_cancel_or_revert_validation() {
     assert_eq!(result["rolled_back"], false);
     assert_eq!(result["validation_failed"], false);
     assert_eq!(result["validation_pending"], true);
+    assert_eq!(result["validation_status"], "pending");
     assert_eq!(
         fs::read_to_string(root.path().join("value.rs")).unwrap(),
         "fn value() -> i32 { 2 }\n"

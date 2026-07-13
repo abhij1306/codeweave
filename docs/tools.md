@@ -63,7 +63,7 @@ Returns the active workspace identity, the `code_retrieve` operation and target 
 
 Provides definition, references, diagnostics, and rename-preview operations through optional persistent language servers. Results label evidence as `semantic`, `syntactic`, or `lexical`. Rename preview never writes files; applying the preview requires `code_transaction`.
 
-Language servers start lazily, remain alive for reuse, and restart once after transport failure. `line` is one-based and `column` is a zero-based UTF-16 offset.
+Supported presets are rust-analyzer, basedpyright, and typescript-language-server. Each configured backend has one worker thread that owns the process and all JSON-RPC reads/writes. Documents use hash/version-tracked full-text `didOpen`/`didChange` synchronization and are reopened lazily after one transport restart. Server capabilities, synchronization kind, position encoding, server identity, initialization latency, first- and last-request latency, bounded warm-request p50, request count, readiness, and last error are exposed through `code_capabilities`. `line` is one-based; `column` is a zero-based UTF-16 code-unit offset within that line and is converted to the server's negotiated encoding.
 
 ```json
 {

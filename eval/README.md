@@ -1,44 +1,84 @@
-# eval — retrieval + latency baseline
+# eval — production retrieval baseline
 
-A minimal, offline benchmark for CodeWeave's retrieval engine. It scans either
-CodeWeave or the larger CrawlerAI Python/TypeScript repository with the real
-`CodeIndex`, runs a fixed query set through `CodeIndex::context`, and reports
-retrieval quality and latency.
+The evaluator executes the same explicit operation dispatcher and index search
+function used by the MCP `code_retrieve` route:
 
-```sh
-cargo run -p eval -- --ranking v1
-cargo run -p eval -- --repo crawlerai --ranking v1
-cargo run -p eval -- --repo crawlerai --ranking v2
+```text
+prepare_retrieval_operation -> execute_index_search -> CodeIndex::search
 ```
 
-CodeWeave remains the default and writes `eval/baseline/v1.json`. CrawlerAI
-writes `eval/baseline/crawlerai/v1.json` and `v2.json`, so the two repositories
-never overwrite each other's results.
+```sh
+cargo run -p eval --
+cargo run -p eval -- --repo crawlerai
+cargo run -p eval -- --repo crawlerai --repo-path ../CrawlerAI
+```
 
-By default, CrawlerAI is resolved at the sibling path `../CrawlerAI`. Override
-that with `--repo-path <path>` or the `CRAWLERAI_REPO` environment variable.
-The crawler query set records its base Git revision, and every baseline records
-the actual revision and whether the worktree was dirty. A revision mismatch or
-dirty tree is reported as a warning rather than hidden; use a clean checkout at
-the pinned revision for a reproducible release gate.
+Operation fixtures live in [`operations/`](operations/) and baselines are written
+to `eval/baseline/live/<repo>.json`.
 
-## What it measures
+## What the baseline records
 
-- **Recall@1 / @5 / @10** — did an expected target path appear in the top-k?
-- **MRR@10** — mean reciprocal rank of the first hit.
-- **Mean chars** — average payload size per query (token cost proxy).
-- **Cold / warm index (ms)** — full scan vs. a second scan of the unchanged tree.
-- **Search p50 / p95 (ms)** — per-query `context` latency.
+- Recall@1 / @5 / @10 and MRR@10 for explicit retrieval operations.
+- Per-operation latency plus p50 and p95.
+- A real cold scan and a warm persisted-cache load.
+- Indexed file count, total LOC, source LOC, content bytes, token/posting counts,
+  symbol counts, and a documented lower bound for owned heap bytes.
+- Git revision and dirty-worktree state.
+- Known failures as named fixture results rather than hidden aggregate noise.
 
-Queries live in [`queries/codeweave.json`](queries/codeweave.json) and
-[`queries/crawlerai.json`](queries/crawlerai.json); each lists the
-workspace-relative path(s) a good ranker should surface. Queries may also mark
-paths as dirty or recently mutated to exercise those ranking signals.
+The CodeWeave fixture requires the receiver-qualified `run_edit_validation`
+reference case to pass. The isolated regression fixture in
+[`fixtures/references/receiver-qualified-rust/`](fixtures/references/receiver-qualified-rust/)
+removes that identifier from the general cached posting list and proves the
+complete fallback scan still returns the exact call, syntactic role, and
+enclosing symbol.
 
-## Why it is deliberately small
+## 300k fallback reference gate
 
-An in-process score **cannot** reproduce how the ChatGPT and Claude web clients
-actually drive the tools. This benchmark's job is a **trustworthy relative
-regression gate** across two representative codebases: re-run both rankings on
-the same clean revisions and compare retrieval quality, response size, and
-latency. There is intentionally no hosted-client simulation or CI wiring.
+The scale fixture is ignored during routine unit tests because it creates and
+scans a deterministic 300,000-source-LOC repository. Run it explicitly with:
+
+```sh
+cargo test -p eval --test phase3 -- --ignored --nocapture
+```
+
+The initial p95 gate is 250 ms and can be overridden for a release environment
+with `CODEWEAVE_FALLBACK_300K_P95_GATE_MS`. The benchmark verifies that every
+allowed file was scanned and that the exact receiver call was returned.
+
+## Shared reference-service contract
+
+`code_retrieve.find_references` and `code_intelligence.references` use the same
+`ReferenceService`, target/occurrence model, serializer, and live in-memory
+index. With language servers disabled, their complete fallback responses are
+required to be byte-for-byte equivalent. A golden fixture covers both the
+fallback and semantic response shapes. Semantic references are labeled current
+only after full-text hash/version synchronization and live-index hash checks:
+
+```sh
+cargo test -p codeweave-rust --bin codeweave-rust shared_reference
+UPDATE_EVAL_SNAPSHOTS=1 cargo test -p codeweave-rust --bin codeweave-rust shared_reference_response_matches_golden
+```
+
+## Contract fixtures
+
+`cargo test -p eval --test phase0` checks:
+
+- the committed public `tools/list` schema snapshot;
+- malformed `code_retrieve` operation errors;
+- the receiver-qualified cached-index full-scan regression.
+
+Regenerate the schema snapshot deliberately with:
+
+```sh
+UPDATE_EVAL_SNAPSHOTS=1 cargo test -p eval --test phase0 public_tool_schema_snapshot_matches
+```
+
+The retired `CodeIndex::context` evaluator, v1/v2 ranking implementations, query
+sets, and historical baselines are intentionally absent. Git history is the only
+archive for that deleted architecture.
+
+For CrawlerAI, the default checkout is the sibling `../CrawlerAI`; override it
+with `--repo-path` or `CRAWLERAI_REPO`. Use a clean, pinned checkout for release
+comparisons. The evaluator stays local and deterministic; it does not simulate a
+hosted ChatGPT or Claude client.

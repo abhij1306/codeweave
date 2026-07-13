@@ -1,4 +1,3 @@
-use super::chunks;
 use super::lines::{hex, line_starts};
 use super::metadata::{
     build_indexed_terms, classify_document, classify_lifecycle, normalize_entry,
@@ -6,6 +5,7 @@ use super::metadata::{
 use super::path_filter::normalize;
 use super::{
     content_hash, qualified_symbol_parts, symbol_matches_qualified_name, CodeIndex, FileEntry,
+    IndexMetrics,
 };
 use crate::model::{AppError, AppResult};
 use crate::security::{relative_string, validate_relative};
@@ -16,11 +16,11 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const INDEX_SCHEMA: &str = "codeweave-index-v8";
+const INDEX_SCHEMA: &str = "codeweave-index-v9";
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceExclusions {
@@ -366,6 +366,79 @@ impl CodeIndex {
     pub fn file_count(&self) -> usize {
         self.files.len()
     }
+
+    pub fn metrics(&self) -> IndexMetrics {
+        let indexed_loc = self.files.values().map(|file| file.line_count).sum();
+        let indexed_source_loc = self
+            .files
+            .values()
+            .filter(|file| file.document_type == "source")
+            .map(|file| file.line_count)
+            .sum();
+        let indexed_content_bytes = self.files.values().map(|file| file.content.len()).sum();
+        let token_posting_count = self.token_index.values().map(HashSet::len).sum();
+        let symbol_declaration_count = self.symbol_index.values().map(BTreeSet::len).sum();
+
+        let mut estimated_heap_bytes_lower_bound = 0usize;
+        for (key, file) in &self.files {
+            estimated_heap_bytes_lower_bound += key.capacity();
+            estimated_heap_bytes_lower_bound += file.path.capacity()
+                + file.path_lower.capacity()
+                + file.content.capacity()
+                + file.search_content.capacity()
+                + file.hash.capacity()
+                + file.language.capacity()
+                + file.document_type.capacity()
+                + file.lifecycle.capacity();
+            estimated_heap_bytes_lower_bound +=
+                file.line_starts.capacity() * std::mem::size_of::<usize>();
+            estimated_heap_bytes_lower_bound +=
+                file.indexed_terms.capacity() * std::mem::size_of::<String>();
+            estimated_heap_bytes_lower_bound += file
+                .indexed_terms
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>();
+            estimated_heap_bytes_lower_bound +=
+                file.symbols.capacity() * std::mem::size_of::<Symbol>();
+            estimated_heap_bytes_lower_bound += file
+                .symbols
+                .iter()
+                .map(|symbol| {
+                    symbol.name.capacity() + symbol.kind.capacity() + symbol.signature.capacity()
+                })
+                .sum::<usize>();
+        }
+        for (term, paths) in &self.token_index {
+            estimated_heap_bytes_lower_bound += term.capacity();
+            estimated_heap_bytes_lower_bound += paths.iter().map(String::capacity).sum::<usize>();
+        }
+        for (name, declarations) in &self.symbol_index {
+            estimated_heap_bytes_lower_bound += name.capacity();
+            estimated_heap_bytes_lower_bound += declarations
+                .iter()
+                .map(|(path, _)| path.capacity() + std::mem::size_of::<usize>())
+                .sum::<usize>();
+        }
+        estimated_heap_bytes_lower_bound += self
+            .cached_snapshot_head
+            .as_ref()
+            .map_or(0, String::capacity);
+        estimated_heap_bytes_lower_bound +=
+            self.cached_snapshot.as_ref().map_or(0, String::capacity);
+
+        IndexMetrics {
+            indexed_file_count: self.files.len(),
+            indexed_loc,
+            indexed_source_loc,
+            indexed_content_bytes,
+            estimated_heap_bytes_lower_bound,
+            token_count: self.token_index.len(),
+            token_posting_count,
+            symbol_name_count: self.symbol_index.len(),
+            symbol_declaration_count,
+        }
+    }
     pub fn languages(&self) -> Vec<String> {
         let mut values: Vec<String> = self
             .files
@@ -380,6 +453,11 @@ impl CodeIndex {
     pub fn get(&self, path: &str) -> Option<&FileEntry> {
         self.files.get(normalize(path).as_ref())
     }
+
+    pub(crate) fn files(&self) -> impl Iterator<Item = &FileEntry> {
+        self.files.values()
+    }
+
     #[cfg(test)]
     pub fn find_symbol(&self, path: Option<&str>, name: &str) -> Option<(String, Symbol, String)> {
         self.find_symbols(path, name).into_iter().next()
@@ -608,8 +686,6 @@ pub(super) fn read_entry(
     let indexed_terms = build_indexed_terms(&search_content, &path_lower, &symbols);
     let line_count = content.lines().count().max(1);
     let line_starts = line_starts(&content);
-    let file_chunks = chunks::build_chunks(&content, &symbols);
-    let path_tf = chunks::path_field(&path_lower);
     Ok(Some(FileEntry {
         path: relative,
         path_lower,
@@ -625,8 +701,6 @@ pub(super) fn read_entry(
         symbols,
         size: metadata.len(),
         modified_ns,
-        chunks: file_chunks,
-        path_tf,
     }))
 }
 

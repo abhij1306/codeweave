@@ -109,7 +109,7 @@ use schemas::{bash, edits, git, intelligence, retrieval, workspace};
 
 /// The full, unfiltered `tools/list` payload (every advertised tool, in
 /// registry order). Used for schema-shape tests and as the `full` profile body.
-#[cfg(test)]
+#[allow(dead_code)]
 pub fn full_list_payload() -> Value {
     Value::Array(registry().iter().map(ToolDefinition::to_payload).collect())
 }

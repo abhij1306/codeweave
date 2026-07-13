@@ -41,6 +41,13 @@ The calling coding agent owns intent interpretation. CodeWeave exposes determini
 The implementation delegates to internal indexed search and exact-read primitives. Those internal functions are not advertised as MCP tools. Lexical and tree-sitter reference results retain their evidence labels; semantic evidence is reported only after a successful `code_intelligence` operation.
 
 The public contract is covered by batch-operation, partial-error, exact-symbol, text-search, reference, outline, repository-map, and exact-read tests.
+
+## Semantic intelligence
+
+Rust, Python, and JavaScript/TypeScript semantic requests use explicit rust-analyzer, basedpyright, and typescript-language-server presets. One worker thread owns each configured process, negotiates capabilities and position encoding, serializes every JSON-RPC exchange, and answers the small set of server-to-client requests needed by these backends. Before a semantic request, the worker sends a full-text `didOpen` or a versioned `didChange` whenever the file hash changed. Transport, timeout, or protocol failures trigger one process restart and clear synchronized-document state so files reopen lazily.
+
+The public position contract remains a one-based line and zero-based UTF-16 code-unit column. Conversion to and from UTF-8, UTF-16, or UTF-32 happens only at the LSP boundary. Semantic output is labeled current only when the synchronized hash still matches disk; semantic references also require that hash in the live index. Otherwise the operation returns the existing syntactic or lexical fallback with a structured reason.
+
 ## Tool registry and profiles
 
 Every advertised tool is defined once in the tool registry (`src/tools/`), which is the single source of truth. Each `ToolDefinition` carries its name, title, description, a safety classification (which drives the MCP annotation hints), its profile membership, and a pointer to its flat draft-07 input schema in `src/tools/schemas/`. The registry drives four consumers that were previously hand-maintained in separate places: the `tools/list` payload, the transport's callable-name gate, profile filtering, and the schema-shape validation. Adding or changing a tool happens in exactly one place.

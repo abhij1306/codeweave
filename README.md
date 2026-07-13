@@ -11,7 +11,7 @@ CodeWeave is a fast, local-first Model Context Protocol (MCP) server for AI-assi
 
 - **Single Rust process** — no Node.js gateway or companion daemon.
 - **Repository-aware retrieval** — ranked context, symbols, references, outlines, regex, filename search, and repository maps.
-- **Optional semantic intelligence** — persistent Python and TypeScript language servers for definitions, references, diagnostics, and safe rename previews, with tree-sitter/lexical fallback.
+- **Optional semantic intelligence** — worker-owned rust-analyzer, basedpyright, and TypeScript language servers for definitions, references, diagnostics, and safe rename previews, with hash-synchronized tree-sitter/lexical fallback.
 - **Safe edits** — narrow single-operation tools with snapshot and content-hash preconditions, non-destructive validation reporting, and atomic recovery for internal write failures.
 - **Supervised Bash execution** — focused commands, timeouts, cancellation, retained logs, and process-tree cleanup.
 - **Git integration** — status, diff, log, show, blame, staging, commits, and confirmed restores.
@@ -212,6 +212,7 @@ Detailed guides:
     "explicitOnly": true
   },
   "intelligence": {
+    "rust": {"enabled": false, "command": "rust-analyzer", "args": [], "timeoutMs": 10000},
     "python": {"enabled": false, "command": "basedpyright-langserver", "args": ["--stdio"], "timeoutMs": 10000},
     "typescript": {"enabled": false, "command": "typescript-language-server", "args": ["--stdio"], "timeoutMs": 10000}
   },
@@ -237,7 +238,7 @@ Detailed guides:
 
 `code_retrieve` is the single public repository retrieval surface. The calling agent selects explicit operations for filename discovery, symbols, text search, references, outlines, repository maps, or exact reads. CodeWeave performs those operations deterministically and can batch up to 12 of them in one call.
 
-`intelligence` configures optional persistent language servers. Disabled adapters retain tree-sitter and lexical behavior. Enabled adapters start lazily on the first `code_intelligence` request and restart once after failure. CodeWeave never installs these executables automatically; run `codeweave doctor --config config.json` after changing their paths.
+`intelligence` configures optional rust-analyzer, basedpyright, and TypeScript language-server workers. Each configured backend has one worker thread that exclusively owns JSON-RPC sequencing and the child process. Documents are opened lazily, re-sent as full text when their content hash changes, and reopened after one automatic transport restart. Semantic output is accepted only while the synchronized hash still matches disk; reference output additionally requires the same hash in the live index. CodeWeave never installs these executables automatically; run `codeweave doctor --config config.json` after changing their paths.
 
 `bash` executes a command string through the configured executable as `bash -c <command>`. For example, a focused Windows repository test can run as `cd backend && ./.venv/Scripts/python.exe -m pytest tests/unit/test_file.py -q`. `cwd` may select an existing workspace-relative directory, `background` returns immediately with a `run_id`, and `timeout_ms` may override the configured default up to `maxTimeoutMs`.
 

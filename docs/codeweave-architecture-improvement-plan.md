@@ -1,418 +1,455 @@
-# CodeWeave Architecture Improvement Plan
+# CodeWeave Architecture Improvement Plan — Revised After Tool-Surface Audit
 
-**Status:** Proposed design freeze  
-**Target repository size:** small and mid-sized repositories, up to approximately **300,000 source lines of code**  
-**Primary product metrics:** **accuracy** and **latency**  
-**Implementation rule:** no production refactor begins until the Phase 0 baselines and this contract are approved.
+**Status:** Proposed design freeze v2  
+**Repository reviewed at:** `5658c65b0b1e913b688edeef7d1f6d6e2bf6c62f`  
+**Target scale:** normally around **100k LOC**, with **300k LOC as the practical ceiling**  
+**Primary metrics:** **accuracy first, latency second**  
+**Public-contract rule:** do not reintroduce a generic retrieval `query` parameter  
+**Implementation rule:** fix the evaluation boundary before changing retrieval behavior
 
 ---
 
 ## 1. Executive decision
 
-CodeWeave should remain a **small, local, single-repository code service**, not evolve into a compiler, graph database, search cluster, or embedded coding agent.
+CodeWeave should remain a small, local, single-repository service for ChatGPT and Claude connectors. It should not become a compiler, graph database, distributed search engine, or embedded coding agent.
 
-The target architecture has three deliberately separate capabilities:
+The revised architecture is:
 
 ```text
-                         CodeWeave public tools
-                                  |
-                  +---------------+----------------+
-                  |                                |
-       explicit retrieval operations       position-based intelligence
-            code_retrieve                    code_intelligence
-                  |                                |
-                  +---------------+----------------+
-                                  |
-                         ReferenceService
+                           Public MCP tools
                                   |
               +-------------------+-------------------+
               |                                       |
-      always-available fallback                 optional LSP backend
-    in-memory exact-name scan +                 rust-analyzer / Python /
-       tree-sitter classification                 TypeScript servers
+      explicit code_retrieve                    code_intelligence
+       discriminated operations                position-based requests
               |                                       |
-       syntactic / lexical evidence              semantic evidence
+              +-------------------+-------------------+
+                                  |
+                         RetrievalFacade
+                                  |
+           +----------------------+----------------------+
+           |                      |                      |
+       TextIndex              SymbolIndex          ReferenceService
+   literal/regex/file       declarations and       semantic LSP first
+       discovery               outlines            when healthy
+                                                        |
+                                           exact full-scope fallback
+                                           + Tree-sitter classification
 ```
 
-The key architectural principle, borrowed from rust-analyzer, is:
+The audit changes the implementation order materially:
 
-> Fast lexical candidate discovery is allowed only when it is a **recall-safe superset**. Semantic resolution verifies identity when a semantic backend is available.
-
-For CodeWeave's 300k-LOC ceiling, the simplest recall-safe fallback is initially a **full scan of the already in-memory eligible source files for an exact identifier**, followed by tree-sitter classification. This is preferable to adding an identifier database before an evaluation proves that the scan is too slow.
-
-### Frozen decisions
-
-1. **No generic public `query` parameter is introduced.**
-2. `code_retrieve` keeps explicit discriminated operations such as `find_symbol`, `search_text`, `find_references`, and `read`.
-3. `code_intelligence` remains position based: `path + line + column`.
-4. Both public routes eventually share one internal `ReferenceService`.
-5. A healthy LSP is the authority for semantic identity.
-6. Tree-sitter and lexical fallback results remain explicitly labelled as non-semantic.
-7. Reference correctness must never depend on the general natural-language/token-ranking index.
-8. The first fallback implementation scans the complete allowed in-memory scope; an identifier posting index is added only if the 300k-LOC latency evaluation requires it.
-9. No SQLite, FTS5, graph database, SCIP serialization, Salsa/HIR clone, Stack Graph implementation, or mandatory embeddings.
-10. Every retrieval or reference change must ship with accuracy and latency deltas from committed eval fixtures.
+1. **The existing evaluator does not exercise the live MCP retrieval path.**
+2. The dead/eval-only ranker must not guide production architecture.
+3. Public tool and operation contracts need simplification before adding more retrieval machinery.
+4. The reference fix remains important, but it must be implemented against a corrected live-path evaluation harness.
+5. LSP, lexical fallback, and Tree-sitter should converge through one service and one result model.
+6. Complexity unrelated to measured accuracy or latency should be removed, not reorganized into more abstractions.
 
 ---
 
-## 2. Product scope
+## 2. What the audit changed
 
-### 2.1 Supported scale
+## 2.1 Highest-priority finding: the evaluator benchmarks a non-production path
 
-CodeWeave is optimized for one repository at a time with:
+The current live retrieval route is:
 
-- approximately 0–300k source LOC;
-- source files available on a local filesystem;
-- one eager in-memory index;
-- incremental refresh after edits;
-- optional persistent cache for faster restart;
-- a small number of language-server processes, enabled only when configured.
+```text
+code_retrieve
+  -> WorkspaceActor::code_retrieve_for_session
+  -> execute_retrieval_operation
+  -> search_index
+  -> CodeIndex::search
+```
 
-The 300k-LOC figure is an **optimization target**, not initially a hard runtime rejection. The workspace summary should report measured source LOC and file count so evaluations and diagnostics can classify the repository size.
+The current evaluation route is:
 
-### 2.2 Primary metrics
+```text
+eval
+  -> CodeIndex::context
+  -> Ranking::V1 / Ranking::V2
+```
 
-In order:
+`CodeIndex::context`, `src/index/context.rs`, `src/index/chunks.rs`, `FileEntry::chunks`, and `FileEntry::path_tf` are not used by any live MCP tool. They are used only by the evaluator and unit tests.
 
-1. **Accuracy**
-   - correct target;
-   - no false-zero reference results caused by indexing;
-   - honest semantic/syntactic/lexical evidence;
-   - correct behavior after edits;
-   - deterministic ambiguity handling.
+Independent verification against the current repository and the parent of commit `7410132` shows this was already true before the recent module split: the context ranker was called only by `eval` and tests.
 
-2. **Latency**
-   - cold index time;
-   - warm startup time;
-   - warm retrieval p50/p95;
-   - warm reference p50/p95;
-   - LSP cold readiness and first-result time;
-   - edit-to-fresh-reference latency.
+### Decision
 
-Secondary guardrails are response size, memory, and agent tool-call count.
+The current retrieval baselines are **not valid production-regression gates**. They measure an internal research ranker rather than the behavior an agent receives from `code_retrieve`.
 
-### 2.3 Non-goals
+Before any ranking, indexing, reference, or tool-surface optimization:
+
+- rebuild the evaluator around the production retrieval boundary;
+- establish live-path baselines;
+- then remove the eval-only ranker and its per-file data unless a separately approved public feature needs it.
+
+Do not wire `context()` into the public tool merely to preserve the existing evaluator. That would introduce a new natural-language retrieval path contrary to the frozen API direction.
+
+## 2.2 Tool-surface complexity is a first-class workstream
+
+The registry is well designed as one source of truth, but the advertised surface is still large:
+
+- 26 tools;
+- 8 edit-facing tools over one internal change engine;
+- 7 `code_retrieve` operation kinds sharing one 20-property item schema;
+- 6 transaction change kinds sharing one 12-property change schema;
+- overlapping capability/diagnostic responses;
+- a deprecated ignored parameter still advertised on every write tool.
+
+The revised plan explicitly measures and reduces:
+
+- invalid tool calls;
+- invalid operation fields;
+- retries caused by schema ambiguity;
+- visible tool-schema token count;
+- tool calls per coding task;
+- cases where the agent switches from a narrow tool to `code_transaction`.
+
+## 2.3 Public transaction language is currently too strong
+
+`code_transaction` provides:
+
+- planning;
+- preconditions;
+- per-file temp-write + rename;
+- sequential multi-file application;
+- compensating restoration after failure;
+- a `PARTIAL_COMMIT` outcome when restoration itself fails.
+
+This is not filesystem-level atomicity across multiple files.
+
+### Decision
+
+Keep the public name for compatibility, but freeze the truthful contract:
+
+```text
+atomic per file: yes
+atomic across files: no
+preflight before writes: yes
+best-effort compensation after partial failure: yes
+manual recovery can be required: yes
+```
+
+Do not describe the engine as fully atomic. Any future implementation may reduce the partial-commit window, but it cannot promise cross-file atomicity on a general filesystem.
+
+## 2.4 Validation semantics need clearer naming, not rollback
+
+Validation is intentionally post-apply and non-destructive:
+
+```text
+apply edit
+-> run validation
+-> report pass/fail/pending
+-> preserve edit
+```
+
+This behavior is correct. The confusion comes from the generic name `validate`, historical rollback language, and the still-advertised `rollback_on_failure` field.
+
+### Decision
+
+- preserve non-destructive validation;
+- remove `rollback_on_failure` from advertised public schemas;
+- temporarily accept and ignore the legacy field in the compatibility-normalization layer;
+- describe `validate` everywhere as **post-apply validation commands**;
+- return explicit `validation_status: passed | failed | pending | unavailable`;
+- reserve reverse recovery for internal partial-commit/bookkeeping failures.
+
+---
+
+## 3. Frozen product scope
+
+## 3.1 Repository scale
+
+Optimize for:
+
+- common case: approximately 25k–100k source LOC;
+- medium case: approximately 100k–200k LOC;
+- practical ceiling: approximately 300k LOC;
+- one local repository per server process;
+- source files already held in a bounded in-memory index;
+- incremental refresh after file changes.
+
+The server should report:
+
+- indexed source LOC;
+- indexed file count;
+- ignored file count;
+- indexed content bytes;
+- index memory estimate;
+- cache hit/miss;
+- cold and warm index duration.
+
+The 300k figure is an evaluation and support target, not initially a hard rejection threshold.
+
+## 3.2 Success metrics
+
+### Accuracy
+
+- reference precision, recall, and false-zero rate;
+- correct declaration disambiguation;
+- evidence honesty;
+- stale-answer rate after edits;
+- exact symbol and text-search correctness;
+- invalid-call recovery quality;
+- correct transaction and validation status.
+
+### Latency
+
+- cold index p50/p95;
+- warm startup p50/p95;
+- warm operation p50/p95 by operation kind;
+- fallback reference p50/p95;
+- semantic reference p50/p95;
+- single-file refresh p50/p95;
+- edit-to-fresh-result p50/p95;
+- response serialization time.
+
+### Agent-efficiency guardrails
+
+- tool calls per task;
+- invalid calls per task;
+- schema tokens exposed;
+- response characters;
+- retries caused by unclear contracts;
+- correct final diff rate.
+
+## 3.3 Non-goals
 
 CodeWeave will not:
 
-- implement Rust name resolution, trait solving, macro expansion, or type inference itself;
-- support monorepo-scale distributed indexing;
-- build a framework-aware relationship graph in the initial architecture;
-- expose an open-ended natural-language retrieval parameter;
-- make semantic backends mandatory;
-- infer that a syntactic same-name match is a semantic reference;
-- add a new storage engine without a measured p95 or memory need;
-- refactor editing, Git, Bash, and retrieval simultaneously.
+- implement Rust, Python, or TypeScript semantic resolution itself;
+- clone rust-analyzer HIR/Salsa;
+- add SQLite/FTS, a graph database, SCIP protobuf, Kythe serving tables, or Stack Graphs without measured need;
+- add mandatory embeddings or an internal agent;
+- add a generic public retrieval `query`;
+- claim same-name lexical occurrences are semantic references;
+- promise cross-file atomic filesystem transactions;
+- preserve dead research code in the production index merely because an old evaluator uses it.
 
 ---
 
-## 3. Research synthesis
+## 4. Public tool-surface design
 
-## 3.1 rust-analyzer — the main reference
+## 4.1 Preserve simple tools; do not collapse everything into one mega-tool
 
-rust-analyzer separates syntax, semantic analysis, IDE APIs, VFS, and LSP transport. Its find-usages implementation follows a particularly relevant rule:
+The audit correctly notes that the narrow edit tools are adapters over one engine. That does not make them useless. They provide:
 
-1. resolve the symbol under a position to a semantic definition;
-2. derive a safe search scope from visibility and the crate graph;
-3. run fast text search to obtain a **superset** of occurrences;
-4. parse each occurrence and use precise name resolution to confirm it targets the definition.
+- smaller schemas;
+- clearer intent;
+- better safety annotations;
+- simpler telemetry;
+- fewer malformed one-item transaction payloads.
 
-It contains specialized fast paths, but they are explicitly designed to allow false positives while avoiding false negatives, after which semantic verification is still performed.
+### Decision
 
-**What CodeWeave should copy**
+Keep these primary simple tools:
 
-- position/definition identity before semantic reference lookup;
-- text search as a candidate accelerator, never as semantic proof;
-- a clear API boundary between transport and analysis;
-- consistent file snapshots and freshness;
-- explicit search scope;
-- incremental invalidation limited to changed files;
-- serializable, tool-facing result models that do not expose backend internals.
+- `code_write`
+- `code_replace`
+- `code_replace_range`
+- `code_insert`
+- `code_delete`
+- `code_rename`
 
-**What CodeWeave should not copy**
+Keep `code_preview` and `code_transaction` for coordinated multi-file changes.
 
-- Salsa;
-- Rust HIR;
-- crate-graph/name-resolution implementation;
-- macro expansion;
-- type inference;
-- rust-analyzer's compiler-scale internal decomposition.
+Do **not** replace the narrow tools with only `code_transaction`.
 
-Those belong in rust-analyzer itself and should be consumed through LSP.
+## 4.2 Reduce visible complexity through profiles and contract cleanup
 
-## 3.2 Serena
+Do not immediately delete useful tools. First measure the tool surface.
 
-Serena demonstrates an agent-facing symbolic toolset backed primarily by language servers. Its strongest relevant choices are:
-
-- symbol-level operations rather than forcing the agent to reconstruct relationships from file reads;
-- position-based semantic requests;
-- separate basic file/pattern tools for situations where semantics are unnecessary;
-- a backend abstraction rather than embedding one language implementation in the MCP layer.
-
-**Borrow:** the semantic tool philosophy and backend isolation.  
-**Do not borrow:** the full multi-language integration scope, memory subsystem, or configuration surface.
-
-## 3.3 CodeGraph
-
-CodeGraph separates:
+Add an evaluated **coding** profile, while keeping compatibility profiles:
 
 ```text
-extraction -> storage -> resolution -> graph queries -> AI context
+coding:
+  workspace
+  code_retrieve
+  code_intelligence
+  narrow edit tools
+  code_preview
+  code_transaction
+  git_status
+  git_diff
+  git_log
+  bash
+  bash_status
+  bash_output
+  bash_cancel
 ```
 
-It extracts tree-sitter nodes and edges, persists them in SQLite/FTS5, resolves imports/calls/framework patterns, and maintains freshness incrementally. It also records fixed node/edge kinds and provenance.
+Keep in `full` only:
 
-**Borrow**
+- Git staging/commit/restore/push and less-common Git inspection;
+- capability/admin tools that evaluations show are not needed on every task.
 
-- extraction, resolution, and presentation are separate stages;
-- relationships carry provenance;
-- stale index state must never be silently presented as current;
-- one response should provide useful context and reduce follow-up reads;
-- incremental refresh and connect-time catch-up are product features, not implementation details.
+The exact profile membership is frozen only after the workflow evaluation. Do not change the default profile in the same release that introduces the profile.
 
-**Do not borrow yet**
+## 4.3 No generic `query`
 
-- SQLite/FTS5;
-- a persistent call graph;
-- framework-specific route resolvers;
-- dozens of node and edge kinds;
-- graph traversal APIs.
-
-Those are valuable at larger scales and for architecture/impact features, but unnecessary for fixing CodeWeave's reference correctness at 300k LOC.
-
-## 3.4 SCIP
-
-SCIP's useful abstraction is a language-neutral index made of documents, symbol information, occurrences, roles, and relationships. It explicitly allows indexers to exist on a spectrum from compiler-precise to heuristic syntax-directed analysis.
-
-**Borrow:** a small internal `Occurrence` and `SymbolTarget` model, plus explicit evidence.  
-**Do not borrow:** protobuf, global symbol descriptors, package identity, streaming index files, or external-index merging.
-
-## 3.5 Kythe
-
-Kythe separates anchors/locations, semantic nodes, and typed edges and includes verifier tooling for indexer correctness.
-
-**Borrow:** location anchors and verification-first thinking.  
-**Do not borrow:** compilation extraction, serving tables, distributed xref infrastructure, or its full schema.
-
-## 3.6 Stack Graphs
-
-Stack Graphs encode language-specific name-resolution rules incrementally without requiring a compiler. This proves syntax-directed semantic resolution is possible, but it requires substantial per-language rule systems. The GitHub repository is also archived.
-
-**Decision:** study only as background. Do not implement Stack Graphs in CodeWeave.
-
-## 3.7 Zoekt
-
-Zoekt is optimized for very fast substring and regex search using trigram indexing and symbol signals.
-
-**Decision:** retain as a future benchmark reference. At 300k LOC, CodeWeave must first prove that its existing in-memory text index or direct byte scanning is insufficient before adopting trigram storage.
-
-## 3.8 ast-grep
-
-ast-grep shows how tree-sitter can provide fast structural matching and rewriting.
-
-**Borrow:** AST-node-aware identifier and occurrence classification.  
-**Do not claim:** structural matching is semantic name resolution.
-
-## 3.9 LSP specification
-
-The LSP reference request is defined by a text document position, not a symbol-name string. Correctness also depends on:
-
-- negotiated capabilities;
-- negotiated position encoding;
-- synchronized document contents;
-- monotonically updated document versions;
-- `didOpen`, `didChange`, and `didClose`;
-- handling null results separately from protocol errors.
-
-This means CodeWeave's LSP architecture must include document synchronization, not only process startup and request dispatch.
-
----
-
-## 4. Current CodeWeave findings
-
-### 4.1 What is already good
-
-- one repository per process;
-- eager index and watcher;
-- explicit retrieval operations with flat schemas;
-- no public generic `query`;
-- exact reads and provenance handles;
-- evidence labels;
-- optional LSP boundary;
-- persistent supervised LSP processes;
-- an offline retrieval/latency eval crate;
-- per-tool latency samples;
-- incremental file refresh;
-- narrow edit tools and one transactional engine.
-
-These should remain.
-
-### 4.2 Reference correctness defect
-
-The current indexed reference path:
-
-1. resolves a symbol definition;
-2. tokenizes the symbol name;
-3. uses the **general text token index** to choose candidate files;
-4. scans only those files with an exact identifier regex.
-
-For:
-
-```rust
-self.run_edit_validation(...)
-```
-
-the caller file was indexed with the compound token `self.run_edit_validation` and split words, but not the exact posting `run_edit_validation`. The candidate stage discarded the file before the exact regex could inspect it.
-
-The defect is architectural: the ranking/token index became a correctness boundary for references.
-
-### 4.3 LSP reliability gaps
-
-The current semantic service is a useful prototype, but it mixes:
-
-- process supervision;
-- JSON-RPC request/response handling;
-- document opening;
-- URI conversion;
-- semantic requests;
-- fallback scanning;
-- WorkspaceEdit normalization;
-- tests.
-
-It currently has hardcoded Python and TypeScript clients. A document is opened once, but the architecture does not yet establish a complete content-version synchronization contract after CodeWeave edits. Rust is not configured as a semantic backend, even though rust-analyzer is the natural semantic authority for Rust.
-
-### 4.4 Eval gap
-
-The existing eval crate measures ranked context retrieval but does not provide a dedicated reference benchmark. Current reference unit tests emphasize bare calls and therefore did not expose receiver-qualified calls.
-
----
-
-## 5. Frozen public API
-
-No public tool multiplication or generic query field is required for this plan.
-
-## 5.1 `code_retrieve`
-
-Keep the current explicit batch model:
+`code_retrieve` remains an explicit batch of discriminated operations:
 
 ```json
 {
   "operations": [
-    {
-      "operation": "find_references",
-      "symbol": "run_edit_validation",
-      "definition_path": "src/workspace/validation.rs",
-      "definition_line": 14,
-      "reference_scope": "all",
-      "reference_kinds": ["call"],
-      "max_results": 20,
-      "context_lines": 2
-    }
+    {"operation": "find_symbol", "symbol": "ReferenceService"},
+    {"operation": "search_text", "pattern": "validation_failed", "syntax": "literal"},
+    {"operation": "read", "target": "path", "value": "src/references/mod.rs"}
   ]
 }
 ```
 
-Rules:
+The server does not contain an agent or semantic query planner. A generic prose `query` would therefore be only another lexical/heuristic bag and would blur the contract.
 
-- `symbol` is a symbol selector, not free-form prose.
-- `definition_path` and `definition_line` disambiguate.
-- no `query`, `mode`, `strategy`, or `backend` parameter is added;
-- backend selection is internal;
-- path filters and scope remain explicit;
-- batching remains the mechanism for reducing MCP round trips.
+## 4.4 Replace prose-only operation rules with one typed contract table
 
-## 5.2 `code_intelligence`
+Flat schemas are retained because hosted clients have historically handled conditional schemas unreliably. The solution is not `oneOf`; it is a single internal contract model.
 
-Keep position-based operations:
+Introduce:
 
-```json
-{
-  "operation": "references",
-  "path": "src/workspace/validation.rs",
-  "line": 14,
-  "column": 24,
-  "max_results": 20
+```rust
+struct OperationContract {
+    operation: RetrievalOperation,
+    required_fields: &'static [&'static str],
+    optional_fields: &'static [&'static str],
+    defaults: &'static [FieldDefault],
+}
+
+struct ChangeContract {
+    kind: ChangeKind,
+    required_fields: &'static [&'static str],
+    optional_fields: &'static [&'static str],
 }
 ```
 
-This route may start from either a declaration or a usage. It resolves the target at the position before searching.
+Generate from these contracts:
 
-## 5.3 Shared response contract
+- runtime validation;
+- `code_capabilities`;
+- schema field descriptions;
+- documentation tables;
+- contract tests;
+- actionable `INVALID_OPERATION_FIELDS` / `INVALID_CHANGE_FIELDS` errors.
 
-Both routes should normalize to the same reference payload:
+Behavior:
 
-```json
-{
-  "target": {
-    "name": "run_edit_validation",
-    "path": "src/workspace/validation.rs",
-    "start_line": 14,
-    "start_column": 24,
-    "kind": "method"
-  },
-  "evidence": "semantic",
-  "backend": "rust-analyzer",
-  "scope": "all",
-  "freshness": "current",
-  "snapshot_id": "snap_...",
-  "result_count": 1,
-  "truncated": false,
-  "results": [
-    {
-      "path": "src/workspace/edit.rs",
-      "start_line": 164,
-      "start_column": 17,
-      "end_line": 164,
-      "end_column": 36,
-      "reference_kind": "call",
-      "classification_evidence": "syntactic",
-      "enclosing_symbol": "WorkspaceActor::code_edit",
-      "handle": "range:..."
-    }
-  ],
-  "warnings": []
-}
-```
+- missing required fields are listed;
+- fields invalid for the selected operation are listed;
+- a corrected example call is returned in `suggested_calls`;
+- no field is silently ignored except explicitly versioned compatibility inputs.
 
-Notes:
+This removes the second-source-of-truth problem without nested schema logic.
 
-- `evidence` describes target resolution: `semantic`, `syntactic`, or `lexical`.
-- `classification_evidence` separately describes how `call`, `read`, `write`, etc. was assigned. LSP references normally return locations, not usage categories.
-- `freshness` is `current`, `stale`, or `unknown`.
-- `truncated` is mandatory.
-- a zero-result semantic response from a healthy synchronized backend is materially stronger than a zero-result lexical response.
-- existing response fields can be retained during migration; new fields are additive.
+## 4.5 Remove the deprecated rollback field from advertised schemas
+
+Migration:
+
+1. stop advertising `rollback_on_failure`;
+2. keep accepting it in request preparation for one compatibility release;
+3. attach a deprecation warning when received;
+4. remove compatibility acceptance after connector schema and workflow tests show no use.
+
+This must apply to every narrow edit wrapper and `code_transaction` from one shared compatibility function.
+
+## 4.6 Clarify handle semantics
+
+Freeze the distinction:
+
+- `code_replace(handle=...)`: exact-text replacement constrained to the fetched range;
+- `code_replace_range`: replace the entire fetched line range.
+
+Improve titles and descriptions to use the phrases:
+
+- **replace text within fetched range**
+- **replace complete fetched range**
+
+Add paired examples and contract tests. Do not merge these operations until agent evaluations show the distinction remains confusing after improved wording.
 
 ---
 
-## 6. Target internal architecture
+## 5. Retrieval and reference architecture
+
+## 5.1 Purpose-specific components
 
 ```text
-WorkspaceManager
-  |
-  +-- WorkspaceActor
-  |     +-- FileState / watcher / snapshot
-  |     +-- CodeIndex
-  |     |     +-- TextIndex
-  |     |     +-- SymbolIndex
-  |     |     +-- line/range metadata
-  |     +-- edit, git and bash services (unchanged)
-  |
-  +-- AnalysisServices
-        +-- ReferenceService
-        |     +-- SemanticReferenceBackend
-        |     +-- FallbackReferenceBackend
-        +-- LspManager
-              +-- one worker per enabled language server
-              +-- document synchronization state
-              +-- capability and position-encoding state
+TextIndex
+  exact literal, regex, filename and discovery operations
+
+SymbolIndex
+  declarations, exact symbol selectors and outlines
+
+ReferenceService
+  target resolution and reference retrieval
+
+LspManager
+  semantic definitions, references, diagnostics and rename
+
+FallbackOccurrenceScanner
+  complete exact-name scope scan with Tree-sitter classification
 ```
 
-The manager remains the composition root. The workspace actor remains responsible for the repository snapshot and index. `AnalysisServices` is introduced narrowly and does not absorb editing, Bash, or Git.
+A ranked search index may accelerate discovery. It must not determine semantic-reference completeness.
 
-## 6.1 Shared data model
+## 5.2 Reference target forms
 
-Introduce small plain Rust structs:
+No public backend selector is added.
+
+Internal target model:
+
+```rust
+enum ReferenceTarget {
+    SymbolSelector {
+        symbol: String,
+        definition_path: Option<String>,
+        definition_line: Option<usize>,
+    },
+    Position {
+        path: String,
+        line: usize,
+        column: usize,
+    },
+}
+```
+
+Public mappings:
+
+- `code_retrieve.find_references` creates `SymbolSelector`;
+- `code_intelligence.references` creates `Position`.
+
+Both routes call one `ReferenceService`.
+
+## 5.3 Always-available fallback
+
+For the target scope:
+
+1. reconcile the workspace snapshot;
+2. resolve one declaration or return deterministic ambiguity;
+3. iterate all eligible in-memory source files;
+4. find the exact identifier with identifier-boundary checks;
+5. exclude only the selected declaration occurrence;
+6. inspect the Tree-sitter node when supported;
+7. classify call/import/type/read/write/other;
+8. attach enclosing-symbol context;
+9. apply path, production/test, kind and result limits;
+10. report truncation and scanned scope.
+
+Do not use the natural-language/general token index as a correctness prefilter.
+
+### Optimization rule
+
+At 300k LOC, benchmark the full in-memory scan first. Add an exact-identifier posting list only when the measured fallback p95 breaches the approved gate.
+
+Any future posting index must have:
+
+- a full-scan oracle;
+- per-file incremental replacement;
+- cache versioning;
+- empty-posting full-scan confirmation;
+- exact identifier tokens from syntax or a language-aware lexer;
+- no dependency on free-text ranking terms.
+
+## 5.4 Shared result model
 
 ```rust
 struct SymbolTarget {
@@ -431,26 +468,10 @@ struct Occurrence {
     evidence: EvidenceLevel,
 }
 
-enum EvidenceLevel {
-    Semantic,
-    Syntactic,
-    Lexical,
-}
-
-enum OccurrenceRole {
-    Declaration,
-    Call,
-    Import,
-    Type,
-    Read,
-    Write,
-    Other,
-}
-
 struct ReferenceResult {
     target: SymbolTarget,
-    evidence: EvidenceLevel,
-    backend: String,
+    target_evidence: EvidenceLevel,
+    backend: BackendKind,
     freshness: Freshness,
     occurrences: Vec<Occurrence>,
     truncated: bool,
@@ -458,601 +479,694 @@ struct ReferenceResult {
 }
 ```
 
-This is intentionally much smaller than SCIP or Kythe. It exists so LSP and fallback paths cannot drift into incompatible outputs.
+Separate:
 
-## 6.2 `ReferenceService`
+- target identity evidence;
+- occurrence classification evidence;
+- backend;
+- freshness.
 
-Inputs are internal target types, not a generic query:
+A location returned by LSP can be semantically correct while the `call/read/write` label is only syntactically inferred.
 
-```rust
-enum ReferenceTarget {
-    SymbolSelector {
-        symbol: String,
-        definition_path: Option<String>,
-        definition_line: Option<usize>,
-    },
-    Position {
-        path: String,
-        line: usize,
-        column: usize,
-    },
-}
-```
+## 5.5 Evidence contract
 
-Algorithm:
+Allowed target evidence:
 
-1. ensure the CodeWeave snapshot is reconciled;
-2. resolve the target:
-   - symbol selector through the symbol index;
-   - position through LSP when enabled, otherwise the exact tree-sitter name/name-reference node;
-3. check whether a configured semantic backend supports references for the language;
-4. if yes, synchronize the relevant document and issue `textDocument/references`;
-5. if semantic lookup succeeds, normalize locations and return semantic evidence;
-6. if the backend is unavailable, unsupported, timed out, or unhealthy, run the fallback;
-7. return the fallback reason explicitly;
-8. never silently convert a semantic error into a semantic-looking result.
+- `semantic`
+- `syntactic`
+- `lexical`
 
-## 6.3 Fallback reference algorithm
+Allowed freshness:
 
-### Phase 1 baseline
+- `current`
+- `stale`
+- `unknown`
 
-For the allowed scope:
+Rules:
 
-1. iterate all eligible in-memory `FileEntry` values;
-2. use a byte substring finder for the exact identifier;
-3. enforce identifier boundaries;
-4. exclude only the selected declaration range;
-5. classify the syntax node or line as call/import/type/read/write/other;
-6. create handles and enclosing-symbol metadata;
-7. apply requested scope, kind filter, max results, and truncation;
-8. report `evidence: syntactic` when a parser confirms an identifier node, otherwise `lexical`.
-
-No general token-index prefilter is used.
-
-This is simple, recall-safe for exact identifier spellings, and likely fast enough for 300k LOC because file contents are already in memory. It must be benchmarked rather than guessed.
-
-### Optional optimization, only after evidence
-
-If warm fallback p95 breaches the approved 300k-LOC target, add:
-
-```rust
-HashMap<InternedIdentifier, SmallVec<OccurrenceLocation>>
-```
-
-The posting list must be built from exact identifier tokens, not natural-language terms. It is an accelerator only. Correctness rules:
-
-- any unsupported grammar or inconsistent posting triggers full-scope scan;
-- an empty posting cannot produce a final zero without a full-scope confirmation;
-- cache schema is versioned;
-- incremental replacement removes and rebuilds postings for only the changed file;
-- tests compare indexed results against full-scan results.
-
-Do not implement this optimization in Phase 1.
-
-## 6.4 Semantic backend
-
-The LSP backend is authoritative only when all are true:
-
-- server is configured and initialized;
-- `referencesProvider` is supported;
-- the document has been synchronized to the current CodeWeave content hash;
-- position encoding is known;
-- the response belongs to the active request;
-- all returned file URIs are within the workspace;
-- no response normalization error occurred.
-
-Otherwise the response is fallback evidence with an explicit warning.
+- only a successful synchronized LSP request may return `semantic`;
+- a backend timeout followed by fallback returns fallback evidence plus a warning;
+- a semantic zero-result is accepted only from a healthy synchronized server;
+- a fallback zero-result includes the scanned file/byte count;
+- no error is silently converted into an empty successful result.
 
 ---
 
-## 7. LSP architecture
+## 6. LSP architecture
 
-## 7.1 Configuration
+## 6.1 Scope
 
-Replace hardcoded internal Python/TypeScript ownership with a language-keyed normalized configuration while preserving compatibility during migration:
+LSP is genuinely used on repositories such as CrawlerAI, so it remains a production workstream rather than an optional experiment.
 
-```json
-{
-  "intelligence": {
-    "servers": {
-      "rust": {
-        "enabled": true,
-        "command": "rust-analyzer",
-        "args": [],
-        "timeoutMs": 10000
-      },
-      "python": {
-        "enabled": false,
-        "command": "basedpyright-langserver",
-        "args": ["--stdio"]
-      },
-      "typescript": {
-        "enabled": false,
-        "command": "typescript-language-server",
-        "args": ["--stdio"]
-      }
-    }
-  }
-}
-```
-
-A built-in registry supplies language IDs, file extensions, default command/arguments, and tested capabilities. Do not expose extensions or protocol details unless a real language integration requires an override.
-
-Initial tested presets:
+Initial tested backends:
 
 - Rust: rust-analyzer;
 - Python: basedpyright;
 - JavaScript/TypeScript: typescript-language-server.
 
-Do not claim broad language support merely because the configuration is generic.
+Generic configuration may exist internally, but only tested backends are claimed as supported.
 
-## 7.2 One worker per server
-
-Use a small worker abstraction:
+## 6.2 Split the current intelligence module by responsibility
 
 ```text
-caller -> bounded command channel -> LSP worker owns process
-                                  -> sequential request dispatch
-                                  -> message pump
-                                  -> response or timeout
+src/intelligence/
+  mod.rs
+  service.rs
+  worker.rs
+  sync.rs
+  protocol.rs
+  normalize.rs
+  workspace_edit.rs
 ```
 
-The worker exclusively owns stdin/stdout and process state. This avoids multiple functions competing to read JSON-RPC messages. Sequential requests are sufficient for the target scale and simpler than a fully concurrent multiplexer. Notifications are consumed and recorded by the same worker.
+Responsibilities:
 
-State:
+- `worker`: owns process stdin/stdout and request sequencing;
+- `sync`: document version/hash state and open/change/close;
+- `protocol`: minimal LSP payload helpers;
+- `normalize`: locations, URIs, position conversions;
+- `workspace_edit`: rename-preview conversion;
+- `service`: routing and fallback policy.
 
-- process and restart count;
-- server capabilities;
-- negotiated position encoding;
-- supported document sync kind;
-- open documents;
-- per-document version and content hash;
-- last error;
-- readiness;
-- startup/indexing timestamps.
+One worker owns each process. No second reader competes for JSON-RPC messages.
 
-## 7.3 Document synchronization
+## 6.3 Document synchronization
 
-Before any semantic request:
+Before a semantic request:
 
 ```text
-if unopened:
-    didOpen(version=1, full text)
-else if current CodeWeave hash != synchronized hash:
-    didChange(version += 1, full text)
+unopened:
+  didOpen(version=1, full text)
+
+opened but hash changed:
+  didChange(version += 1, full text)
 ```
 
-Full-text `didChange` is deliberately selected first. At 300k repository LOC, individual files are still bounded by `max_file_bytes`, and full sync is much simpler and safer than computing incremental edits. Incremental LSP changes can be evaluated later.
+Use full-text changes first. They are simpler, correctness-first, and bounded by the existing maximum file size.
 
-On rename/delete:
+On delete/rename:
 
-- `didClose` old URI;
-- issue file notifications only if required by the server;
-- open the new URI when queried.
+- close the old URI;
+- clear old sync state;
+- lazily open the new URI when required.
 
-After process restart:
+After restart:
 
-- clear open-document state;
-- reinitialize;
+- clear synchronized-document state;
+- initialize again;
 - reopen lazily.
 
-Semantic results include the document hash/snapshot against which they were requested.
+## 6.4 Capabilities and positions
 
-## 7.4 Position encoding
+Record:
 
-Negotiate and store UTF-8/UTF-16/UTF-32 position encoding. The current public `column` definition should remain stable, but conversion must occur at the LSP boundary. Do not assume UTF-16 forever simply because it is the protocol default.
+- `referencesProvider`;
+- `definitionProvider`;
+- `renameProvider`;
+- sync kind;
+- position encoding;
+- server name/version;
+- initialization duration;
+- current readiness and last error.
 
-## 7.5 Rust support
+Public coordinate contract:
 
-Add rust-analyzer as the first new semantic preset because it is both the affected language and the strongest semantic implementation studied.
+- `line`: one-based line number;
+- `column`: zero-based UTF-16 code-unit offset for the current compatibility API.
 
-Do not imitate rust-analyzer's HIR. CodeWeave's responsibilities are:
+Internally use an explicit `PositionEncoding`. Convert at the LSP boundary and correct the misleading phrase “UTF-16 line.”
 
-- start it;
-- synchronize files;
-- send position-based requests;
-- normalize locations;
-- expose latency, readiness, and failure reasons.
+Do not add another position parameter.
 
----
+## 6.5 Semantic routing
 
-## 8. Retrieval architecture beyond references
+`ReferenceService` preference:
 
-## 8.1 Keep indexes purpose-specific
-
-```text
-TextIndex
-  purpose: literal/regex/natural-language discovery and ranking
-  correctness: ranked retrieval, not semantic identity
-
-SymbolIndex
-  purpose: declarations, outlines, exact symbol selectors
-  correctness: syntax-derived declaration locations
-
-Reference fallback
-  purpose: exact same-spelling occurrence discovery
-  correctness: complete scan of allowed scope, identity only best-effort
-
-LSP
-  purpose: semantic definition/reference/rename identity
-  correctness: delegated to language server
-```
-
-Do not reuse one index merely because it already contains strings.
-
-## 8.2 Keep retrieval batching
-
-CodeGraph's useful product lesson is that reducing tool calls matters. CodeWeave already obtains this without a graph database by allowing up to 12 explicit operations in one `code_retrieve` call.
-
-Continue to improve batching and response context rather than adding a natural-language planner to the server.
-
-A separate high-level exploration tool should be considered only after workflow evals demonstrate that explicit batching cannot meet tool-call targets. It is not part of this plan.
-
-## 8.3 Freshness
-
-Every indexed and semantic result should expose enough state to detect staleness:
-
-- `snapshot_id`;
-- current file hash for handles;
-- `reconcile_pending`;
-- semantic `freshness`;
-- fallback reason if LSP is behind or unavailable.
-
-A quiet stale answer is worse than a slower honest answer.
+1. use a configured, healthy, synchronized LSP backend;
+2. return semantic results when successful;
+3. fall back only on a classified unsupported/unavailable/timeout/protocol failure;
+4. report the fallback reason;
+5. do not let the caller choose the backend through a public parameter.
 
 ---
 
-## 9. Code organization plan
+## 7. Evaluation architecture
 
-Do not rewrite the repository. Use a strangler-style migration.
+## 7.1 Replace the current evaluator before retrieval changes
 
-### Existing files retained
+Create a runner that exercises the same production operations as the MCP path.
 
-- `src/index/*` for text, symbol, file metadata, and fallback scan primitives;
-- `src/workspace/retrieve.rs` for public operation parsing;
-- `src/manager.rs` as composition root;
-- edit, Bash, Git, watcher, journal, and transport modules unchanged.
+Preferred structure:
 
-### New/split modules
-
-```text
-src/references/
-  mod.rs           ReferenceService and routing
-  model.rs         SymbolTarget, Occurrence, ReferenceResult
-  fallback.rs      full-scope exact identifier scan
-  normalize.rs     public JSON normalization
-
-src/intelligence/
-  mod.rs           Semantic service public boundary
-  worker.rs        owned LSP process and message loop
-  sync.rs          open/change/close and version/hash state
-  lsp_types.rs     minimal request/response helpers
-  workspace_edit.rs existing rename normalization logic
+```rust
+trait RetrievalApi {
+    fn execute(&self, operation: RetrievalOperation) -> AppResult<Value>;
+}
 ```
 
-Migration steps:
+Both:
 
-1. move no behavior initially; extract tests around existing behavior;
-2. introduce shared model;
-3. migrate fallback;
-4. migrate LSP worker;
-5. route both public operations to the service;
-6. delete duplicate fallback logic only after parity tests.
+- `WorkspaceActor::execute_retrieval_operation`, and
+- the offline evaluator
 
-Avoid renaming unrelated modules during these phases.
+call the same production implementation.
 
----
+Do not benchmark through HTTP for every microbenchmark; use the production service boundary in process. Add a smaller end-to-end MCP suite separately.
 
-## 10. Evaluation architecture
+## 7.2 Remove the eval-only ranking subsystem after migration
 
-Accuracy and latency gates are part of the feature, not a follow-up.
+After the live evaluator reaches feature parity for the intended metrics:
 
-## 10.1 Extend the existing eval crate
+- remove `src/index/context.rs`;
+- remove `src/index/chunks.rs` unless live retrieval consumes structural chunks;
+- remove `ContextParams`, `Ranking`, `SymbolDetail` exports used only by eval;
+- remove `FileEntry::chunks` and `FileEntry::path_tf`;
+- bump the index-cache schema;
+- update cold/warm baselines;
+- measure memory reduction.
 
-Add subcommands:
+Preserve the old implementation in Git history rather than keeping a parallel research engine in the production index.
 
-```text
-cargo run -p eval -- retrieval ...
-cargo run -p eval -- references --backend fallback ...
-cargo run -p eval -- references --backend semantic --language rust ...
-cargo run -p eval -- freshness ...
-```
+## 7.3 Evaluation suites
 
-Keep existing baseline files; add:
+### Production retrieval
 
-```text
-eval/
-  reference-fixtures/
-    rust/
-    python/
-    typescript/
-  reference-cases/
-    rust.json
-    python.json
-    typescript.json
-  baseline/
-    references/
-      fallback.json
-      rust-analyzer.json
-  workflow-runs/
-```
+- file lookup;
+- exact symbol;
+- literal and regex search;
+- outline;
+- repository map;
+- exact reads;
+- scope/path filters;
+- handle freshness;
+- response truncation.
 
-## 10.2 Canonical accuracy cases
+### References
 
-### Rust
+Rust:
 
-- bare free-function call;
-- `self.method()` receiver call;
-- `value.method()` receiver call;
+- bare function;
+- `self.method()`;
+- `value.method()`;
 - `Type::associated_function()`;
 - trait method and implementation;
 - same method name on unrelated types;
-- imported alias;
-- re-export;
-- local variable shadowing;
-- field read and write;
-- constructor usage;
-- macro-generated or macro-invoked reference;
-- test-only reference;
-- declaration-only symbol;
-- references after an edit;
-- ambiguous same-name declarations requiring `definition_path`.
-
-### Python
-
-- module function import;
-- aliased import;
-- instance method;
-- class method;
-- same method name on unrelated classes;
+- alias/re-export;
 - local shadowing;
-- re-export;
-- reference after edit.
+- field read/write;
+- declaration only;
+- test-only reference;
+- references after edit;
+- ambiguous definitions.
 
-### TypeScript
+Equivalent high-value fixtures for Python and TypeScript.
 
-- named import and alias;
-- class method;
-- interface/implementation;
-- same-name methods;
-- namespace/module re-export;
-- property read/write;
-- reference after edit.
+### Tool surface
 
-## 10.3 Accuracy metrics
+Scripted ChatGPT/Claude tasks:
 
-For semantic backends:
+- locate and read implementation;
+- inspect references;
+- make one-file edit;
+- make multi-file edit;
+- inspect failed post-apply validation;
+- run and poll Bash;
+- review Git diff;
+- recover from stale handle;
+- stage/commit only when requested.
 
-- precision;
-- recall;
-- F1;
-- false-zero rate;
-- wrong-target rate;
-- ambiguous-target handling rate;
-- duplicate result rate;
-- stale-result rate after edit.
+Measure:
 
-For fallback:
+- selected tool;
+- malformed calls;
+- runtime validation errors;
+- retries;
+- tool calls;
+- schema tokens;
+- correct final diff.
 
-- exact-name occurrence recall;
-- false-zero rate;
-- same-name false-positive rate;
-- classification accuracy;
-- evidence-honesty rate;
-- full-scan/index parity if an accelerator is later added.
+### Scale
 
-For general retrieval:
+Use deterministic fixtures at:
 
-- existing Recall@1/5/10 and MRR;
-- complete-symbol rate;
-- mean response chars.
+- approximately 10k LOC;
+- approximately 100k LOC;
+- approximately 300k LOC.
 
-## 10.4 Latency metrics
+Use pinned real repositories for relevance and correctness, including CodeWeave and CrawlerAI.
 
-Measure separately:
+## 7.4 Gates
 
-- cold CodeWeave index;
-- warm CodeWeave startup;
-- warm literal/symbol retrieval p50/p95;
-- warm fallback references p50/p95;
-- LSP process startup;
-- LSP project-ready/first-useful-result time;
-- warm semantic references p50/p95;
-- single-file index refresh p50/p95;
-- edit-to-fresh-fallback-result p50/p95;
-- edit-to-fresh-semantic-result p50/p95.
+Freeze absolute targets only after live-path baselines exist.
 
-Run at three size buckets:
+Initial relative gates:
 
-- small: approximately 10k LOC;
-- medium: approximately 100k LOC;
-- maximum target: approximately 300k LOC.
-
-Use real pinned repositories for accuracy and deterministic generated repositories for scale curves.
-
-## 10.5 Initial gates
-
-Absolute SLOs should be frozen only after Phase 0 measures the current implementation on the target machine. Initial relative gates:
-
-- no canonical reference case may regress;
-- receiver-qualified calls must have zero false-zero results;
-- fallback exact-name recall must be 100% on canonical fixtures;
-- semantic precision and recall must be 100% on deterministic fixtures supported by the language server;
-- warm fallback reference p95 must be no worse than 1.25× the approved baseline;
-- warm general retrieval p95 must be no worse than 1.10×;
-- cold startup must not regress by more than 10% unless accuracy improves and the trade-off is explicitly approved;
-- post-edit freshness must be correct before a response is labelled `current`;
-- no result may be labelled semantic after fallback.
-
-After Phase 0, add absolute 300k-LOC targets based on measured hardware rather than estimates.
+- no canonical accuracy regression;
+- zero false-zero receiver-qualified reference cases;
+- fallback exact-name occurrence recall of 100% on deterministic fixtures;
+- no fallback result labelled semantic;
+- warm live retrieval p95 no worse than 1.10× baseline;
+- warm fallback-reference p95 no worse than 1.25× baseline;
+- cold index no worse than baseline after removing dead per-file fields;
+- memory must improve or remain within 1.05×;
+- invalid-call rate must decline after contract changes;
+- average schema tokens in the default profile must decline;
+- tool calls per workflow must not increase.
 
 ---
 
-## 11. Phased implementation plan
+## 8. Error and capability architecture
 
-## Phase 0 — freeze and baseline
+## 8.1 Central error registry
 
-**Production behavior:** unchanged.
+Introduce stable internal codes without changing public strings initially:
+
+```rust
+enum ErrorCode {
+    InvalidArgument,
+    MissingOperationField,
+    InvalidOperationField,
+    StaleSnapshot,
+    StaleFile,
+    StaleHandle,
+    PartialCommit,
+    IndexRefreshFailed,
+    JournalWriteFailed,
+    // ...
+}
+
+struct ErrorPolicy {
+    code: &'static str,
+    retry_kind: RetryKind,
+    public_category: ErrorCategory,
+}
+```
+
+Generate:
+
+- public code string;
+- retryability;
+- default retry kind;
+- documentation;
+- tests for uniqueness;
+- exhaustive mapping checks.
+
+Call sites may attach cause-specific details, but they do not hand-author retry policy.
+
+Do not collapse distinct recovery paths merely to reduce the number of codes. Consolidate only codes with the same caller action.
+
+## 8.2 Separate static capabilities from dynamic diagnostics
+
+Create one internal `CapabilitySnapshot` source, rendered in two views:
+
+```text
+code_capabilities:
+  public contracts, supported operations, limits, known limitations
+
+workspace diagnostics:
+  current readiness, cache state, generation, snapshot, pending reconcile,
+  LSP process state, Bash state, repository metrics
+```
+
+During compatibility, retain existing fields as aliases where required, but test that shared values come from the same source.
+
+## 8.3 Truthful edit capability model
+
+Publish:
+
+```json
+{
+  "atomic_file_replace": true,
+  "atomic_multi_file_commit": false,
+  "compensating_restore": "best_effort",
+  "manual_recovery_possible": true,
+  "validation_failures_preserve_edits": true
+}
+```
+
+Remove ambiguous legacy names such as `supports_rollback_on_failure`.
+
+---
+
+## 9. Internal simplification workstream
+
+## 9.1 Centralize Bash request validation
+
+The Bash allowed-field validation currently exists in both request preparation and manager dispatch.
+
+Create one function:
+
+```rust
+fn normalize_bash_request(method: BashMethod, input: &Value) -> AppResult<NormalizedBashRequest>
+```
+
+Use it once before dispatch. Manager methods consume typed normalized input. Keep defense-in-depth tests, not duplicate hand-maintained field lists.
+
+## 9.2 Consolidate removed-feature compatibility
+
+Move legacy configuration/tool-name rejection into:
+
+```text
+src/compatibility.rs
+```
+
+with a table containing:
+
+- removed input;
+- replacement;
+- removal version;
+- error code;
+- suggested configuration/tool.
+
+Keep actionable errors, but remove scattered compatibility conditionals.
+
+## 9.3 Share low-level helpers
+
+Move duplicate UTF-8 boundary and response truncation helpers into a small utility module with focused tests.
+
+Do not create a general “utils” dumping ground; functions must have one clear owner such as `text.rs` or `response.rs`.
+
+## 9.4 Reduce WorkspaceActor lock complexity incrementally
+
+Do not rewrite it into a mailbox actor and do not rename it in the same project.
+
+Extract cohesive state owners:
+
+```text
+ReconcileState
+MutationJournal
+RunAttribution
+RepositoryStatusCache
+```
+
+Each component owns its locks and exposes methods that preserve ordering internally. The top-level workspace object coordinates them without directly combining all guards.
+
+Priority extraction: `RunAttribution`, because it contains complex baseline/completion/frozen-state logic and can be tested independently.
+
+Add concurrency tests for:
+
+- edit + watcher event;
+- Bash completion + reconcile;
+- concurrent reads during edit;
+- cancellation + output polling;
+- refresh during pending filesystem events.
+
+## 9.5 Transaction compensation
+
+Keep the current best-effort reverse recovery, but isolate it as:
+
+```text
+CommitPlan
+CommitProgress
+CompensationReport
+```
+
+Before write phase:
+
+- prepare all temporary contents;
+- confirm destination parents and preconditions;
+- only then begin rename/delete application.
+
+This can reduce but not eliminate partial commits.
+
+Responses must preserve:
+
+- applied paths;
+- restored paths;
+- rollback failures;
+- manual recovery requirement;
+- current snapshot/reconcile state.
+
+---
+
+## 10. Phased implementation plan
+
+## Phase 0 — live-path evaluation correction
+
+**No production behavior change.**
 
 Deliver:
 
-- commit this architecture decision;
-- add reference fixture definitions and gold results;
-- add 10k/100k/300k generated scale fixtures;
-- measure current false-zero, precision/recall, and p50/p95;
-- capture rust-analyzer cold and warm behavior;
-- record current memory as a guardrail;
-- add a test that reproduces `self.run_edit_validation()` returning zero.
+- public tool/schema snapshot;
+- live production retrieval adapter for eval;
+- reference fixture framework;
+- tool-surface workflow framework;
+- 10k/100k/300k scale fixtures;
+- baseline cold/warm latency and memory;
+- regression reproducing `self.run_edit_validation()` false zero;
+- explicit proof that `context()` is not live.
 
-Exit criteria:
+Exit:
 
-- baseline files committed;
-- public schema snapshot committed;
-- design decisions approved;
-- no implementation patch mixed into the phase.
+- committed live-path baselines;
+- temporary evaluator marker established before deletion in Phase 1;
+- no implementation optimization started.
 
-## Phase 1 — correct always-available fallback
+## Phase 1 — delete dead retrieval architecture
 
-Change only the fallback:
+Deliver:
 
-- remove general token-index candidate filtering from reference lookup;
-- scan every eligible in-memory file with exact identifier boundaries;
-- preserve scope, kind filters, result limits, handles, and evidence;
-- add receiver, associated-function, same-name, and declaration-only tests;
-- add `truncated` and complete scanned-scope metadata if absent.
+- migrate all useful eval cases to production operations;
+- remove `context.rs`, eval-only ranking types, chunks/path fields when no live consumer remains;
+- bump cache schema;
+- compare memory and startup;
+- keep no parallel v1/v2 engine.
 
-Do not add an identifier posting index.
+Exit:
 
-Exit criteria:
+- eval and live retrieval use the same code;
+- no production regression;
+- cold index and memory meet gates.
 
-- false-zero regression fixed;
-- fallback exact-name recall 100%;
-- latency within gate at 300k LOC;
-- general retrieval baselines unchanged.
+## Phase 2 — contract and tool-surface cleanup
 
-## Phase 2 — shared reference model
+Deliver:
 
-- introduce `SymbolTarget`, `Occurrence`, and `ReferenceResult`;
-- normalize current indexed and intelligence responses through one serializer;
-- separate target-resolution evidence from occurrence-kind classification;
-- keep public fields backward compatible;
-- move duplicate reference classification into one module.
+- typed retrieval/change contract tables;
+- runtime required/allowed-field validation;
+- generated capability/docs/tests;
+- remove `rollback_on_failure` from advertised schemas;
+- post-apply validation terminology;
+- handle wording cleanup;
+- central Bash request normalization;
+- static-vs-dynamic capability split;
+- initial central error registry.
 
-Exit criteria:
+Exit:
 
-- golden JSON tests for both public routes;
-- no schema input changes;
-- no accuracy or latency regression.
+- no generic `query`;
+- invalid-call fixture rate improves;
+- schema tokens decline;
+- compatibility tests pass.
 
-## Phase 3 — reliable generic LSP worker
+## Phase 3 — correct fallback references
 
-- split `intelligence.rs`;
-- create one owner worker per configured server;
-- record capabilities and position encoding;
-- implement full-text didOpen/didChange/didClose synchronization;
-- track version + content hash;
-- add rust-analyzer preset;
-- retain Python and TypeScript compatibility;
-- test process restart, timeout, stale file, Unicode columns, rename, and outside-root URI rejection.
+Deliver:
 
-Exit criteria:
+- complete allowed-scope identifier scan;
+- identifier-boundary correctness;
+- Tree-sitter classification;
+- enclosing symbols;
+- target/evidence/freshness fields;
+- exact deterministic fixtures;
+- no general token-index correctness prefilter.
 
-- semantic queries after CodeWeave edits use current content;
-- no competing stdout reader;
-- rust-analyzer deterministic fixture passes;
-- cold/warm latency captured.
+Exit:
 
-## Phase 4 — one internal `ReferenceService`
+- false-zero bug fixed;
+- canonical fallback recall gate passes;
+- 300k p95 within gate.
 
-- route `code_intelligence.references` through `ReferenceService`;
-- route `code_retrieve.find_references` through the same service after it resolves the declaration selector;
-- prefer a healthy semantic backend automatically;
-- fallback on explicit, classified failures;
-- expose backend, evidence, freshness, and warning;
-- do not expose a backend-selection parameter.
+## Phase 4 — shared ReferenceService and model
 
-Exit criteria:
+Deliver:
 
-- both public routes produce equivalent locations for the same semantic target;
-- no duplicate fallback implementations;
-- an LSP outage returns honest fallback evidence;
-- no public `query` field appears.
+- shared target and occurrence models;
+- one serializer;
+- route both public reference operations through one service;
+- remove duplicate fallback code;
+- semantic/fallback routing policy;
+- golden response tests.
 
-## Phase 5 — measured optimizations only
+Exit:
 
-Evaluate:
+- equivalent location results across both public entry points;
+- no duplicate reference engines;
+- evidence labels correct.
 
-1. exact identifier posting list;
-2. parsed occurrence cache;
-3. safe visibility-derived scopes;
-4. richer enclosing-symbol context;
-5. call hierarchy operations exposed through LSP.
+## Phase 5 — LSP reliability and rust-analyzer
 
-Adopt an item only when:
+Deliver:
 
-- it improves approved latency or workflow metrics;
-- exact accuracy does not regress;
-- maintenance complexity is documented;
-- a full-scan correctness oracle remains in tests.
+- worker-owned JSON-RPC process;
+- capability negotiation;
+- position encoding;
+- full-text document synchronization;
+- restart/reopen behavior;
+- rust-analyzer preset;
+- existing Python/TypeScript presets migrated;
+- current-hash freshness checks;
+- Unicode, timeout, restart and post-edit tests.
 
-SQLite, trigram indexes, persistent graphs, and framework resolution remain out of scope unless the 300k-LOC evaluation clearly invalidates the in-memory design.
+Exit:
+
+- semantic results after edits are current;
+- CrawlerAI and Rust fixtures pass;
+- latency baselines recorded;
+- fallback remains available and honest.
+
+## Phase 6 — evaluated default tool profile
+
+Deliver:
+
+- run ChatGPT and Claude workflow suites against current profiles;
+- define the coding profile from measured tool use;
+- expose uncommon/destructive Git tools only in `full`;
+- retain custom profile;
+- change the default only in a separate versioned release after connector testing.
+
+Exit:
+
+- fewer visible schema tokens;
+- lower or equal malformed-call rate;
+- no increase in tool calls or task failures.
+
+## Phase 7 — state ownership and edit-engine simplification
+
+Deliver:
+
+- extract `RunAttribution`;
+- centralize compatibility;
+- deduplicate text helpers;
+- isolate commit progress/compensation;
+- clarify lock ownership;
+- add concurrency tests.
+
+Exit:
+
+- no behavior or latency regression;
+- fewer multi-lock call sites;
+- partial-commit reporting remains complete.
+
+## Phase 8 — measured optimizations only
+
+Candidates:
+
+- exact identifier posting list;
+- parsed occurrence cache;
+- visibility-derived reference scope;
+- LSP call hierarchy;
+- faster substring/trigram index.
+
+Adoption requirements:
+
+- approved metric regression exists;
+- proposed change fixes that metric;
+- correctness oracle remains;
+- complexity and memory costs are measured;
+- no competing retrieval system remains after adoption.
+
+---
+
+## 11. Findings not adopted as immediate changes
+
+### Delete all narrow edit tools
+
+Rejected. Narrow tools are the simple interface. Their shared engine is a maintenance benefit, not proof the public wrappers are unnecessary.
+
+### Replace flat schemas with `oneOf`
+
+Rejected for now. Hosted-client compatibility is a real constraint. Typed runtime contracts and actionable errors provide most of the value safely.
+
+### Rename WorkspaceActor immediately
+
+Rejected. The name is imperfect, but a rename has no accuracy or latency payoff. Reduce lock ownership and module complexity first.
+
+### Add a graph database because CodeGraph has one
+
+Rejected. CodeGraph's stage separation and provenance are useful; its storage and graph breadth are not justified for 100k–300k LOC.
+
+### Keep the eval-only ranker for possible future use
+
+Rejected after the live evaluator is migrated. Git history is the archive. Parallel unused engines distort memory, startup and architectural decisions.
+
+### Collapse all error codes
+
+Rejected. Centralize and classify them, then consolidate only where the recovery action is identical.
 
 ---
 
 ## 12. Revert-prevention rules
 
-This area has already suffered repeated reversions, so the implementation process must reduce ambiguity.
-
-1. One phase per commit series.
-2. No API redesign and engine rewrite in the same phase.
-3. Before each phase:
-   - clean Git status;
-   - baseline recorded;
-   - exact files and invariants listed.
-4. Every optimization has a correctness oracle:
-   - fallback full scan is the oracle for identifier postings;
-   - LSP deterministic fixture is the oracle for semantic routing.
-5. No test should assert only `result_count > 0`; tests assert exact paths, ranges, evidence, and target.
-6. Add adversarial same-name cases before performance optimization.
-7. Do not delete the old path until the new path passes golden parity.
-8. No configuration migration without backward-compatibility tests.
-9. No new dependency unless a standard-library/current-crate implementation fails the measured target.
-10. Any rollback of a phase must preserve fixture and baseline additions so the failure remains reproducible.
+1. One workstream per commit series.
+2. Phase 0 baselines land before behavior changes.
+3. Public input schemas have committed snapshots.
+4. No API simplification and engine rewrite in the same phase.
+5. Every optimization has a simpler correctness oracle.
+6. Exact expected paths/ranges/evidence are asserted; not merely `result_count > 0`.
+7. Adversarial same-name fixtures precede reference optimization.
+8. Compatibility acceptance is separated from advertised schemas.
+9. No new dependency without a measured requirement.
+10. Do not delete the prior implementation until parity/golden tests pass.
+11. Reverts preserve fixtures and baselines that reproduce the failure.
+12. Every phase reports accuracy, p50/p95, memory, schema size and workflow call count.
+13. No code is described as atomic when it is only compensating.
+14. No fallback response is described as semantic.
+15. No generic retrieval `query` enters the public contract.
 
 ---
 
-## 13. Final architecture recommendation
+## 13. Immediate next slice
 
-The appropriate architecture for CodeWeave is not a miniature rust-analyzer or CodeGraph. It is:
+The first implementation slice should contain only:
 
-- an eager in-memory file/text/symbol index;
-- exact deterministic retrieval operations;
-- a complete in-memory identifier scan as the reliable fallback;
-- tree-sitter for syntax structure and occurrence classification;
-- LSP for semantic identity;
-- one shared result model;
-- one shared reference service;
-- explicit evidence and freshness;
-- eval-gated optimization for a 300k-LOC ceiling.
+1. a new live-path evaluator adapter;
+2. exact reference fixtures, including the receiver-qualified failure;
+3. tool-schema snapshots and malformed-call fixtures;
+4. memory/LOC/index metrics;
+5. a temporary marker around the then-current `context()` evaluator.
 
-This preserves CodeWeave's main advantage: a small, understandable, low-latency local service with high-confidence behavior and narrow public contracts.
+This historical slice is complete. Phase 1 subsequently deleted the evaluator, ranker, query sets, and historical baselines; Git history is the only retained archive.
 
 ---
 
-## 14. Primary sources studied
+## 14. Source basis
 
-- [rust-analyzer architecture](https://rust-analyzer.github.io/book/contributing/architecture.html)
-- [rust-analyzer find-usages search implementation](https://raw.githubusercontent.com/rust-lang/rust-analyzer/master/crates/ide-db/src/search.rs)
-- [rust-analyzer reference entry point](https://raw.githubusercontent.com/rust-lang/rust-analyzer/master/crates/ide/src/references.rs)
-- [Serena](https://github.com/oraios/serena)
-- [CodeGraph](https://github.com/colbymchenry/codegraph)
-- [CodeGraph: how it works](https://colbymchenry.github.io/codegraph/core-concepts/how-it-works/)
-- [CodeGraph: knowledge graph](https://colbymchenry.github.io/codegraph/core-concepts/knowledge-graph/)
-- [CodeGraph: indexing](https://colbymchenry.github.io/codegraph/guides/indexing/)
-- [SCIP](https://github.com/scip-code/scip)
-- [SCIP protocol](https://raw.githubusercontent.com/scip-code/scip/main/scip.proto)
-- [Kythe](https://github.com/kythe/kythe)
-- [Stack Graphs](https://github.com/github/stack-graphs)
-- [Zoekt](https://github.com/sourcegraph/zoekt)
-- [ast-grep](https://github.com/ast-grep/ast-grep)
-- [LSP 3.17 specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/)
+### Audit
+
+- `Pasted text(14).txt`, especially:
+  - public tool surface and shared edit engine: lines 1–22;
+  - concurrency/edit pipeline: lines 24–75;
+  - schema confusion risks: lines 77–87;
+  - error contract: lines 88–99;
+  - duplication and state complexity: lines 100–108;
+  - live-vs-eval retrieval finding: lines 109–176.
+
+### Repository verification
+
+Verified during the initial audit:
+
+- live retrieval called `CodeIndex::search`;
+- `CodeIndex::context` was called only by eval/tests;
+- the same was true before the recent module split;
+- `context.rs` was 950 LOC and `chunks.rs` was 192 LOC;
+- `chunks` and `path_tf` were built and cached for every file despite having no live consumer;
+- Phase 1 deleted those eval-only files and fields rather than retaining a legacy mode;
+- Bash field validation is duplicated in `main.rs` and `manager.rs`;
+- the UTF-8 boundary helper is duplicated;
+- `rollback_on_failure` is still advertised but deprecated and ignored;
+- the working tree was clean during review.
+
+### External architecture references retained from v1
+
+- rust-analyzer architecture and find-usages implementation;
+- Serena;
+- CodeGraph;
+- SCIP;
+- Kythe;
+- Stack Graphs;
+- Zoekt;
+- ast-grep;
+- LSP 3.17 specification.
+
+The revised plan keeps their useful principles while reducing the amount of machinery proposed for CodeWeave.

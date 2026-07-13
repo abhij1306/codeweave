@@ -10,6 +10,7 @@ use super::util::{
 };
 use super::validation::ValidationOutcome;
 use super::WorkspaceActor;
+use crate::contracts;
 use crate::index::{content_hash, decode_handle, CodeIndex};
 use crate::model::{bool_value, required_str, string_list, usize_value, AppError, AppResult};
 use crate::security::validate_relative;
@@ -168,9 +169,9 @@ impl WorkspaceActor {
                 validation_run_ids.push(deferred_run_id.clone());
             }
             let guidance = if deferred_validation_pending.is_some() {
-                "Validation is running in the background. The edit remains applied. Poll bash_status for every ID in validation_run_ids; validation_run_id is the leading validator and deferred_validation_run_id is queued behind it."
+                "Post-apply validation is running in the background. The edit remains applied. Poll bash_status for every ID in validation_run_ids; validation_run_id is the leading validator and deferred_validation_run_id is queued behind it."
             } else {
-                "Validation is running in the background. The edit remains applied. Poll bash_status with validation_run_id."
+                "Post-apply validation is running in the background. The edit remains applied. Poll bash_status with validation_run_id."
             };
             drop(write_guard.take());
             self.reconcile_pending_async().await?;
@@ -179,6 +180,7 @@ impl WorkspaceActor {
                 "rolled_back": false,
                 "validation_failed": validation_failed,
                 "validation_pending": true,
+                "validation_status": "pending",
                 "validation_run_id": run_id,
                 "validation_run_ids": validation_run_ids,
                 "guidance": guidance,
@@ -212,6 +214,7 @@ impl WorkspaceActor {
             "applied": true,
             "rolled_back": false,
             "validation_failed": validation_failed,
+            "validation_status": if validation_failed { "failed" } else { "passed" },
             "snapshot_rebased_from": snapshot_rebased_from,
             "diff": diff_value,
             "diff_stat": diff_stat_value,
@@ -230,7 +233,7 @@ impl WorkspaceActor {
         if validation_failed {
             response["reason"] = Value::String("validation_failed".to_owned());
             response["guidance"] = Value::String(
-                "Validation failed, but the edit remains applied so the reported failure can be fixed in a follow-up edit."
+                "Post-apply validation failed, but the edit remains applied so the reported failure can be fixed in a follow-up edit."
                     .to_owned(),
             );
         }
@@ -256,6 +259,9 @@ impl WorkspaceActor {
             .ok_or_else(|| AppError::invalid("changes must be an array"))?;
         if changes.is_empty() {
             return Err(AppError::invalid("changes cannot be empty"));
+        }
+        for change in changes {
+            contracts::validate_change(change)?;
         }
         let snapshot_matches = requested_snapshot
             .as_deref()
@@ -408,7 +414,7 @@ impl WorkspaceActor {
                 if handle.is_none() {
                     return Err(AppError::new(
                         "MISSING_HANDLE",
-                        "replace_range requires a fetch handle",
+                        "replace_range requires a fresh code_retrieve range handle",
                     ));
                 }
                 vec![(base_offset, base_offset + selected.len())]
@@ -554,7 +560,10 @@ impl WorkspaceActor {
             }
             "replace_range" => {
                 let handle = edit_handle.as_ref().ok_or_else(|| {
-                    AppError::new("MISSING_HANDLE", "replace_range requires a fetch handle")
+                    AppError::new(
+                        "MISSING_HANDLE",
+                        "replace_range requires a fresh code_retrieve range handle",
+                    )
                 })?;
                 let new_input = change
                     .get("new_text")

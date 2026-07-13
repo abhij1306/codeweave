@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use tree_sitter::{Language, Node, Parser};
 
@@ -15,6 +15,25 @@ pub struct Symbol {
     pub start_line: usize,
     pub end_line: usize,
     pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentifierOccurrence {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+    pub role: &'static str,
+    pub evidence: &'static str,
+    pub enclosing_symbol: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SyntaxContext {
+    role: &'static str,
+    enclosing_symbol: Option<String>,
 }
 
 pub fn language_name(path: &Path) -> &'static str {
@@ -99,6 +118,334 @@ pub fn extract_symbols(path: &Path, content: &str) -> Vec<Symbol> {
     .unwrap_or_default()
 }
 
+/// Find every exact identifier occurrence. The lexical pass is the completeness
+/// oracle; Tree-sitter enriches matching syntax nodes but never filters a hit.
+pub fn identifier_occurrences(
+    path: &Path,
+    content: &str,
+    identifier: &str,
+) -> Vec<IdentifierOccurrence> {
+    identifier_occurrences_with_symbols(path, content, identifier, &[])
+}
+
+/// Enrich exact occurrences using bounded syntax ranges selected from the
+/// already-indexed symbol outline. This avoids reparsing a whole large file for
+/// a handful of hits while keeping the lexical scan as the correctness oracle.
+pub fn identifier_occurrences_with_symbols(
+    path: &Path,
+    content: &str,
+    identifier: &str,
+    symbols: &[Symbol],
+) -> Vec<IdentifierOccurrence> {
+    const MAX_SYNTAX_RANGE_LINES: usize = 200;
+    const LOCAL_CONTEXT_LINES: usize = 20;
+
+    let identifier = identifier.trim();
+    if identifier.is_empty() {
+        return Vec::new();
+    }
+    let mut occurrences = lexical_identifier_occurrences(content, identifier);
+    if occurrences.is_empty() {
+        return occurrences;
+    }
+
+    let line_starts = source_line_starts(content);
+    let total_lines = line_starts.len().max(1);
+    let mut ranges = BTreeMap::<(usize, usize), Option<String>>::new();
+    if symbols.is_empty() {
+        ranges.insert((1, total_lines), None);
+    } else {
+        for occurrence in &mut occurrences {
+            let indexed_enclosing = symbols
+                .iter()
+                .filter(|symbol| {
+                    symbol.start_line <= occurrence.start_line
+                        && symbol.end_line >= occurrence.end_line
+                })
+                .min_by_key(|symbol| symbol.end_line.saturating_sub(symbol.start_line));
+            let fallback_enclosing = indexed_enclosing
+                .filter(|symbol| {
+                    !(symbol.name == identifier && symbol.start_line == occurrence.start_line)
+                })
+                .map(|symbol| symbol.name.clone());
+            occurrence.enclosing_symbol = fallback_enclosing.clone();
+
+            let (mut start_line, mut end_line) = indexed_enclosing
+                .map(|symbol| (symbol.start_line, symbol.end_line))
+                .unwrap_or((occurrence.start_line, occurrence.end_line));
+            if end_line.saturating_sub(start_line) + 1 > MAX_SYNTAX_RANGE_LINES {
+                start_line = occurrence
+                    .start_line
+                    .saturating_sub(LOCAL_CONTEXT_LINES)
+                    .max(1);
+                end_line = (occurrence.end_line + LOCAL_CONTEXT_LINES).min(total_lines);
+            }
+            ranges
+                .entry((start_line, end_line))
+                .or_insert(fallback_enclosing);
+        }
+    }
+
+    let mut syntax = HashMap::new();
+    for ((start_line, end_line), fallback_enclosing) in ranges {
+        let (start_byte, end_byte) =
+            source_line_range_bytes(content, &line_starts, start_line, end_line);
+        let source = &content[start_byte..end_byte];
+        let contexts = with_parser(path, |parser| {
+            parser.parse(source, None).map(|tree| {
+                syntax_contexts(
+                    tree.root_node(),
+                    source.as_bytes(),
+                    identifier,
+                    start_byte,
+                    fallback_enclosing.as_deref(),
+                )
+            })
+        })
+        .flatten();
+        if let Some(contexts) = contexts {
+            syntax.extend(contexts);
+        }
+    }
+
+    for occurrence in &mut occurrences {
+        if let Some(context) = syntax.get(&(occurrence.start_byte, occurrence.end_byte)) {
+            occurrence.role = context.role;
+            occurrence.evidence = "syntactic";
+            if context.enclosing_symbol.is_some() {
+                occurrence.enclosing_symbol = context.enclosing_symbol.clone();
+            }
+        }
+    }
+    occurrences
+}
+
+fn lexical_identifier_occurrences(content: &str, identifier: &str) -> Vec<IdentifierOccurrence> {
+    let line_starts = source_line_starts(content);
+    content
+        .match_indices(identifier)
+        .filter_map(|(start_byte, _)| {
+            let end_byte = start_byte + identifier.len();
+            let before = content[..start_byte].chars().next_back();
+            let after = content[end_byte..].chars().next();
+            if before.is_some_and(is_identifier_continue)
+                || after.is_some_and(is_identifier_continue)
+            {
+                return None;
+            }
+            let (start_line, start_column) = source_position(content, &line_starts, start_byte);
+            let (end_line, end_column) = source_position(content, &line_starts, end_byte);
+            Some(IdentifierOccurrence {
+                start_byte,
+                end_byte,
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                role: "other",
+                evidence: "lexical",
+                enclosing_symbol: None,
+            })
+        })
+        .collect()
+}
+
+fn is_identifier_continue(character: char) -> bool {
+    character == '_'
+        || character == '$'
+        || character.is_alphanumeric()
+        || matches!(character, '\u{200c}' | '\u{200d}')
+        || ('\u{0300}'..='\u{036f}').contains(&character)
+        || ('\u{1ab0}'..='\u{1aff}').contains(&character)
+        || ('\u{1dc0}'..='\u{1dff}').contains(&character)
+        || ('\u{20d0}'..='\u{20ff}').contains(&character)
+        || ('\u{fe20}'..='\u{fe2f}').contains(&character)
+}
+
+fn source_line_starts(content: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(content.match_indices('\n').map(|(index, _)| index + 1));
+    starts
+}
+
+fn source_position(content: &str, line_starts: &[usize], byte: usize) -> (usize, usize) {
+    let line_index = line_starts
+        .partition_point(|line_start| *line_start <= byte)
+        .saturating_sub(1);
+    let line_start = line_starts[line_index];
+    let column = content[line_start..byte].chars().count() + 1;
+    (line_index + 1, column)
+}
+
+fn source_line_range_bytes(
+    content: &str,
+    line_starts: &[usize],
+    start_line: usize,
+    end_line: usize,
+) -> (usize, usize) {
+    let start_index = start_line.saturating_sub(1).min(line_starts.len() - 1);
+    let end_index = end_line.min(line_starts.len());
+    let start_byte = line_starts[start_index];
+    let end_byte = line_starts.get(end_index).copied().unwrap_or(content.len());
+    (start_byte, end_byte)
+}
+
+fn syntax_contexts(
+    root: Node<'_>,
+    source: &[u8],
+    identifier: &str,
+    base_byte: usize,
+    fallback_enclosing: Option<&str>,
+) -> HashMap<(usize, usize), SyntaxContext> {
+    let mut contexts = HashMap::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if is_identifier_node(node) && node.utf8_text(source).ok() == Some(identifier) {
+            contexts.insert(
+                (base_byte + node.start_byte(), base_byte + node.end_byte()),
+                SyntaxContext {
+                    role: classify_identifier_node(node),
+                    enclosing_symbol: enclosing_symbol_name(node, source)
+                        .or_else(|| fallback_enclosing.map(str::to_owned)),
+                },
+            );
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    contexts
+}
+
+fn is_identifier_node(node: Node<'_>) -> bool {
+    if !node.is_named() || node.named_child_count() != 0 {
+        return false;
+    }
+    let kind = node.kind();
+    matches!(
+        kind,
+        "identifier"
+            | "field_identifier"
+            | "property_identifier"
+            | "shorthand_property_identifier"
+            | "shorthand_property_identifier_pattern"
+            | "type_identifier"
+            | "namespace_identifier"
+            | "name"
+    ) || kind.ends_with("_identifier")
+}
+
+fn classify_identifier_node(node: Node<'_>) -> &'static str {
+    if is_declaration_name(node) {
+        return "declaration";
+    }
+    if node.kind().contains("type_identifier") {
+        return "type";
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        let kind = parent.kind();
+        if is_import_context(kind) {
+            return "import";
+        }
+        if is_write_context(parent, node) {
+            return "write";
+        }
+        if is_call_context(kind) {
+            return "call";
+        }
+        if is_type_context(kind) {
+            return "type";
+        }
+        current = parent.parent();
+    }
+    "read"
+}
+
+fn is_declaration_name(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if is_occurrence_declaration(parent.kind()) {
+            if let Some(name) = parent
+                .child_by_field_name("name")
+                .or_else(|| find_identifier(parent))
+            {
+                if same_node(name, node) {
+                    return true;
+                }
+            }
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn is_import_context(kind: &str) -> bool {
+    kind.contains("import")
+        || matches!(
+            kind,
+            "use_declaration" | "include_directive" | "preproc_include" | "using_directive"
+        )
+}
+
+fn is_call_context(kind: &str) -> bool {
+    kind.contains("call")
+        || matches!(
+            kind,
+            "method_invocation" | "invocation_expression" | "macro_invocation" | "command"
+        )
+}
+
+fn is_write_context(parent: Node<'_>, node: Node<'_>) -> bool {
+    let kind = parent.kind();
+    if matches!(kind, "update_expression" | "postfix_unary_expression") {
+        return contains_node(parent, node);
+    }
+    if kind.contains("assignment") || matches!(kind, "short_var_declaration") {
+        return parent
+            .child_by_field_name("left")
+            .or_else(|| parent.child_by_field_name("name"))
+            .is_some_and(|left| contains_node(left, node));
+    }
+    false
+}
+
+fn is_type_context(kind: &str) -> bool {
+    kind.contains("type")
+        || matches!(
+            kind,
+            "cast_expression" | "generic_parameter" | "implements_clause" | "extends_clause"
+        )
+}
+
+fn contains_node(container: Node<'_>, node: Node<'_>) -> bool {
+    container.start_byte() <= node.start_byte() && container.end_byte() >= node.end_byte()
+}
+
+fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
+    left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
+}
+
+fn enclosing_symbol_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if is_declaration(parent.kind()) {
+            if let Some(name) = parent
+                .child_by_field_name("name")
+                .or_else(|| find_identifier(parent))
+            {
+                if !same_node(name, node) {
+                    if let Ok(name) = name.utf8_text(source) {
+                        return Some(name.to_owned());
+                    }
+                }
+            }
+        }
+        current = parent.parent();
+    }
+    None
+}
+
 fn walk(root: Node<'_>, source: &[u8], output: &mut Vec<Symbol>) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -138,10 +485,35 @@ fn walk(root: Node<'_>, source: &[u8], output: &mut Vec<Symbol>) {
 
 fn find_identifier(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
-    let found = node
-        .children(&mut cursor)
-        .find(|child| matches!(child.kind(), "identifier" | "type_identifier" | "name"));
+    let found = node.children(&mut cursor).find(|child| {
+        matches!(
+            child.kind(),
+            "identifier"
+                | "field_identifier"
+                | "property_identifier"
+                | "type_identifier"
+                | "namespace_identifier"
+                | "name"
+        )
+    });
     found
+}
+
+fn is_occurrence_declaration(kind: &str) -> bool {
+    is_declaration(kind)
+        || matches!(
+            kind,
+            "variable_declarator"
+                | "lexical_declaration"
+                | "let_declaration"
+                | "const_item"
+                | "static_item"
+                | "field_declaration"
+                | "parameter"
+                | "required_parameter"
+                | "optional_parameter"
+                | "formal_parameter"
+        )
 }
 
 fn is_declaration(kind: &str) -> bool {
@@ -178,9 +550,49 @@ fn is_declaration(kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn extracts_rust_function() {
         let symbols = extract_symbols(Path::new("x.rs"), "pub fn hello() {}\n");
-        assert!(symbols.iter().any(|s| s.name == "hello"));
+        assert!(symbols.iter().any(|symbol| symbol.name == "hello"));
+    }
+
+    #[test]
+    fn exact_identifier_boundaries_exclude_identifier_substrings() {
+        let content = "run run_more prerun $run run();\n";
+        let occurrences = identifier_occurrences(Path::new("x.rs"), content, "run");
+        assert_eq!(occurrences.len(), 2);
+        assert_eq!(occurrences[0].start_column, 1);
+        assert_eq!(occurrences[1].role, "call");
+    }
+
+    #[test]
+    fn receiver_qualified_call_has_syntactic_role_and_enclosing_symbol() {
+        let content = "impl Validator {\n    fn apply(&self) {\n        self.run_edit_validation();\n    }\n}\n";
+        let occurrences =
+            identifier_occurrences(Path::new("validator.rs"), content, "run_edit_validation");
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(occurrences[0].role, "call");
+        assert_eq!(occurrences[0].evidence, "syntactic");
+        assert_eq!(occurrences[0].enclosing_symbol.as_deref(), Some("apply"));
+    }
+
+    #[test]
+    fn tree_sitter_classifies_python_import_and_typescript_write() {
+        let imported = identifier_occurrences(
+            Path::new("module.py"),
+            "from owner import extract\n",
+            "extract",
+        );
+        assert_eq!(imported[0].role, "import");
+        assert_eq!(imported[0].evidence, "syntactic");
+
+        let written = identifier_occurrences(
+            Path::new("module.ts"),
+            "function update() { value = 1; }\n",
+            "value",
+        );
+        assert_eq!(written[0].role, "write");
+        assert_eq!(written[0].enclosing_symbol.as_deref(), Some("update"));
     }
 }

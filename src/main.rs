@@ -15,7 +15,7 @@ use axum::{
     Json,
 };
 use clap::{Parser, Subcommand, ValueEnum};
-use codeweave_rust::{index, model, security, symbols};
+use codeweave_rust::{contracts, index, model, retrieval, security, symbols};
 use manager::{SessionKey, WorkspaceManager};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -398,42 +398,16 @@ async fn prepare(
     // redirect a tool call.
     params.remove("workspace_id");
     params.remove("workspace");
+    // Removed from advertised schemas in contract v2. Continue accepting the
+    // historical field at the compatibility boundary and ignore its value.
+    params.remove("rollback_on_failure");
     if method == "code_preview" {
         params.insert("preview".into(), Value::Bool(true));
     }
     if is_code_mutation(method) {
         normalize_code_mutation(method, &mut params);
     }
-    if matches!(
-        method,
-        "bash" | "bash_status" | "bash_output" | "bash_cancel"
-    ) {
-        let allowed_fields: &[&str] = match method {
-            "bash" => &["command", "cwd", "background", "timeout_ms"],
-            "bash_status" | "bash_cancel" => &["run_id"],
-            "bash_output" => &["run_id", "stream", "continuation"],
-            _ => unreachable!("matched Bash tool"),
-        };
-        if params
-            .keys()
-            .any(|field| !allowed_fields.contains(&field.as_str()))
-        {
-            return Err(model::AppError::invalid(format!(
-                "{method} received an unknown or spoofed field"
-            )));
-        }
-    }
-    if method == "bash" {
-        let has_command = params
-            .get("command")
-            .and_then(Value::as_str)
-            .is_some_and(|command| !command.trim().is_empty());
-        if !has_command {
-            return Err(model::AppError::invalid(
-                "bash requires a non-empty command",
-            ));
-        }
-    }
+
     if let Some(action) = tool_action(method) {
         params.insert("action".into(), Value::String(action.into()));
     }
@@ -701,10 +675,12 @@ async fn doctor_checks(cli: &Cli) -> Vec<Check> {
     }
 
     for (language, default_command) in [
+        ("rust", "rust-analyzer"),
         ("python", "basedpyright-langserver"),
         ("typescript", "typescript-language-server"),
     ] {
         let check_name = match language {
+            "rust" => "intelligence rust",
             "python" => "intelligence python",
             "typescript" => "intelligence typescript",
             _ => unreachable!("fixed language list"),
@@ -1190,6 +1166,7 @@ mod tests {
             assert!(!encoded.contains("\"allOf\""));
             assert!(!encoded.contains("\"not\""));
             assert!(!encoded.contains("\"const\""));
+            assert!(!encoded.contains("rollback_on_failure"));
             assert_eq!(item["execution"]["taskSupport"], "forbidden");
         }
 
@@ -1391,33 +1368,17 @@ mod tests {
                 .unwrap();
             assert!(prepared.get("action").is_none(), "{method}");
         }
-        assert!(prepare(
-            &manager,
-            &config,
-            &full_access(),
-            "bash",
-            json!({"command": "  "})
-        )
-        .await
-        .is_err());
-        assert!(prepare(
-            &manager,
-            &config,
-            &full_access(),
-            "bash",
-            json!({"command": "printf test", "unknown": true})
-        )
-        .await
-        .is_err());
-        assert!(prepare(
-            &manager,
-            &config,
-            &full_access(),
-            "bash_status",
-            json!({"run_id": "run_test", "action": "cancel"})
-        )
-        .await
-        .is_err());
+        for (method, input) in [
+            ("bash", json!({"command": "  "})),
+            ("bash", json!({"command": "printf test", "unknown": true})),
+            (
+                "bash_status",
+                json!({"run_id": "run_test", "action": "cancel"}),
+            ),
+        ] {
+            let error = contracts::normalize_bash_request(method, &input).unwrap_err();
+            assert_eq!(error.0.code, "INVALID_BASH_REQUEST", "{method}");
+        }
         let removed = prepare(
             &manager,
             &config,

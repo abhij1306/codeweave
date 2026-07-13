@@ -145,6 +145,8 @@ fn default_lsp_timeout_ms() -> u64 {
 #[serde(rename_all = "camelCase")]
 pub struct IntelligenceSettings {
     #[serde(default)]
+    pub rust: LanguageServerSettings,
+    #[serde(default)]
     pub python: LanguageServerSettings,
     #[serde(default)]
     pub typescript: LanguageServerSettings,

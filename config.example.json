@@ -36,6 +36,12 @@
     "explicitOnly": true
   },
   "intelligence": {
+    "rust": {
+      "enabled": false,
+      "command": "rust-analyzer",
+      "args": [],
+      "timeoutMs": 10000
+    },
     "python": {
       "enabled": false,
       "command": "basedpyright-langserver",

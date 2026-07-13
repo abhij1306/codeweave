@@ -1,0 +1,150 @@
+{
+  "repo": "crawlerai",
+  "note": "Production code_retrieve operations migrated from the retired CrawlerAI ranker suite. All expected paths were verified against the sibling checkout.",
+  "cases": [
+    {
+      "id": "find-symbol-openrouter-parser",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "parse_openrouter_completion", "max_results": 10},
+      "expected_paths": ["backend/app/ai_visibility/openrouter_parser.py"]
+    },
+    {
+      "id": "find-symbol-sitemap-normalizer",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "_normalize_sitemap_url", "max_results": 10},
+      "expected_paths": ["backend/app/crawl/sitemap_resolver.py"]
+    },
+    {
+      "id": "find-symbol-extraction-request",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "ExtractionRequest", "max_results": 10},
+      "expected_paths": ["backend/app/extraction/contracts.py"]
+    },
+    {
+      "id": "find-symbol-extraction-result",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "ExtractionResult", "max_results": 10},
+      "expected_paths": ["backend/app/extraction/contracts.py"]
+    },
+    {
+      "id": "find-file-backend-pyproject",
+      "category": "find-file",
+      "operation": {"operation": "find_file", "name": "backend/pyproject.toml", "max_results": 10},
+      "expected_paths": ["backend/pyproject.toml"]
+    },
+    {
+      "id": "find-file-semantic-surface",
+      "category": "find-file",
+      "operation": {"operation": "find_file", "name": "extraction_semantic_surface.toml", "max_results": 10},
+      "expected_paths": ["backend/app/core/config/extraction_semantic_surface.toml"]
+    },
+    {
+      "id": "find-file-frontend-package",
+      "category": "find-file",
+      "operation": {"operation": "find_file", "name": "frontend/package.json", "max_results": 10},
+      "expected_paths": ["frontend/package.json"]
+    },
+    {
+      "id": "find-file-openrouter-tests",
+      "category": "find-file",
+      "operation": {"operation": "find_file", "name": "test_openrouter_ai_visibility.py", "max_results": 10},
+      "expected_paths": ["backend/tests/unit/test_openrouter_ai_visibility.py"]
+    },
+    {
+      "id": "find-file-extraction-architecture-tests",
+      "category": "find-file",
+      "operation": {"operation": "find_file", "name": "test_extraction_architecture.py", "max_results": 10},
+      "expected_paths": ["backend/tests/unit/test_extraction_architecture.py"]
+    },
+    {
+      "id": "find-file-run-polling",
+      "category": "find-file",
+      "operation": {"operation": "find_file", "name": "use-run-polling.ts", "max_results": 10},
+      "expected_paths": ["frontend/components/crawl/use-run-polling.ts"]
+    },
+    {
+      "id": "find-symbol-planned-http-chain",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "run_planned_http_chain", "max_results": 10},
+      "expected_paths": ["backend/app/acquisition/fetch/planned_http.py"]
+    },
+    {
+      "id": "find-symbol-browser-policy",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "attach_browser_attempt_diagnostics", "max_results": 10},
+      "expected_paths": ["backend/app/acquisition/fetch/browser_policy.py"]
+    },
+    {
+      "id": "find-symbol-extraction-engine",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "extract", "paths": ["backend/app/extraction/engine.py"], "max_results": 10},
+      "expected_paths": ["backend/app/extraction/engine.py"]
+    },
+    {
+      "id": "find-symbol-memory-profile",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "save_extraction_profile", "max_results": 10},
+      "expected_paths": ["backend/app/persistence/extraction_memory.py"]
+    },
+    {
+      "id": "find-symbol-domain-profile",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "load_domain_run_profile", "max_results": 10},
+      "expected_paths": ["backend/app/crawl/profile/repository.py"]
+    },
+    {
+      "id": "find-symbol-acquisition-contract",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "apply_acquisition_contract_to_profile", "max_results": 10},
+      "expected_paths": ["backend/app/crawl/profile/acquisition_contract.py"]
+    },
+    {
+      "id": "find-symbol-record-stage",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "extract_records_for_acquisition_result", "max_results": 10},
+      "expected_paths": ["backend/app/crawl/pipeline/record_extraction_stage.py"]
+    },
+    {
+      "id": "find-symbol-retry-stage",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "retry_extraction_request_with_browser", "max_results": 10},
+      "expected_paths": ["backend/app/crawl/pipeline/retry/stage.py"]
+    },
+    {
+      "id": "find-symbol-mcp-product-tool",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "extract_product", "max_results": 10},
+      "expected_paths": ["backend/app/mcp_server/tools.py"]
+    },
+    {
+      "id": "literal-browser-runtime-error",
+      "category": "runtime-error",
+      "operation": {"operation": "search_text", "pattern": "Browser runtime failed to initialize", "max_results": 10},
+      "expected_paths": ["backend/app/acquisition/browser_pool.py"]
+    },
+    {
+      "id": "literal-evidence-identity-error",
+      "category": "runtime-error",
+      "operation": {"operation": "search_text", "pattern": "representation canonicalization changed evidence identity", "max_results": 10},
+      "expected_paths": ["backend/app/extraction/adapters.py"]
+    },
+    {
+      "id": "find-symbol-eval-runner",
+      "category": "find-symbol",
+      "operation": {"operation": "find_symbol", "symbol": "run_v3_engine", "max_results": 10},
+      "expected_paths": ["backend/eval/run.py"]
+    },
+    {
+      "id": "symbols-overview-extraction-engine",
+      "category": "symbols-overview",
+      "operation": {"operation": "symbols_overview", "paths": ["backend/app/extraction/engine.py"], "max_results": 100},
+      "expected_paths": ["backend/app/extraction/engine.py"]
+    },
+    {
+      "id": "repo-map-extraction",
+      "category": "repo-map-scope",
+      "operation": {"operation": "repo_map", "path": "backend/app/extraction", "max_results": 100},
+      "expected_paths": []
+    }
+  ]
+}

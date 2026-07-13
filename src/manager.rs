@@ -1,3 +1,4 @@
+use crate::contracts;
 use crate::intelligence::IntelligenceService;
 use crate::model::{required_str, AppError, AppResult, DaemonConfig, WorkspaceConfig};
 use crate::security::{canonical_root, validate_relative};
@@ -255,6 +256,8 @@ impl WorkspaceManager {
                 .await
             }
             "code_intelligence" => {
+                let actor = self.actor()?;
+                actor.summary_ids()?;
                 let service = self.intelligence.read().clone().ok_or_else(|| {
                     AppError::new("NOT_INITIALIZED", "Workspace has not been initialized")
                 })?;
@@ -266,7 +269,6 @@ impl WorkspaceManager {
                     .to_owned();
                 let semantic = run_blocking(move || service.execute(&params)).await?;
                 if operation == "rename_preview" {
-                    let actor = self.actor()?;
                     let changes = semantic
                         .get("changes")
                         .cloned()
@@ -308,49 +310,7 @@ impl WorkspaceManager {
                 run_blocking(move || actor.git(&params)).await
             }
             "bash" | "bash_status" | "bash_output" | "bash_cancel" => {
-                let action = match method {
-                    "bash" => "start",
-                    "bash_status" => "status",
-                    "bash_output" => "output",
-                    "bash_cancel" => "cancel",
-                    _ => unreachable!("matched Bash method"),
-                };
-                let mut prepared = params.clone();
-                let allowed_fields: &[&str] = match method {
-                    "bash" => &["command", "cwd", "background", "timeout_ms"],
-                    "bash_status" | "bash_cancel" => &["run_id"],
-                    "bash_output" => &["run_id", "stream", "continuation"],
-                    _ => unreachable!("matched Bash method"),
-                };
-                let has_disallowed_field = match prepared.as_object() {
-                    Some(object) => object
-                        .keys()
-                        .any(|field| !allowed_fields.contains(&field.as_str())),
-                    None => true,
-                };
-                if has_disallowed_field {
-                    return Err(AppError::invalid(format!(
-                        "{method} received an unknown or spoofed field"
-                    )));
-                }
-                if method == "bash" {
-                    let valid_command = prepared
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(|command| !command.trim().is_empty());
-                    if !valid_command {
-                        return Err(AppError::invalid("bash requires a non-empty command"));
-                    }
-                } else if prepared
-                    .get("run_id")
-                    .and_then(Value::as_str)
-                    .is_none_or(str::is_empty)
-                {
-                    return Err(AppError::invalid(format!(
-                        "{method} requires a non-empty run_id"
-                    )));
-                }
-                prepared["action"] = Value::String(action.to_owned());
+                let prepared = contracts::normalize_bash_request(method, params)?;
                 self.actor()?.run(session.as_str(), &prepared).await
             }
             _ => Err(AppError::details(
@@ -391,6 +351,9 @@ impl WorkspaceManager {
         let intelligence = Arc::new(IntelligenceService::new(
             PathBuf::from(&repo.path),
             config.intelligence.clone(),
+            actor.id.clone(),
+            actor.reference_index(),
+            actor.reference_snapshot(),
         ));
         let open_ms = open_started.elapsed().as_millis();
 
@@ -934,7 +897,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(raw_command.0.code, "INVALID_ARGUMENT");
+        assert_eq!(raw_command.0.code, "INVALID_BASH_REQUEST");
 
         let spoofed_action = manager
             .dispatch(
@@ -944,7 +907,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(spoofed_action.0.code, "INVALID_ARGUMENT");
+        assert_eq!(spoofed_action.0.code, "INVALID_BASH_REQUEST");
 
         let removed = manager
             .dispatch(SessionKey::stdio(), "task_run", &json!({"profile": "test"}))

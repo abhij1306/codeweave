@@ -1,16 +1,8 @@
 use super::util::stale_snapshot;
 use super::*;
-
-const MAX_RETRIEVAL_OPERATIONS: usize = 12;
-const READ_TARGETS: &[&str] = &[
-    "path",
-    "handle",
-    "symbol",
-    "metadata",
-    "bash_status",
-    "bash_log",
-    "continuation",
-];
+use crate::retrieval::{
+    prepare_retrieval_operation, PreparedRetrievalOperation, MAX_RETRIEVAL_OPERATIONS,
+};
 
 impl WorkspaceActor {
     /// Execute explicit repository discovery and read operations in one MCP call.
@@ -149,145 +141,16 @@ impl WorkspaceActor {
         kind: &str,
         operation: &serde_json::Map<String, Value>,
     ) -> AppResult<Value> {
-        match kind {
-            "find_file" => {
-                let name = operation_required_str(operation, "name")?;
-                self.search_index(&search_params(operation, "filename", name))
-            }
-            "find_symbol" => {
-                let symbol = operation_required_str(operation, "symbol")?;
-                self.search_index(&search_params(operation, "symbol", symbol))
-            }
-            "search_text" => {
-                let pattern = operation_required_str(operation, "pattern")?;
-                let syntax = operation
-                    .get("syntax")
-                    .and_then(Value::as_str)
-                    .unwrap_or("literal");
-                if !matches!(syntax, "literal" | "regex") {
-                    return Err(AppError::invalid(
-                        "search_text syntax must be literal or regex",
-                    ));
-                }
-                self.search_index(&search_params(operation, syntax, pattern))
-            }
-            "find_references" => {
-                let symbol = operation_required_str(operation, "symbol")?;
-                self.search_index(&search_params(operation, "references", symbol))
-            }
-            "symbols_overview" => {
-                let paths = operation_paths(operation);
-                if paths.is_empty() {
-                    return Err(AppError::invalid("symbols_overview requires path or paths"));
-                }
-                let mut params = search_params(operation, "outline", "");
-                params["paths"] = json!(paths);
-                self.search_index(&params)
-            }
-            "repo_map" => self.search_index(&search_params(operation, "repo_map", "")),
-            "read" => {
-                let target = operation_required_str(operation, "target")?;
-                if !READ_TARGETS.contains(&target) {
-                    return Err(AppError::details(
-                        "UNSUPPORTED_READ_TARGET",
-                        format!("unsupported read target '{target}'"),
-                        json!({"target": target, "supported": READ_TARGETS}),
-                    ));
-                }
-                let value = operation_required_str(operation, "value")?;
-                let mut item = json!({"kind": target, "value": value});
-                for field in ["path", "start_line", "end_line", "include_imports"] {
-                    copy_field(operation, &mut item, field);
-                }
-                if let Some(value) = operation.get("surrounding_lines") {
-                    item["context_lines"] = value.clone();
-                }
-                let max_chars = operation
-                    .get("max_chars")
-                    .and_then(Value::as_u64)
-                    .map(|value| value as usize)
-                    .unwrap_or(30_000)
-                    .min(200_000);
-                let result = self.read_target(session_id, &item, max_chars)?;
-                if operation.get("response_detail").and_then(Value::as_str) == Some("compact") {
+        match prepare_retrieval_operation(kind, operation)? {
+            PreparedRetrievalOperation::Search(params) => self.search_index(&params),
+            PreparedRetrievalOperation::Read(read) => {
+                let result = self.read_target(session_id, &read.item, read.max_chars)?;
+                if read.compact {
                     Ok(super::fetch::compact_fetch_result(&result))
                 } else {
                     Ok(result)
                 }
             }
-            unsupported => Err(AppError::details(
-                "UNSUPPORTED_RETRIEVAL_OPERATION",
-                format!("unsupported retrieval operation '{unsupported}'"),
-                json!({
-                    "operation": unsupported,
-                    "supported": [
-                        "find_file",
-                        "find_symbol",
-                        "search_text",
-                        "find_references",
-                        "symbols_overview",
-                        "repo_map",
-                        "read"
-                    ]
-                }),
-            )),
         }
-    }
-}
-
-fn operation_required_str<'a>(
-    operation: &'a serde_json::Map<String, Value>,
-    field: &str,
-) -> AppResult<&'a str> {
-    operation
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| AppError::invalid(format!("retrieval operation requires {field}")))
-}
-
-fn operation_paths(operation: &serde_json::Map<String, Value>) -> Vec<String> {
-    let mut paths = operation
-        .get("paths")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if let Some(path) = operation.get("path").and_then(Value::as_str) {
-        if !paths.iter().any(|candidate| candidate == path) {
-            paths.push(path.to_owned());
-        }
-    }
-    paths
-}
-
-fn search_params(operation: &serde_json::Map<String, Value>, mode: &str, selector: &str) -> Value {
-    let mut params = json!({
-        "mode": mode,
-        "query": selector,
-    });
-    let paths = operation_paths(operation);
-    if !paths.is_empty() {
-        params["paths"] = json!(paths);
-    }
-    for field in [
-        "max_results",
-        "context_lines",
-        "case_sensitive",
-        "reference_scope",
-        "reference_kinds",
-        "definition_path",
-        "definition_line",
-    ] {
-        copy_field(operation, &mut params, field);
-    }
-    params
-}
-
-fn copy_field(operation: &serde_json::Map<String, Value>, target: &mut Value, field: &str) {
-    if let Some(value) = operation.get(field) {
-        target[field] = value.clone();
     }
 }

@@ -4,34 +4,6 @@ use regex::Regex;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-pub(super) fn low_signal_context_path(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-    matches!(
-        name.as_str(),
-        "cargo.lock"
-            | "package-lock.json"
-            | "pnpm-lock.yaml"
-            | "yarn.lock"
-            | "license"
-            | "license.md"
-            | "license.txt"
-    )
-}
-
-pub(super) fn evidence_allowed(document_type: &str, evidence: &[String]) -> bool {
-    if evidence.is_empty() {
-        return true;
-    }
-    evidence.iter().any(|item| match item.as_str() {
-        "source" => document_type == "source",
-        "tests" => document_type == "test",
-        "artifacts" => matches!(document_type, "runtime_evidence" | "artifact" | "log"),
-        "changes" => false,
-        "instructions" => document_type == "instruction",
-        _ => false,
-    })
-}
-
 pub(super) fn classify_document(path: &str) -> String {
     let lower = path.to_ascii_lowercase();
     let segments: Vec<&str> = lower.split('/').collect();
@@ -129,44 +101,6 @@ pub(super) fn query_terms(query: &str) -> Vec<String> {
     terms
 }
 
-pub(super) fn compact_reason_codes(mut reasons: Vec<String>) -> Vec<String> {
-    const PRIORITY: &[&str] = &[
-        "exact_symbol",
-        "exact_path_literal",
-        "exact_literal",
-        "exact_phrase",
-        "multi_symbol_match",
-        "full_term_coverage",
-        "filename_affinity",
-        "required_term",
-        "path_match",
-        "runtime_evidence",
-        "dirty_file",
-        "recent_mutation",
-        "symbol_match",
-    ];
-    reasons.sort();
-    reasons.dedup();
-    let mut compact = Vec::new();
-    for preferred in PRIORITY {
-        if reasons.iter().any(|reason| reason == preferred) {
-            compact.push((*preferred).to_owned());
-        }
-        if compact.len() == 3 {
-            return compact;
-        }
-    }
-    for reason in reasons {
-        if !compact.contains(&reason) {
-            compact.push(reason);
-        }
-        if compact.len() == 3 {
-            break;
-        }
-    }
-    compact
-}
-
 pub(super) fn build_indexed_terms(
     search_content: &str,
     path_lower: &str,
@@ -215,11 +149,5 @@ pub(super) fn normalize_entry(entry: &mut FileEntry) {
     if entry.indexed_terms.is_empty() {
         entry.indexed_terms =
             build_indexed_terms(&entry.search_content, &entry.path_lower, &entry.symbols);
-    }
-    if entry.chunks.is_empty() {
-        entry.chunks = super::chunks::build_chunks(&entry.content, &entry.symbols);
-    }
-    if entry.path_tf.is_empty() {
-        entry.path_tf = super::chunks::path_field(&entry.path_lower);
     }
 }

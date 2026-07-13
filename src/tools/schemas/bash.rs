@@ -56,3 +56,31 @@ pub fn bash_cancel() -> Value {
         "$schema": "http://json-schema.org/draft-07/schema#"
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::bash_contract;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn bash_schemas_match_runtime_contract_tables() {
+        for (name, schema) in [
+            ("bash", bash()),
+            ("bash_status", bash_status()),
+            ("bash_output", bash_output()),
+            ("bash_cancel", bash_cancel()),
+        ] {
+            let contract = bash_contract(name).expect("Bash contract");
+            assert_eq!(schema["required"], json!(contract.required));
+            let schema_fields = schema["properties"]
+                .as_object()
+                .expect("properties")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let contract_fields = contract.allowed_fields().collect::<BTreeSet<_>>();
+            assert_eq!(schema_fields, contract_fields, "{name}");
+        }
+    }
+}

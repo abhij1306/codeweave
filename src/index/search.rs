@@ -2,6 +2,7 @@ use super::metadata::query_terms;
 use super::path_filter::PathFilterSet;
 use super::{encode_handle, slice_lines, CodeIndex, FileEntry, RangeHandle};
 use crate::model::{AppError, AppResult};
+use crate::reference_service::{FallbackReferenceRequest, ReferenceService};
 use regex::{Regex, RegexBuilder};
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -49,7 +50,8 @@ impl CodeIndex {
             definition_line,
         } = params;
         let max_results = max_results.max(1);
-        let path_filters = PathFilterSet::new(path_filters);
+        let raw_path_filters = path_filters;
+        let path_filters = PathFilterSet::new(raw_path_filters);
         match mode {
             "literal" => self.search_text(TextSearchParams {
                 workspace_id,
@@ -124,18 +126,18 @@ impl CodeIndex {
                     json!({"mode": mode, "snapshot_id": snapshot_id, "result_count": results.len(), "results": results}),
                 )
             }
-            "references" => self.reference_results(
+            "references" => ReferenceService::new(self).fallback(FallbackReferenceRequest {
                 workspace_id,
                 snapshot_id,
-                query,
-                &path_filters,
+                selector: query,
+                path_filters: raw_path_filters,
                 max_results,
                 context_lines,
                 reference_scope,
                 reference_kinds,
                 definition_path,
                 definition_line,
-            ),
+            }),
             "outline" => {
                 let file = self.get(query).ok_or_else(|| {
                     AppError::details(

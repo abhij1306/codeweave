@@ -1,16 +1,13 @@
-mod chunks;
-mod context;
 mod handle;
 mod lines;
 mod metadata;
 mod path_filter;
-mod references;
 mod scan;
 mod search;
 
-pub use context::{ContextParams, Ranking, SymbolDetail};
 pub use handle::{content_hash, decode_handle, encode_handle, RangeHandle};
 pub use lines::slice_lines;
+pub(crate) use path_filter::PathFilterSet;
 pub use scan::{ignored_workspace_path, WorkspaceExclusions};
 pub use search::SearchParams;
 
@@ -52,37 +49,22 @@ pub struct FileEntry {
     pub size: u64,
     #[serde(default)]
     pub modified_ns: u128,
-    /// Symbol-bounded chunks for BM25F ranking (`v2`). Derived from `content` +
-    /// `symbols`; not persisted — rebuilt by `normalize_entry` on load/insert.
-    #[serde(skip, default)]
-    chunks: Vec<chunks::Chunk>,
-    /// Path field term frequencies, shared by every chunk of this file. Derived
-    /// from `path_lower`; not persisted.
-    #[serde(skip, default)]
-    path_tf: HashMap<String, u32>,
 }
 
+/// Deterministic index-size counters used by the production-path evaluator.
+/// `estimated_heap_bytes_lower_bound` counts owned buffers and indexed values;
+/// allocator and hash-table bucket overhead are intentionally excluded.
 #[derive(Debug, Clone, Serialize)]
-pub struct SearchMatch {
-    pub path: String,
-    pub start_line: usize,
-    pub end_line: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preview: Option<String>,
-    pub document_type: String,
-    pub score: f64,
-    pub group: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub reason_codes: Vec<String>,
-    pub handle: String,
-    /// Chunk provenance (v2 ranking only): `symbol`, `symbol_part`, or
-    /// `remainder`. Absent under v1.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chunk_kind: Option<String>,
-    /// True when the excerpt spans a complete symbol (v2 ranking only). Absent
-    /// under v1.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub complete_symbol: Option<bool>,
+pub struct IndexMetrics {
+    pub indexed_file_count: usize,
+    pub indexed_loc: usize,
+    pub indexed_source_loc: usize,
+    pub indexed_content_bytes: usize,
+    pub estimated_heap_bytes_lower_bound: usize,
+    pub token_count: usize,
+    pub token_posting_count: usize,
+    pub symbol_name_count: usize,
+    pub symbol_declaration_count: usize,
 }
 
 fn default_lifecycle() -> String {

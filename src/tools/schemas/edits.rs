@@ -1,17 +1,19 @@
 //! Input schemas for the edit tools: the narrow single-operation writers plus
 //! the code_preview / code_transaction multi-file engine entry points.
 
+use crate::contracts::change_kind_names;
 use serde_json::{json, Value};
 
-const HANDLE_DESCRIPTION: &str = "Range handle returned by code_retrieve. A handle-based change must be the only change for its file in one transaction; combining it with another change for that file is rejected as ambiguous.";
-const OPTIONAL_HANDLE_DESCRIPTION: &str = "Optional range handle returned by code_retrieve. It scopes the exact-text match to the fetched range. A handle-based change must be the only change for its file in one transaction; combining it with another change for that file is rejected as ambiguous.";
+const HANDLE_DESCRIPTION: &str = "Fresh range handle returned by a code_retrieve read. It binds the workspace, path, line range, and content hash. A handle-based change must be the only change for its file in one transaction; combining it with another change for that file is rejected as ambiguous.";
+const OPTIONAL_HANDLE_DESCRIPTION: &str = "Optional fresh range handle returned by a code_retrieve read. It scopes the exact-text match to the fetched range and binds the workspace, path, and content hash. A handle-based change must be the only change for its file in one transaction; combining it with another change for that file is rejected as ambiguous.";
 const REPLACEMENT_TEXT_DESCRIPTION: &str = "Replacement text. When replacing text that ends with a terminal newline, omitting that newline here preserves it from the selected text or range.";
+const VALIDATION_DESCRIPTION: &str = "Post-apply validation commands. The edit remains applied if a command fails; long-running validation may continue in the background.";
 
-fn rollback_on_failure_schema() -> Value {
+fn validation_schema() -> Value {
     json!({
-        "type": "boolean",
-        "default": false,
-        "description": "Deprecated compatibility field; its value is ignored. Validation failures are reported and edits are never rolled back. Long-running validation may continue in the background."
+        "type": "array",
+        "items": {"type": "string"},
+        "description": VALIDATION_DESCRIPTION
     })
 }
 
@@ -23,8 +25,7 @@ pub fn code_write() -> Value {
             "content": {"type": "string"},
             "overwrite": {"type": "boolean", "default": true},
             "expected_hash": {"type": "string"},
-            "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": rollback_on_failure_schema(),
+            "validate": validation_schema(),
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard"}
         },
         "required": ["path", "content"],
@@ -43,8 +44,7 @@ pub fn code_replace() -> Value {
             "expected_replacements": {"type": "integer", "minimum": 1, "default": 1},
             "expected_hash": {"type": "string"},
             "handle": {"type": "string", "description": OPTIONAL_HANDLE_DESCRIPTION},
-            "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": rollback_on_failure_schema(),
+            "validate": validation_schema(),
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard"}
         },
         "required": ["path", "old_text", "new_text"],
@@ -60,8 +60,7 @@ pub fn code_replace_range() -> Value {
             "path": {"type": "string"},
             "handle": {"type": "string", "description": HANDLE_DESCRIPTION},
             "new_text": {"type": "string", "description": REPLACEMENT_TEXT_DESCRIPTION},
-            "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": rollback_on_failure_schema(),
+            "validate": validation_schema(),
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard"}
         },
         "required": ["path", "handle", "new_text"],
@@ -79,8 +78,7 @@ pub fn code_insert() -> Value {
             "anchor_symbol": {"type": "string"},
             "position": {"type": "string", "enum": ["before", "after", "inside_start", "inside_end"]},
             "expected_hash": {"type": "string"},
-            "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": rollback_on_failure_schema(),
+            "validate": validation_schema(),
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard"}
         },
         "required": ["path", "content", "anchor_symbol", "position"],
@@ -95,8 +93,7 @@ pub fn code_delete() -> Value {
         "properties": {
             "path": {"type": "string"},
             "expected_hash": {"type": "string"},
-            "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": rollback_on_failure_schema(),
+            "validate": validation_schema(),
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard"}
         },
         "required": ["path"],
@@ -112,8 +109,7 @@ pub fn code_rename() -> Value {
             "path": {"type": "string"},
             "to": {"type": "string"},
             "expected_hash": {"type": "string"},
-            "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": rollback_on_failure_schema(),
+            "validate": validation_schema(),
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard"}
         },
         "required": ["path", "to"],
@@ -141,8 +137,7 @@ pub fn code_transaction() -> Value {
         "properties": {
             "changes": {"type": "array", "items": change_schema()},
             "snapshot_id": {"type": "string"},
-            "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": rollback_on_failure_schema(),
+            "validate": validation_schema(),
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard", "description": "compact omits the unified diff and returns diff_stat only; standard caps the diff to bound payload size; debug returns the full diff."}
         },
         "required": ["changes"],
@@ -158,7 +153,7 @@ fn change_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "kind": {"type": "string", "enum": ["create", "replace", "replace_range", "insert", "delete", "rename"], "description": "Required operation kind."},
+            "kind": {"type": "string", "enum": change_kind_names(), "description": "Required operation kind."},
             "path": {"type": "string"},
             "to": {"type": "string"},
             "content": {"type": "string"},
@@ -181,12 +176,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn edit_schemas_share_the_non_destructive_validation_contract() {
-        let expected = rollback_on_failure_schema();
-        assert_eq!(expected["default"], false);
-        let description = expected["description"].as_str().unwrap();
-        assert!(description.contains("Deprecated compatibility field"));
-        assert!(description.contains("never rolled back"));
+    fn edit_schemas_advertise_post_apply_validation_without_rollback_field() {
         for schema in [
             code_write(),
             code_replace(),
@@ -196,7 +186,13 @@ mod tests {
             code_rename(),
             code_transaction(),
         ] {
-            assert_eq!(schema["properties"]["rollback_on_failure"], expected);
+            let properties = schema["properties"].as_object().expect("properties");
+            assert!(!properties.contains_key("rollback_on_failure"));
+            let description = properties["validate"]["description"]
+                .as_str()
+                .expect("validation description");
+            assert!(description.contains("Post-apply validation"));
+            assert!(description.contains("remains applied"));
         }
     }
 

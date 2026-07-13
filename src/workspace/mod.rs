@@ -14,12 +14,13 @@ use journal::{load_journal, open_journal, rotate_journal_if_needed};
 use util::{summarize_changed_paths, ChangedPathSummary};
 
 use crate::bash::{BashSupervisor, StartRequest};
-use crate::index::{content_hash, CodeIndex, SearchParams, WorkspaceExclusions};
+use crate::contracts;
+use crate::index::{content_hash, CodeIndex, WorkspaceExclusions};
 use crate::model::{
-    bool_value, required_str, string_list, usize_value, AppError, AppResult, PolicyConfig,
-    WorkspaceConfig,
+    bool_value, required_str, usize_value, AppError, AppResult, PolicyConfig, WorkspaceConfig,
 };
 use crate::repository::{CliGitBackend, RepoStatus, RepositoryBackend};
+use crate::retrieval::{execute_index_search, PROTOCOL_MAX_RESULTS};
 use crate::security::{canonical_root, relative_string};
 use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -40,51 +41,6 @@ const POLL_RECONCILE_DEBOUNCE: Duration = Duration::from_secs(2);
 /// Maximum bytes of an instruction file (AGENTS.md/CLAUDE.md) inlined into a summary
 /// response before it is truncated and the caller is pointed at a code_retrieve read.
 const INSTRUCTION_INLINE_CAP: usize = 4_096;
-const PROTOCOL_MAX_RESULTS: usize = 200;
-
-fn result_limit(
-    params: &Value,
-    default: usize,
-    configured_max: usize,
-) -> (usize, usize, Vec<Value>) {
-    let requested = usize_value(params, "max_results", default);
-    let applied = requested.min(PROTOCOL_MAX_RESULTS).min(configured_max);
-    let mut warnings = Vec::new();
-    if requested > applied {
-        let limit_message = if configured_max < PROTOCOL_MAX_RESULTS {
-            format!("Requested {requested} results; the effective configured maximum is {configured_max}.")
-        } else {
-            format!("Requested {requested} results; protocol maximum is {PROTOCOL_MAX_RESULTS}.")
-        };
-        warnings.push(json!({"code": "MAX_RESULTS_CLAMPED", "message": limit_message}));
-    }
-    (requested, applied, warnings)
-}
-
-fn add_result_limits(
-    result: &mut Value,
-    requested: usize,
-    applied: usize,
-    configured_max: usize,
-    configured_default: usize,
-    warnings: Vec<Value>,
-) {
-    if let Some(object) = result.as_object_mut() {
-        object.insert(
-            "limits".to_owned(),
-            json!({
-                "requested_results": requested,
-                "protocol_max_results": PROTOCOL_MAX_RESULTS,
-                "configured_max_results": configured_max,
-                "applied_results": applied,
-                "configured_default_results": configured_default,
-            }),
-        );
-        if !warnings.is_empty() {
-            object.insert("warnings".to_owned(), Value::Array(warnings));
-        }
-    }
-}
 
 pub struct WorkspaceActor {
     // Lock ordering for code that needs more than one guard:
@@ -97,9 +53,9 @@ pub struct WorkspaceActor {
     policy: PolicyConfig,
     artifact_paths: Vec<String>,
     exclusions: WorkspaceExclusions,
-    index: RwLock<CodeIndex>,
+    index: Arc<RwLock<CodeIndex>>,
     generation: Arc<AtomicU64>,
-    snapshot_id: RwLock<String>,
+    snapshot_id: Arc<RwLock<String>>,
     repository: Arc<dyn RepositoryBackend>,
     repo_status: RwLock<RepoStatus>,
     /// Set when a `git status` refresh failed and the cached `repo_status` may be
@@ -300,9 +256,9 @@ impl WorkspaceActor {
             policy,
             artifact_paths: config.artifact_paths.clone(),
             exclusions,
-            index: RwLock::new(index),
+            index: Arc::new(RwLock::new(index)),
             generation,
-            snapshot_id: RwLock::new(snapshot_id),
+            snapshot_id: Arc::new(RwLock::new(snapshot_id)),
             repository,
             repo_status: RwLock::new(repo_status),
             repo_status_stale: AtomicBool::new(false),
@@ -360,6 +316,14 @@ impl WorkspaceActor {
     }
     pub fn snapshot(&self) -> String {
         self.snapshot_id.read().clone()
+    }
+
+    pub(crate) fn reference_index(&self) -> Arc<RwLock<CodeIndex>> {
+        Arc::clone(&self.index)
+    }
+
+    pub(crate) fn reference_snapshot(&self) -> Arc<RwLock<String>> {
+        Arc::clone(&self.snapshot_id)
     }
 
     fn reconcile_pending(&self) -> AppResult<Vec<String>> {
@@ -562,61 +526,30 @@ impl WorkspaceActor {
     pub fn code_capabilities(&self) -> AppResult<Value> {
         let bash = self.bash.readiness();
         let bash_available = bash.is_ready();
-        Ok(json!({
+        let generation = self.generation();
+        let snapshot_id = self.snapshot();
+        let mut result = contracts::public_contract_capabilities();
+        result["workspace_id"] = Value::String(self.id.clone());
+        result["root"] = Value::String(self.root.to_string_lossy().into_owned());
+        result["generation"] = json!(generation);
+        result["snapshot_id"] = Value::String(snapshot_id.clone());
+        result["editing"]["supports_bash_validation_commands"] = Value::Bool(bash_available);
+        result["execution"] = json!({"bash": bash});
+        result["dynamic"] = json!({
             "workspace_id": self.id,
-            "root": self.root,
-            "generation": self.generation(),
-            "snapshot_id": self.snapshot(),
-            "retrieval": {
-                "tool": "code_retrieve",
-                "max_operations": 12,
-                "operations": ["find_file", "find_symbol", "search_text", "find_references", "symbols_overview", "repo_map", "read"],
-                "read_targets": ["path", "handle", "symbol", "metadata", "bash_status", "bash_log", "continuation"],
-                "text_syntax": ["literal", "regex"],
-                "reference_scopes": ["all", "production", "tests"],
-                "reference_kinds": ["declaration", "call", "import", "type", "read", "write", "other"],
-                "supports_qualified_symbols": true,
-                "ambiguous_symbols_return_candidates": true,
-                "supports_snapshot_precondition": true,
-                "malformed_operations_return_item_errors": true
-            },
-            "editing": {
-                "supports_preview": true,
-                "supports_transaction": true,
-                "supports_single_file_wrappers": true,
-                "supports_handle_range_replace": true,
-                "handle_edits_must_be_only_change_for_file": true,
-                "full_line_replacements_preserve_terminal_line_ending": true,
-                "supports_bash_validation_commands": bash_available,
-                "supports_rollback_on_failure": false,
-                "validation_failures_preserve_edits": true,
-                "validation_may_run_detached": true
-            },
-            "change_contracts": {
-                "create": {"required": ["kind", "path", "content"], "optional": ["overwrite", "expected_hash"]},
-                "replace": {"required": ["kind", "path", "old_text", "new_text"], "optional": ["expected_replacements", "expected_hash", "handle"]},
-                "replace_range": {"required": ["kind", "path", "handle", "new_text"], "optional": []},
-                "insert": {"required": ["kind", "path", "content", "anchor_symbol", "position"], "optional": ["expected_hash"]},
-                "delete": {"required": ["kind", "path"], "optional": ["expected_hash"]},
-                "rename": {"required": ["kind", "path", "to"], "optional": ["expected_hash"]}
-            },
-            "execution": {
-                "bash": bash
-            },
-            "limits": {
-                "max_file_bytes": self.policy.max_file_bytes,
-                "max_context_chars": self.policy.max_context_chars,
-                "max_search_results": self.policy.max_search_results,
-                "protocol_max_search_results": PROTOCOL_MAX_RESULTS,
-                "max_bash_output_chars": self.policy.bash.max_output_chars,
-                "max_bash_timeout_ms": self.policy.bash.max_timeout_ms
-            },
-            "known_limitations": [
-                "find_references uses indexed lexical or syntactic evidence; use code_intelligence when semantic resolution is required",
-                "include_imports returns lexical import prelude only, not inferred dependency usage",
-                "hosted connector lazy-loading behavior is outside the server-side MCP list_tools contract"
-            ]
-        }))
+            "generation": generation,
+            "snapshot_id": snapshot_id,
+            "bash": self.bash.readiness()
+        });
+        result["limits"] = json!({
+            "max_file_bytes": self.policy.max_file_bytes,
+            "max_context_chars": self.policy.max_context_chars,
+            "max_search_results": self.policy.max_search_results,
+            "protocol_max_search_results": PROTOCOL_MAX_RESULTS,
+            "max_bash_output_chars": self.policy.bash.max_output_chars,
+            "max_bash_timeout_ms": self.policy.bash.max_timeout_ms
+        });
+        Ok(result)
     }
     pub fn summary(&self, session_id: &str, stateless_session: bool) -> AppResult<Value> {
         let started = Instant::now();
@@ -784,208 +717,17 @@ impl WorkspaceActor {
     }
 
     pub(super) fn search_index(&self, params: &Value) -> AppResult<Value> {
-        let started = Instant::now();
         let reconcile_pending = self.read_reconcile_pending();
-        let mode = params
-            .get("mode")
-            .and_then(Value::as_str)
-            .unwrap_or("literal");
-        let queries = if let Some(values) = params.get("queries").and_then(Value::as_array) {
-            values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .ok_or_else(|| AppError::invalid("queries must contain strings"))
-                })
-                .collect::<AppResult<Vec<_>>>()?
-        } else {
-            vec![params
-                .get("query")
-                .and_then(Value::as_str)
-                .unwrap_or_default()]
-        };
-        if queries.is_empty() {
-            return Err(AppError::invalid("queries cannot be empty"));
-        }
-        let paths = string_list(params, "paths");
-        let reference_scope = params
-            .get("reference_scope")
-            .and_then(Value::as_str)
-            .unwrap_or("all");
-        if !matches!(reference_scope, "all" | "production" | "tests") {
-            return Err(AppError::invalid(
-                "reference_scope must be all, production, or tests",
-            ));
-        }
-        let reference_kinds = string_list(params, "reference_kinds");
-        if reference_kinds.iter().any(|kind| {
-            !matches!(
-                kind.as_str(),
-                "declaration" | "call" | "import" | "type" | "read" | "write" | "other"
-            )
-        }) {
-            return Err(AppError::invalid(
-                "reference_kinds contains an unsupported kind",
-            ));
-        }
-        let definition_path = params.get("definition_path").and_then(Value::as_str);
-        let definition_line = params
-            .get("definition_line")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize);
-        let (requested_results, applied_results, limit_warnings) =
-            result_limit(params, 20, self.policy.max_search_results);
         let snapshot = self.snapshot();
         let index = self.index.read();
-        if mode == "outline" && queries.len() == 1 && queries[0].is_empty() && paths.len() > 1 {
-            let search_started = Instant::now();
-            let mut results = Vec::new();
-            let mut errors = Vec::new();
-            for (index_number, path) in paths.iter().enumerate() {
-                match index.search(SearchParams {
-                    workspace_id: &self.id,
-                    snapshot_id: &snapshot,
-                    mode,
-                    query: path,
-                    path_filters: &[],
-                    case_sensitive: bool_value(params, "case_sensitive", false),
-                    max_results: applied_results,
-                    context_lines: usize_value(params, "context_lines", 2).min(20),
-                    reference_scope,
-                    reference_kinds: &reference_kinds,
-                    definition_path,
-                    definition_line,
-                }) {
-                    Ok(result) => results.push(result),
-                    Err(error) => errors.push(json!({
-                        "index": index_number,
-                        "path": path,
-                        "error": error.0
-                    })),
-                }
-            }
-            let mut result = json!({
-                "mode": mode,
-                "snapshot_id": snapshot,
-                "result_count": results.len(),
-                "error_count": errors.len(),
-                "partial_success": !results.is_empty() && !errors.is_empty(),
-                "results": results,
-                "errors": errors,
-            });
-            add_reconcile_pending(&mut result, reconcile_pending);
-            add_result_limits(
-                &mut result,
-                requested_results,
-                applied_results,
-                self.policy.max_search_results,
-                20,
-                limit_warnings,
-            );
-            add_phase_metrics(
-                &mut result,
-                &[
-                    ("index_search", search_started.elapsed().as_millis()),
-                    ("total_local", started.elapsed().as_millis()),
-                ],
-            );
-            return Ok(result);
-        }
-        let run_search = |query: &str| {
-            let effective_query = if mode == "outline" && query.is_empty() {
-                if paths.len() == 1 {
-                    paths[0].as_str()
-                } else {
-                    return Err(AppError::details(
-                        "INVALID_OUTLINE_PATH",
-                        "Outline requires a file path in query or exactly one paths entry",
-                        json!({
-                            "paths_count": paths.len(),
-                            "retryable": true,
-                            "retry_kind": "retry_with_changes",
-                            "suggested_calls": paths.iter().map(|path| json!({
-                                "mode": "outline",
-                                "paths": [path]
-                            })).collect::<Vec<_>>()
-                        }),
-                    ));
-                }
-            } else {
-                query
-            };
-            index.search(SearchParams {
-                workspace_id: &self.id,
-                snapshot_id: &snapshot,
-                mode,
-                query: effective_query,
-                path_filters: &paths,
-                case_sensitive: bool_value(params, "case_sensitive", false),
-                max_results: applied_results,
-                context_lines: usize_value(params, "context_lines", 2).min(20),
-                reference_scope,
-                reference_kinds: &reference_kinds,
-                definition_path,
-                definition_line,
-            })
-        };
-        if queries.len() == 1 {
-            let search_started = Instant::now();
-            let mut result = run_search(queries[0])?;
-            add_reconcile_pending(&mut result, reconcile_pending);
-            add_result_limits(
-                &mut result,
-                requested_results,
-                applied_results,
-                self.policy.max_search_results,
-                20,
-                limit_warnings,
-            );
-            add_phase_metrics(
-                &mut result,
-                &[
-                    ("index_search", search_started.elapsed().as_millis()),
-                    ("total_local", started.elapsed().as_millis()),
-                ],
-            );
-            return Ok(result);
-        }
-        let mut results = Vec::new();
-        let mut errors = Vec::new();
-        let search_started = Instant::now();
-        for query in &queries {
-            match run_search(query) {
-                Ok(result) => results.push(json!({"query": query, "result": result})),
-                Err(error) => errors.push(json!({"query": query, "error": error.0})),
-            }
-        }
-        let mut result = json!({
-            "mode": mode,
-            "snapshot_id": snapshot,
-            "query_count": queries.len(),
-            "result_count": results.len(),
-            "error_count": errors.len(),
-            "partial_success": !results.is_empty() && !errors.is_empty(),
-            "results": results,
-            "errors": errors,
-        });
-        add_reconcile_pending(&mut result, reconcile_pending);
-        add_result_limits(
-            &mut result,
-            requested_results,
-            applied_results,
+        execute_index_search(
+            &index,
+            &self.id,
+            &snapshot,
+            params,
             self.policy.max_search_results,
-            20,
-            limit_warnings,
-        );
-        add_phase_metrics(
-            &mut result,
-            &[
-                ("index_search", search_started.elapsed().as_millis()),
-                ("total_local", started.elapsed().as_millis()),
-            ],
-        );
-        Ok(result)
+            reconcile_pending,
+        )
     }
 
     pub fn changes(&self, session_id: &str, params: &Value) -> AppResult<Value> {
@@ -1318,6 +1060,7 @@ fn run_result_ended_at(result: &Value) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
+#[allow(dead_code)]
 pub(super) fn add_reconcile_pending(value: &mut Value, pending: bool) {
     if let Some(object) = value.as_object_mut() {
         object.insert("reconcile_pending".to_owned(), json!(pending));
