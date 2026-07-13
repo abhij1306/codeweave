@@ -5,6 +5,7 @@ mod io_helpers;
 mod journal;
 mod retrieve;
 mod util;
+mod validation;
 
 #[cfg(test)]
 use git::validated_push_target;

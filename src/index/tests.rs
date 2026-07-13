@@ -767,6 +767,30 @@ fn configured_exclusions_resolve_noncanonical_absolute_paths() {
 }
 
 #[test]
+fn artifact_scan_canonicalizes_workspace_root_for_containment() {
+    let workspace = tempfile::tempdir().unwrap();
+    fs::create_dir_all(workspace.path().join("nested")).unwrap();
+    fs::create_dir_all(workspace.path().join("artifacts")).unwrap();
+    fs::write(
+        workspace.path().join("artifacts/inside.rs"),
+        "fn inside() {}\n",
+    )
+    .unwrap();
+    let noncanonical_root = workspace.path().join("nested").join("..");
+    let exclusions = WorkspaceExclusions::new(&noncanonical_root, &[]).unwrap();
+
+    let index = CodeIndex::scan(
+        &noncanonical_root,
+        2_000_000,
+        &["artifacts".to_owned()],
+        &exclusions,
+    )
+    .unwrap();
+
+    assert!(index.get("artifacts/inside.rs").is_some());
+}
+
+#[test]
 fn changing_exclusions_invalidates_the_index_cache() {
     let workspace = tempfile::tempdir().unwrap();
     let cache_dir = tempfile::tempdir().unwrap();

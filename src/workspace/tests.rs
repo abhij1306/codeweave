@@ -160,6 +160,54 @@ fn git_diff_continuation_preserves_the_original_scope() {
 }
 
 #[test]
+fn git_diff_pagination_advances_past_oversized_hunks() {
+    let root = tempdir().unwrap();
+    run_git(root.path(), &["init", "-q"]);
+    run_git(
+        root.path(),
+        &["config", "user.email", "codeweave@example.test"],
+    );
+    run_git(root.path(), &["config", "user.name", "CodeWeave Test"]);
+
+    let base = (0..40)
+        .map(|index| format!("line-{index:02}"))
+        .collect::<Vec<_>>();
+    fs::write(
+        root.path().join("large.rs"),
+        format!("{}\n", base.join("\n")),
+    )
+    .unwrap();
+    run_git(root.path(), &["add", "large.rs"]);
+    run_git(root.path(), &["commit", "-q", "-m", "baseline"]);
+
+    let mut changed = base;
+    changed[1] = format!("oversized-{}", "x".repeat(4_000));
+    changed[35] = "later-change".to_owned();
+    fs::write(
+        root.path().join("large.rs"),
+        format!("{}\n", changed.join("\n")),
+    )
+    .unwrap();
+
+    let actor = test_actor(root.path());
+    let first = actor
+        .git(&json!({"action": "diff", "paths": ["large.rs"], "max_chars": 100}))
+        .unwrap();
+    assert_eq!(first["hunks"].as_array().unwrap().len(), 1);
+    assert!(first["output"].as_str().unwrap().len() > 100);
+    let first_id = first["hunks"][0]["id"].as_str().unwrap();
+    let continuation = first["continuation"].as_str().unwrap();
+
+    let second = actor
+        .git(&json!({"action": "diff", "continuation": continuation, "max_chars": 100}))
+        .unwrap();
+    assert_eq!(second["hunks"].as_array().unwrap().len(), 1);
+    assert_ne!(second["hunks"][0]["id"].as_str().unwrap(), first_id);
+    assert!(second["output"].as_str().unwrap().contains("later-change"));
+    assert!(second["continuation"].is_null());
+}
+
+#[test]
 fn push_target_defaults_to_current_branch_and_rejects_git_syntax() {
     assert_eq!(
         validated_push_target(&json!({}), "feature/current").unwrap(),
@@ -1500,11 +1548,11 @@ fn dirty_ownership_tracks_only_current_dirty_mcp_paths() {
 }
 
 #[tokio::test]
-async fn slow_bash_validation_detaches_and_reports_pending() {
+async fn slow_bash_validation_queues_remaining_commands() {
     let root = tempdir().unwrap();
     let original = "fn value() -> i32 { 1 }\n";
     fs::write(root.path().join("value.rs"), original).unwrap();
-    let actor = test_actor_with_budget(root.path(), 200);
+    let actor = test_actor_with_budget(root.path(), 50);
     let result = actor
         .code_edit(
             "test-session",
@@ -1516,7 +1564,10 @@ async fn slow_bash_validation_detaches_and_reports_pending() {
                     "new_text": "{ 2 }",
                     "expected_hash": content_hash(original)
                 }],
-                "validate": ["echo checking; sleep 30", "echo later"],
+                "validate": [
+                    "echo checking; sleep 1",
+                    "printf later > validation-later.txt"
+                ],
                 "rollback_on_failure": false
             }),
         )
@@ -1524,20 +1575,138 @@ async fn slow_bash_validation_detaches_and_reports_pending() {
         .unwrap();
     assert_eq!(result["applied"], true);
     assert_eq!(result["validation_pending"], true);
-    assert!(result["validation_run_id"].is_string());
     assert_eq!(result["validation"].as_array().unwrap().len(), 2);
-    assert_eq!(result["validation"][1]["command"], "echo later");
+    assert_eq!(
+        result["validation"][1]["command"],
+        "printf later > validation-later.txt"
+    );
     assert_eq!(
         result["validation"][1]["result"]["reason"],
         "blocked_by_pending_validation"
     );
-    // Edit stays applied; validation could not drive a synchronous rollback.
     assert_eq!(
         fs::read_to_string(root.path().join("value.rs")).unwrap(),
         "fn value() -> i32 { 2 }\n"
     );
-    let run_id = result["validation_run_id"].as_str().unwrap();
-    let _ = actor.bash.cancel_for_session("test-session", run_id);
+
+    let leading_run_id = result["validation_run_id"].as_str().unwrap();
+    let deferred_run_id = result["deferred_validation_run_id"].as_str().unwrap();
+    assert_ne!(leading_run_id, deferred_run_id);
+    assert_eq!(result["validation"][0]["result"]["run_id"], leading_run_id);
+    assert_eq!(result["validation"][1]["result"]["run_id"], deferred_run_id);
+    assert_eq!(
+        result["validation_run_ids"],
+        json!([leading_run_id, deferred_run_id])
+    );
+
+    let mut leading = actor
+        .bash
+        .status_for_session("test-session", leading_run_id)
+        .unwrap();
+    for _ in 0..200 {
+        if leading["ended_at"].is_string() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        leading = actor
+            .bash
+            .status_for_session("test-session", leading_run_id)
+            .unwrap();
+    }
+    assert_eq!(leading["status"], "succeeded");
+
+    let mut deferred = actor
+        .bash
+        .status_for_session("test-session", deferred_run_id)
+        .unwrap();
+    for _ in 0..200 {
+        if deferred["ended_at"].is_string() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        deferred = actor
+            .bash
+            .status_for_session("test-session", deferred_run_id)
+            .unwrap();
+    }
+    assert_eq!(deferred["status"], "succeeded");
+    assert_eq!(
+        fs::read_to_string(root.path().join("validation-later.txt")).unwrap(),
+        "later"
+    );
+}
+
+#[tokio::test]
+async fn detached_validation_keeps_leading_failure_as_primary_run() {
+    let root = tempdir().unwrap();
+    let original = "fn value() -> i32 { 1 }\n";
+    fs::write(root.path().join("value.rs"), original).unwrap();
+    let actor = test_actor_with_budget(root.path(), 20);
+    let result = actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [{
+                    "kind": "replace",
+                    "path": "value.rs",
+                    "old_text": "{ 1 }",
+                    "new_text": "{ 2 }",
+                    "expected_hash": content_hash(original)
+                }],
+                "validate": [
+                    "sleep 0.2; exit 7",
+                    "printf later > validation-after-failure.txt"
+                ],
+                "rollback_on_failure": false
+            }),
+        )
+        .await
+        .unwrap();
+
+    let leading_run_id = result["validation_run_id"].as_str().unwrap();
+    let deferred_run_id = result["deferred_validation_run_id"].as_str().unwrap();
+    assert_eq!(result["validation"][0]["result"]["run_id"], leading_run_id);
+    assert_eq!(result["validation"][1]["result"]["run_id"], deferred_run_id);
+    assert!(result["guidance"]
+        .as_str()
+        .unwrap()
+        .contains("every ID in validation_run_ids"));
+
+    let mut leading = actor
+        .bash
+        .status_for_session("test-session", leading_run_id)
+        .unwrap();
+    for _ in 0..100 {
+        if leading["ended_at"].is_string() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        leading = actor
+            .bash
+            .status_for_session("test-session", leading_run_id)
+            .unwrap();
+    }
+    assert_eq!(leading["status"], "failed");
+
+    let mut deferred = actor
+        .bash
+        .status_for_session("test-session", deferred_run_id)
+        .unwrap();
+    for _ in 0..100 {
+        if deferred["ended_at"].is_string() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        deferred = actor
+            .bash
+            .status_for_session("test-session", deferred_run_id)
+            .unwrap();
+    }
+    assert_eq!(deferred["status"], "succeeded");
+    assert_eq!(
+        fs::read_to_string(root.path().join("validation-after-failure.txt")).unwrap(),
+        "later"
+    );
 }
 
 #[test]

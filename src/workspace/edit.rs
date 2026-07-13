@@ -8,8 +8,8 @@ use super::util::{
     changes_without_independent_preconditions, line_offset, line_range_bytes,
     normalize_line_endings_for_content, stale_snapshot_for_paths,
 };
+use super::validation::ValidationOutcome;
 use super::WorkspaceActor;
-use crate::bash::StartRequest;
 use crate::index::{content_hash, decode_handle, CodeIndex};
 use crate::model::{bool_value, required_str, string_list, usize_value, AppError, AppResult};
 use crate::security::validate_relative;
@@ -158,132 +158,15 @@ impl WorkspaceActor {
             omitted: diff_omitted,
         } = diff_view;
 
-        // Validation stays inside the write transaction when rollback was requested.
-        // If the foreground budget is exhausted, a rollback-protected edit is
-        // reverted instead of being left applied without a validation result.
-        // Callers that explicitly disable rollback may opt into detached validation.
-        let budget_ms = self.policy.bash.foreground_budget_ms;
-        let validation_started = Instant::now();
-        let mut validation = Vec::new();
-        let mut validation_failed = false;
-        let mut validation_pending: Option<String> = None;
-        let mut validation_cancellation_error: Option<Value> = None;
-        let mut remaining = validate.iter().peekable();
-        while let Some(command) = remaining.next() {
-            let over_budget =
-                budget_ms != 0 && validation_started.elapsed().as_millis() as u64 >= budget_ms;
-            if over_budget {
-                let mut deferred = vec![command.clone()];
-                deferred.extend(remaining.map(String::clone));
-                if rollback_on_failure {
-                    validation_failed = true;
-                    validation.extend(deferred.into_iter().map(|command| {
-                        json!({
-                            "command": command,
-                            "result": {
-                                "status": "not_run",
-                                "reason": "rollback_requires_synchronous_validation"
-                            }
-                        })
-                    }));
-                } else {
-                    match self
-                        .spawn_pending_validation(session_id, &deferred, &mut validation)
-                        .await
-                    {
-                        Some(run_id) => validation_pending = Some(run_id),
-                        None => validation_failed = true,
-                    }
-                }
-                break;
-            }
-            match self
-                .bash
-                .start_for_session(
-                    &self.root,
-                    session_id,
-                    StartRequest {
-                        command: command.clone(),
-                        cwd: None,
-                        background: Some(false),
-                        timeout_ms: None,
-                    },
-                )
-                .await
-            {
-                Ok(result) => match result.get("status").and_then(Value::as_str) {
-                    Some("succeeded") => {
-                        validation.push(json!({"command": command, "result": result}));
-                    }
-                    Some("running") => {
-                        let run_id = result
-                            .get("run_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        validation.push(json!({"command": command, "result": result}));
-                        if rollback_on_failure {
-                            validation_failed = true;
-                            if let Some(run_id) = run_id {
-                                match self
-                                    .bash
-                                    .cancel_and_wait_for_session(
-                                        session_id,
-                                        &run_id,
-                                        tokio::time::Duration::from_secs(5),
-                                    )
-                                    .await
-                                {
-                                    Ok(cancellation) => validation.push(json!({
-                                        "run_id": run_id,
-                                        "cancellation": cancellation,
-                                        "reason": "rollback_requires_synchronous_validation"
-                                    })),
-                                    Err(error) => {
-                                        let error = json!(error.0);
-                                        validation.push(json!({
-                                            "run_id": run_id,
-                                            "error": error,
-                                            "reason": "validation_cancellation_unconfirmed"
-                                        }));
-                                        validation_cancellation_error = Some(error);
-                                    }
-                                }
-                            }
-                        } else if let Some(run_id) = run_id {
-                            validation_pending = Some(run_id.clone());
-                            for deferred in remaining {
-                                validation.push(json!({
-                                    "command": deferred,
-                                    "deferred": true,
-                                    "result": {
-                                        "status": "pending",
-                                        "reason": "blocked_by_pending_validation",
-                                        "run_id": run_id
-                                    }
-                                }));
-                            }
-                        } else {
-                            validation_failed = true;
-                        }
-                        break;
-                    }
-                    _ => {
-                        validation_failed = true;
-                        validation.push(json!({"command": command, "result": result}));
-                    }
-                },
-                Err(error) => {
-                    validation_failed = true;
-                    validation.push(json!({
-                        "command": command,
-                        "error": error.0,
-                    }));
-                }
-            }
-            if validation_failed {
-                break;
-            }
-        }
+        let ValidationOutcome {
+            validation,
+            failed: validation_failed,
+            pending_run_id: validation_pending,
+            deferred_run_id: deferred_validation_pending,
+            cancellation_error: validation_cancellation_error,
+        } = self
+            .run_edit_validation(session_id, &validate, rollback_on_failure)
+            .await;
 
         if let Some(error) = validation_cancellation_error {
             drop(write_guard.take());
@@ -313,14 +196,24 @@ impl WorkspaceActor {
 
         if let Some(run_id) = validation_pending {
             debug_assert!(!rollback_on_failure);
+            let mut validation_run_ids = vec![run_id.clone()];
+            if let Some(deferred_run_id) = deferred_validation_pending.as_ref() {
+                validation_run_ids.push(deferred_run_id.clone());
+            }
+            let guidance = if deferred_validation_pending.is_some() {
+                "Validation is running detached because rollback_on_failure is false. Poll bash_status for every ID in validation_run_ids; validation_run_id is the leading validator and deferred_validation_run_id is queued behind it."
+            } else {
+                "Validation is running detached because rollback_on_failure is false. Poll bash_status with validation_run_id."
+            };
             drop(write_guard.take());
             self.reconcile_pending_async().await?;
-            return Ok(json!({
+            let mut response = json!({
                 "applied": true,
                 "rolled_back": false,
                 "validation_pending": true,
                 "validation_run_id": run_id,
-                "guidance": "Validation is running detached because rollback_on_failure is false. Poll bash_status with validation_run_id.",
+                "validation_run_ids": validation_run_ids,
+                "guidance": guidance,
                 "snapshot_rebased_from": snapshot_rebased_from,
                 "diff": diff_value,
                 "diff_stat": diff_stat_value,
@@ -335,7 +228,11 @@ impl WorkspaceActor {
                     "prepare_and_commit": prepare_ms,
                     "commit": commit_ms
                 }
-            }));
+            });
+            if let Some(deferred_run_id) = deferred_validation_pending {
+                response["deferred_validation_run_id"] = Value::String(deferred_run_id);
+            }
+            return Ok(response);
         }
 
         if validation_failed && rollback_on_failure {
@@ -416,49 +313,6 @@ impl WorkspaceActor {
                 "commit": commit_ms
             }
         }))
-    }
-
-    /// Launch the remaining validation commands as a single detached bash run
-    /// once the foreground budget is spent. Returns the run_id to poll, or
-    /// records an error entry and returns None if the launch itself failed.
-    async fn spawn_pending_validation(
-        &self,
-        session_id: &str,
-        commands: &[String],
-        validation: &mut Vec<Value>,
-    ) -> Option<String> {
-        let joined = commands
-            .iter()
-            .map(|command| format!("({command})"))
-            .collect::<Vec<_>>()
-            .join(" && ");
-        match self
-            .bash
-            .start_for_session(
-                &self.root,
-                session_id,
-                StartRequest {
-                    command: joined.clone(),
-                    cwd: None,
-                    background: Some(true),
-                    timeout_ms: None,
-                },
-            )
-            .await
-        {
-            Ok(result) => {
-                let run_id = result
-                    .get("run_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                validation.push(json!({"command": joined, "deferred": true, "result": result}));
-                run_id
-            }
-            Err(error) => {
-                validation.push(json!({"command": joined, "error": error.0}));
-                None
-            }
-        }
     }
 
     fn prepare_edit(

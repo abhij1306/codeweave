@@ -161,7 +161,7 @@ fn parse_diff_hunks(diff: &str) -> Vec<DiffHunk> {
 fn hunk_overlaps(hunk: &DiffHunk, start: usize, end: usize) -> bool {
     let overlaps = |line: usize, count: usize| {
         let last = line.saturating_add(count.saturating_sub(1));
-        count == 0 || (line <= end && last >= start)
+        count > 0 && line <= end && last >= start
     };
     overlaps(hunk.old_start, hunk.old_count) || overlaps(hunk.new_start, hunk.new_count)
 }
@@ -310,16 +310,17 @@ impl WorkspaceActor {
                     next = Some(index);
                     break;
                 }
-                if output.is_empty() && hunk.text.len() > applied_chars {
-                    next = Some(index);
-                    break;
-                }
+                let oversized = hunk.text.len() > applied_chars;
                 output.push_str(&hunk.text);
                 selected.push(json!({
                     "id": hunk.id, "path": hunk.path,
                     "old": {"start_line": hunk.old_start, "line_count": hunk.old_count},
                     "new": {"start_line": hunk.new_start, "line_count": hunk.new_count}
                 }));
+                if oversized {
+                    next = (index + 1 < hunks.len()).then_some(index + 1);
+                    break;
+                }
             }
             let continuation = next
                 .map(|index| {
@@ -485,5 +486,33 @@ impl WorkspaceActor {
             ],
         );
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hunk(old_start: usize, old_count: usize, new_start: usize, new_count: usize) -> DiffHunk {
+        DiffHunk {
+            id: "test".to_owned(),
+            path: "test.rs".to_owned(),
+            old_start,
+            old_count,
+            new_start,
+            new_count,
+            text: String::new(),
+        }
+    }
+
+    #[test]
+    fn hunk_overlap_ignores_zero_length_sides() {
+        let addition = hunk(10, 0, 100, 2);
+        assert!(!hunk_overlaps(&addition, 10, 10));
+        assert!(hunk_overlaps(&addition, 100, 101));
+
+        let deletion = hunk(20, 2, 200, 0);
+        assert!(hunk_overlaps(&deletion, 20, 21));
+        assert!(!hunk_overlaps(&deletion, 200, 200));
     }
 }
