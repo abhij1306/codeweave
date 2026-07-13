@@ -762,8 +762,12 @@ fn build_chunks_bounds_symbols_and_covers_remainder() {
     let line_count = lines.len();
     let mut covered = vec![0u32; line_count + 1];
     for chunk in &built {
-        for line in chunk.start_line..=chunk.end_line.min(line_count) {
-            covered[line] += 1;
+        for hits in covered
+            .iter_mut()
+            .take(chunk.end_line.min(line_count) + 1)
+            .skip(chunk.start_line)
+        {
+            *hits += 1;
         }
     }
     assert!(
