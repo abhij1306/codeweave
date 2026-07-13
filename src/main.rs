@@ -1,4 +1,5 @@
 mod bash;
+#[allow(dead_code)]
 mod index;
 mod intelligence;
 mod manager;
@@ -381,39 +382,6 @@ async fn prepare(
     // redirect a tool call.
     params.remove("workspace_id");
     params.remove("workspace");
-    if method == "code_fetch" && !params.contains_key("items") {
-        if let Some(ranges) = params
-            .remove("ranges")
-            .and_then(|value| value.as_array().cloned())
-        {
-            let items = ranges
-                .into_iter()
-                .map(|range| {
-                    let mut item = json!({
-                        "kind": "path",
-                        "value": range.get("path").cloned().unwrap_or(Value::Null),
-                    });
-                    if let Some(value) = range.get("start_line").or_else(|| range.get("start")) {
-                        item["start_line"] = value.clone();
-                    }
-                    if let Some(value) = range.get("end_line").or_else(|| range.get("end")) {
-                        item["end_line"] = value.clone();
-                    }
-                    item
-                })
-                .collect::<Vec<_>>();
-            params.insert("items".into(), json!(items));
-        } else if let Some(path) = params.remove("path") {
-            let mut item = json!({"kind":"path","value":path});
-            if let Some(v) = params.remove("start_line") {
-                item["start_line"] = v;
-            }
-            if let Some(v) = params.remove("end_line") {
-                item["end_line"] = v;
-            }
-            params.insert("items".into(), json!([item]));
-        }
-    }
     if method == "code_preview" {
         params.insert("preview".into(), Value::Bool(true));
     }
@@ -1162,10 +1130,8 @@ mod tests {
         let items = all.as_array().expect("tools array");
         let expected_annotations = [
             ("workspace", true, false, true, false),
-            ("code_context", true, false, true, false),
+            ("code_retrieve", true, false, true, false),
             ("code_capabilities", true, false, true, false),
-            ("code_fetch", true, false, true, false),
-            ("code_search", true, false, true, false),
             ("code_intelligence", true, false, true, false),
             ("code_write", false, false, false, false),
             ("code_replace", false, false, false, false),
@@ -1211,9 +1177,6 @@ mod tests {
             assert_eq!(item["execution"]["taskSupport"], "forbidden");
         }
 
-        assert!(tool(&all, "code_context")["inputSchema"]
-            .get("required")
-            .is_none());
         assert!(items.iter().all(|item| item["name"] != "code_edit"));
         assert!(items
             .iter()
@@ -1232,10 +1195,24 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(action_multiplexers, ["workspace"]);
         assert_eq!(tool(&all, "workspace")["annotations"]["readOnlyHint"], true);
-        let fetch_item = &tool(&all, "code_fetch")["inputSchema"]["properties"]["items"]["items"];
-        assert_eq!(fetch_item["required"], json!(["kind", "value"]));
+        let retrieval_operation =
+            &tool(&all, "code_retrieve")["inputSchema"]["properties"]["operations"]["items"];
+        assert_eq!(retrieval_operation["required"], json!(["operation"]));
+        assert!(retrieval_operation["properties"].get("query").is_none());
         assert_eq!(
-            fetch_item["properties"]["kind"]["enum"],
+            retrieval_operation["properties"]["operation"]["enum"],
+            json!([
+                "find_file",
+                "find_symbol",
+                "search_text",
+                "find_references",
+                "symbols_overview",
+                "repo_map",
+                "read"
+            ])
+        );
+        assert_eq!(
+            retrieval_operation["properties"]["target"]["enum"],
             json!([
                 "path",
                 "handle",
@@ -1246,7 +1223,10 @@ mod tests {
                 "continuation"
             ])
         );
-        assert_eq!(fetch_item["additionalProperties"], false);
+        assert_eq!(retrieval_operation["additionalProperties"], false);
+        for removed in ["code_context", "code_search", "code_fetch"] {
+            assert!(items.iter().all(|item| item["name"] != removed));
+        }
         assert_eq!(
             tool(&all, "code_write")["inputSchema"]["required"],
             json!(["path", "content"])
@@ -1302,33 +1282,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_normalizes_compatibility_inputs() {
+    async fn prepare_normalizes_mutation_inputs() {
         let manager = Arc::new(WorkspaceManager::default());
         let config = json!({"workspace": {"path": "/repo"}});
-
-        let context = prepare(
-            &manager,
-            &config,
-            &full_access(),
-            "code_context",
-            json!({"query": "WorkspaceActor"}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(context["query"], "WorkspaceActor");
-
-        let fetch = prepare(
-            &manager,
-            &config,
-            &full_access(),
-            "code_fetch",
-            json!({"ranges": [{"path": "src/main.rs", "start": 2, "end": 4}]}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(fetch["items"][0]["kind"], "path");
-        assert_eq!(fetch["items"][0]["start_line"], 2);
-        assert_eq!(fetch["items"][0]["end_line"], 4);
 
         let replace = prepare(
             &manager,
@@ -1652,8 +1608,11 @@ mod tests {
             &manager,
             &public_config,
             &full_access(),
-            "code_search",
-            json!({"workspace_id": "main", "mode": "filename", "query": "configured.rs"}),
+            "code_retrieve",
+            json!({
+                "workspace_id": "main",
+                "operations": [{"operation": "find_file", "name": "configured.rs"}]
+            }),
         )
         .await
         .unwrap();
@@ -1714,7 +1673,7 @@ mod tests {
         let access = resolve_tool_access(&server, &root).expect("example profile must resolve");
         assert!(access.is_allowed("bash"));
         assert!(access.bash_tools_available());
-        assert_eq!(access.list_payload().as_array().unwrap().len(), 28);
+        assert_eq!(access.list_payload().as_array().unwrap().len(), 26);
     }
 
     #[test]

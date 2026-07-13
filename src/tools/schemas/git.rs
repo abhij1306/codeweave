@@ -24,7 +24,7 @@ pub fn git_diff() -> Value {
             "end_line": {"type": "integer", "minimum": 1},
             "symbol": {"type": "string"},
             "hunk_ids": {"type": "array", "items": {"type": "string"}},
-            "continuation": {"type": "string", "description": "Snapshot-bound continuation returned by a truncated git_diff response."}
+            "continuation": {"type": "string", "description": "Snapshot- and scope-bound continuation returned by a truncated git_diff response. Reuses the original paths, staged mode, symbol/line focus, and hunk IDs."}
         },
         "additionalProperties": false,
         "$schema": "http://json-schema.org/draft-07/schema#"

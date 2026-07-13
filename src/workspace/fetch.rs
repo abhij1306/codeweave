@@ -244,12 +244,16 @@ impl WorkspaceActor {
         context_lines: usize,
         include_imports: bool,
     ) -> AppResult<Value> {
-        let (qualified_path, symbol_name) = match symbol_name.rsplit_once("::") {
-            Some((path, name)) if !path.is_empty() && !name.is_empty() => (Some(path), name),
-            _ => (None, symbol_name),
+        let index = self.index.read();
+        let (qualified_path, symbol_name) = if requested_path.is_none() {
+            symbol_name
+                .split_once("::")
+                .filter(|(path, name)| !name.is_empty() && index.get(path).is_some())
+                .map_or((None, symbol_name), |(path, name)| (Some(path), name))
+        } else {
+            (None, symbol_name)
         };
         let requested_path = requested_path.or(qualified_path);
-        let index = self.index.read();
         let candidates = index.find_symbols(requested_path, symbol_name);
         if candidates.is_empty() {
             return Err(AppError::details(

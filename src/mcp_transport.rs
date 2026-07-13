@@ -36,11 +36,10 @@ use crate::{
     health, is_loopback, live, prepare, tool_failure, tool_result, AppState, Cli, SERVER_NAME,
 };
 
-const INSTRUCTIONS: &str = "Use code_capabilities to inspect supported contracts, code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, code_preview/code_transaction for multi-file edits, and the single-operation code_write/code_replace/code_replace_range/code_insert/code_delete/code_rename tools for narrow changes. Run commands with bash; inspect or stop retained runs with bash_status, bash_output, and bash_cancel. Bash executes as the CodeWeave OS user and is not sandboxed. Use the narrowly scoped git_status/git_diff/git_log/git_show/git_blame/git_preflight/git_stage/git_commit/git_restore/git_push tools for repository operations. CodeWeave serves one repository, fixed for the server's lifetime and configured in config.json; call workspace to inspect its summary, changes, diagnostics, or skills.";
+const INSTRUCTIONS: &str = "Use code_retrieve for all repository discovery and exact reads. Select explicit operations and selector fields rather than sending a natural-language task description. Use code_intelligence only for semantic definitions, references, diagnostics, or rename previews. Use code_capabilities to inspect contracts, code_preview/code_transaction for multi-file edits, and code_write/code_replace/code_replace_range/code_insert/code_delete/code_rename for narrow changes. Run commands with bash; inspect or stop retained runs with bash_status, bash_output, and bash_cancel. Bash executes as the CodeWeave OS user and is not sandboxed. Use the narrowly scoped git tools for repository operations. CodeWeave serves one repository fixed in config.json; use workspace for its summary, changes, diagnostics, or skills.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CodeWeaveSessionId(String);
-
 #[derive(Clone)]
 pub(crate) struct CodeWeaveMcp {
     state: AppState,

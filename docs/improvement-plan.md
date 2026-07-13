@@ -12,7 +12,7 @@ CodeWeave's job: be a **single MCP server** that makes coding tasks fast and acc
 
 Primary success metrics, in priority order:
 
-1. **Latency** — cold start to first useful `code_context` answer; warm search latency; edit round-trip time.
+1. **Latency** — cold start to first useful `code_retrieve` answer; warm search latency; edit round-trip time.
 2. **Efficiency** — fewer tool round trips per task (right code on the first call), smaller schema/response token footprints.
 3. **Accuracy** — retrieval relevance, symbol-complete results, edits that apply correctly with honest precondition/validation reporting.
 
@@ -32,7 +32,7 @@ Hard constraints (must remain true):
 
 - **Exactly 27 tools**, all defined as inline `json!` literals in `main.rs::tools()` (`main.rs:202-717`). The set is **triple-pinned**: schema definitions in `main.rs`, a hardcoded name allowlist in `mcp_transport.rs:85-113`, and the `expected_annotations` test table at `main.rs:1173-1201`. Adding one tool touches 4–5 sites. No tool profiles exist; a previous "task profile" concept was deliberately removed (`main.rs:833-842`).
 - **Retrieval scoring is hand-rolled and hand-tuned.** All constants live in `CodeIndex::context` (`src/index/mod.rs:915-989`): exact phrase +12, required term +15, path match +5, exact symbol +25, partial symbol +7, dirty file +7, recent mutation +5, `ln_1p(count)*3` term frequency, `coverage*10` bonus, doc-type multipliers (test ×0.9, source ×1.1, runtime_evidence ×1.25), and a size-penalty divisor `1 + min(ln(1+bytes/8192),4)*0.18`. There is **no IDF, no document-length normalization, no BM25** — no IR library at all in `Cargo.toml`.
-- **Retrieval unit is not symbol-bounded.** `code_context` returns an excerpt of ±6 lines around the *first* matching signal (`index/lines.rs:24-33`, `index/mod.rs:999-1047`), annotated with the enclosing symbol but not aligned to it. Candidate scoring is file-granular via a token→file inverted index (`index/mod.rs:212-225`).
+- **Retrieval unit is not symbol-bounded.** `code_retrieve` returns an excerpt of ±6 lines around the *first* matching signal (`index/lines.rs:24-33`, `index/mod.rs:999-1047`), annotated with the enclosing symbol but not aligned to it. Candidate scoring is file-granular via a token→file inverted index (`index/mod.rs:212-225`).
 - **Reference lookup is lexical.** `references` mode requires an indexed declaration, then scans with a word-boundary regex `\b<name>\b` (`index/mod.rs:1059-1202`). It cannot distinguish overloads, shadowing, or same-named identifiers.
 - **The transaction engine is the strongest asset.** Preconditions (snapshot / content hash / provenance handle, `edit.rs:598-614`), overlap preflight, tree-sitter syntax preflight, atomic temp-file+rename writes with in-process reverse rollback, mutation journal with rotation and crash recovery, validation commands with rollback-on-failure. All edit tools funnel into one `changes[]` pipeline compiled to `PlannedFile { path, before, after }` (`edit.rs:27`), a clean compile target for future operations.
 
@@ -151,7 +151,7 @@ Removed keys: `workspaces[]`, `workspace.defaultPath`, `workspace.lockToDefault`
 **Acceptance:**
 - All tools behave identically for a single configured repo; `workspace(summary/diagnostics)` unchanged in output shape minus multi-workspace fields.
 - Old multi-workspace config keys produce an actionable startup error, not silent misbehavior.
-- First `code_context` call after warm start pays zero index-build cost (test: assert index ready before transport bind).
+- First `code_retrieve` call after warm start pays zero index-build cost (test: assert index ready before transport bind).
 - Net LOC decreases; `manager.rs` shrinks substantially; the multi-workspace test suite (`manager.rs:1042-1345` etc.) is deleted, not skipped.
 
 ---
@@ -205,7 +205,7 @@ Registry-level validation (startup + tests): draft-07, `type: object`, flat (no 
 | Profile | Tools |
 |---|---|
 | `full` | all (default; identical to today) |
-| `read-only` | workspace, code_context, code_capabilities, code_fetch, code_search, git_status, git_diff, git_log, git_show, git_blame |
+| `read-only` | workspace, code_retrieve, code_capabilities, code_intelligence, code_preview, git_status, git_diff, git_log, git_show, git_blame |
 | `edit` | everything except `bash`, `bash_status`, `bash_output`, `bash_cancel`, `git_push` |
 | `custom` | `server.tools.include` / `exclude` over the full set |
 
@@ -337,8 +337,8 @@ Verification: `cargo test --bin codeweave-rust` (163 pass, incl. new chunk-build
 5. Rendering: return the **whole symbol chunk** when it fits the remaining char budget; otherwise the existing `fit_excerpt` shrink applies within the chunk. Each result keeps `handle`, enclosing-symbol metadata, `reasons`, plus additive fields `chunk_kind`, `complete_symbol: bool`.
 
 **Compatibility:**
-- `code_search` modes (literal/regex/filename/symbol/references/outline/repo_map) unchanged.
-- `code_context` request/response schema unchanged (additive fields only).
+- `code_retrieve` modes (literal/regex/filename/symbol/references/outline/repo_map) unchanged.
+- `code_retrieve` request/response schema unchanged (additive fields only).
 - Config flag `index.ranking: "v1" | "v2"` (default `v2` once gates pass; `v1` kept one release, then deleted).
 
 **Acceptance (hard gates via P3 harness, measured on crawlerai + OSS fixtures):**
@@ -386,11 +386,10 @@ edits are root-checked, UTF-16 converted, overlap-checked, compiled to existing
 hash-preconditioned `changes[]`, and passed through `code_preview`; no
 intelligence backend writes files directly.
 
-The same audit also drives the retrieval contract work: natural-language
-`code_context.query` remains distinct from structured terms, result caps report
-protocol/configured/effective limits and warnings, bare duplicate symbols fail
-with candidates, v2 down-ranks historical plans for implementation intent, and
-Git diff supports hunk-focused review plus snapshot-bound continuation.
+The same audit also drives the retrieval contract work: one structured
+`code_retrieve` surface exposes explicit discovery and read operations, bare
+duplicate symbols return candidates, reference evidence is labelled honestly,
+and Git diff supports hunk-focused review plus snapshot-bound continuation.
 
 ## 5. Deferred — do not start
 

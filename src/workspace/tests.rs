@@ -5,13 +5,14 @@ use super::util::{
     summarize_changed_paths, MAX_CHANGED_PATH_GROUPS, MAX_OBSERVED_CHANGED_PATHS,
 };
 use super::{validated_push_target, RunBaseline, WorkspaceActor};
-use crate::index::{content_hash, Ranking};
+use crate::index::content_hash;
 use crate::model::{test_bash_executable, BashConfig, PolicyConfig, WorkspaceConfig};
 use chrono::Utc;
 use serde_json::json;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -56,7 +57,6 @@ fn test_actor_with_policy_and_exclusions(
                 exclude_paths,
             },
             policy,
-            Ranking::V1,
             cache,
         )
         .unwrap(),
@@ -71,6 +71,91 @@ fn test_actor_with_budget(root: &Path, foreground_budget_ms: u64) -> Arc<Workspa
 
 fn test_actor_with_exclusions(root: &Path, exclude_paths: Vec<String>) -> Arc<WorkspaceActor> {
     test_actor_with_policy_and_exclusions(root, test_policy(), exclude_paths)
+}
+
+fn run_git(root: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git command failed: {args:?}");
+}
+
+#[test]
+fn git_diff_continuation_preserves_the_original_scope() {
+    let root = tempdir().unwrap();
+    run_git(root.path(), &["init", "-q"]);
+    run_git(
+        root.path(),
+        &["config", "user.email", "codeweave@example.test"],
+    );
+    run_git(root.path(), &["config", "user.name", "CodeWeave Test"]);
+
+    let base = (0..30)
+        .map(|index| format!("line-{index:02}-{}", "x".repeat(80)))
+        .collect::<Vec<_>>();
+    fs::write(root.path().join("a.rs"), format!("{}\n", base.join("\n"))).unwrap();
+    fs::write(root.path().join("b.rs"), format!("{}\n", base.join("\n"))).unwrap();
+    run_git(root.path(), &["add", "a.rs", "b.rs"]);
+    run_git(root.path(), &["commit", "-q", "-m", "baseline"]);
+
+    let mut changed_a = base.clone();
+    changed_a[1] = format!("changed-near-start-{}", "y".repeat(80));
+    changed_a[25] = format!("changed-near-end-{}", "z".repeat(80));
+    fs::write(
+        root.path().join("a.rs"),
+        format!("{}\n", changed_a.join("\n")),
+    )
+    .unwrap();
+    let mut changed_b = base.clone();
+    changed_b[1] = format!("unrelated-change-{}", "q".repeat(80));
+    fs::write(
+        root.path().join("b.rs"),
+        format!("{}\n", changed_b.join("\n")),
+    )
+    .unwrap();
+
+    let actor = test_actor(root.path());
+    let first = actor
+        .git(&json!({
+            "action": "diff",
+            "paths": ["a.rs"],
+            "max_chars": 1_200
+        }))
+        .unwrap();
+    assert_eq!(first["truncated"], true);
+    assert!(!first["hunks"].as_array().unwrap().is_empty());
+    assert!(first["hunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|hunk| hunk["path"] == "a.rs"));
+    let continuation = first["continuation"].as_str().unwrap();
+
+    let second = actor
+        .git(&json!({
+            "action": "diff",
+            "continuation": continuation,
+            "max_chars": 5_000
+        }))
+        .unwrap();
+    assert!(second["hunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|hunk| hunk["path"] == "a.rs"));
+    assert!(!second["output"].as_str().unwrap().contains("b.rs"));
+    assert_eq!(second["scope"]["paths"], json!(["a.rs"]));
+
+    let error = actor
+        .git(&json!({
+            "action": "diff",
+            "continuation": continuation,
+            "paths": ["b.rs"]
+        }))
+        .unwrap_err();
+    assert_eq!(error.0.code, "CONTINUATION_SCOPE_MISMATCH");
 }
 
 #[test]
@@ -116,6 +201,68 @@ fn fetch_batches_return_successes_and_item_errors() {
     assert_eq!(result["results"].as_array().unwrap().len(), 1);
     assert_eq!(result["errors"].as_array().unwrap().len(), 1);
     assert_eq!(result["partial_success"], true);
+}
+
+#[test]
+fn fetch_resolves_qualified_python_method_names() {
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("runner.py"),
+        "class BrowserAttemptRunner:\n    def run(self):\n        return 'browser'\n\nclass OtherRunner:\n    def run(self):\n        return 'other'\n",
+    )
+    .unwrap();
+    let actor = test_actor(root.path());
+
+    let result = actor
+        .code_fetch(&json!({
+            "items": [{
+                "kind": "symbol",
+                "path": "runner.py",
+                "value": "BrowserAttemptRunner.run"
+            }]
+        }))
+        .unwrap();
+
+    assert_eq!(result["result_count"], 1);
+    assert!(result["results"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("return 'browser'"));
+    assert!(!result["results"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("return 'other'"));
+}
+
+#[test]
+fn fetch_disambiguates_path_and_rust_qualified_method() {
+    let root = tempdir().unwrap();
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    fs::write(
+        root.path().join("src/runner.rs"),
+        "struct BrowserAttemptRunner;\nimpl BrowserAttemptRunner {\n    fn run(&self) -> &'static str { \"browser\" }\n}\nstruct OtherRunner;\nimpl OtherRunner {\n    fn run(&self) -> &'static str { \"other\" }\n}\n",
+    )
+    .unwrap();
+    let actor = test_actor(root.path());
+
+    let result = actor
+        .code_fetch(&json!({
+            "items": [{
+                "kind": "symbol",
+                "value": "src/runner.rs::BrowserAttemptRunner::run"
+            }]
+        }))
+        .unwrap();
+
+    assert_eq!(result["result_count"], 1);
+    assert!(result["results"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("\"browser\""));
+    assert!(!result["results"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("\"other\""));
 }
 
 #[test]
@@ -371,16 +518,17 @@ fn code_capabilities_reports_public_contracts() {
     let capabilities = actor.code_capabilities().unwrap();
 
     assert_eq!(capabilities["workspace_id"], "main");
-    assert!(capabilities["search_modes"]
+    assert_eq!(capabilities["retrieval"]["tool"], "code_retrieve");
+    assert!(capabilities["retrieval"]["operations"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|mode| mode == "outline"));
-    assert!(capabilities["fetch_kinds"]
+        .any(|operation| operation == "read"));
+    assert!(capabilities["retrieval"]["read_targets"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|kind| kind == "metadata"));
+        .any(|target| target == "metadata"));
     assert_eq!(capabilities["editing"]["supports_transaction"], true);
     assert_eq!(
         capabilities["editing"]["supports_handle_range_replace"],
@@ -389,26 +537,85 @@ fn code_capabilities_reports_public_contracts() {
 }
 
 #[test]
-fn code_context_accepts_weighted_terms_without_legacy_query() {
+fn code_retrieve_batches_explicit_primitives_in_one_round_trip() {
     let root = tempdir().unwrap();
     fs::write(
-        root.path().join("mcp.rs"),
-        "pub fn register_mcp_tools() { map_structured_errors(); }\nfn map_structured_errors() {}\n",
+        root.path().join("engine.rs"),
+        "pub fn extract() { panic!(\"runtime failed\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\n",
     )
     .unwrap();
     let actor = test_actor(root.path());
 
-    let context = actor
-        .code_context(&json!({
-            "required_terms": ["mcp"],
-            "optional_terms": ["structured errors"],
-            "document_types": ["source"]
-        }))
+    let result = actor
+        .code_retrieve_for_session(
+            "session",
+            &json!({
+                "operations": [
+                    {"id": "file", "operation": "find_file", "name": "Cargo.toml"},
+                    {"id": "symbol", "operation": "find_symbol", "symbol": "extract", "paths": ["engine.rs"]},
+                    {"id": "pattern", "operation": "search_text", "pattern": "runtime failed", "paths": ["engine.rs"]},
+                    {"id": "outline", "operation": "symbols_overview", "paths": ["engine.rs"]},
+                    {"id": "read", "operation": "read", "target": "symbol", "value": "extract", "path": "engine.rs"}
+                ]
+            }),
+        )
         .unwrap();
 
-    assert_eq!(context["result_count"], 1);
-    assert_eq!(context["results"][0]["path"], "mcp.rs");
-    assert!(context["results"][0]["score"].is_number());
+    assert_eq!(result["retrieval_contract_version"], 2);
+    assert_eq!(result["result_count"], 5);
+    assert_eq!(result["error_count"], 0);
+    assert_eq!(result["execution"]["round_trips"], 1);
+    assert_eq!(result["execution"]["parallel"], false);
+    let ids = result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["file", "symbol", "pattern", "outline", "read"]);
+    assert_eq!(
+        result["results"][0]["result"]["results"][0]["path"],
+        "Cargo.toml"
+    );
+    assert_eq!(
+        result["results"][1]["result"]["results"][0]["path"],
+        "engine.rs"
+    );
+    assert!(result["results"][2]["result"]["results"][0]["preview"]
+        .as_str()
+        .unwrap()
+        .contains("runtime failed"));
+    assert_eq!(result["results"][4]["result"]["result_count"], 1);
+}
+
+#[test]
+fn code_retrieve_preserves_success_when_an_operation_fails() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("engine.rs"), "pub fn extract() {}\n").unwrap();
+    let actor = test_actor(root.path());
+
+    let result = actor
+        .code_retrieve_for_session(
+            "session",
+            &json!({
+                "operations": [
+                    {"id": "file", "operation": "find_file", "name": "engine.rs"},
+                    {"id": "invalid", "operation": "find_symbol"}
+                ]
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(result["result_count"], 1);
+    assert_eq!(result["error_count"], 1);
+    assert_eq!(result["partial_success"], true);
+    assert_eq!(result["results"][0]["id"], "file");
+    assert_eq!(result["errors"][0]["id"], "invalid");
 }
 
 #[tokio::test]
@@ -616,21 +823,6 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
     assert_eq!(search["result_count"], 0);
     assert!(search["phase_ms"]["index_search"].is_number());
 
-    let context = actor
-        .code_context(&json!({"query": "existing_symbol"}))
-        .unwrap();
-    assert_eq!(context["reconcile_pending"], true);
-    assert_eq!(context["result_count"], 1);
-    assert!(context.get("recent_bash_failures").is_none());
-    assert!(context["phase_ms"]["index_context"].is_number());
-
-    let context_with_failures = actor
-        .code_context(&json!({
-            "query": "existing_symbol",
-            "include_bash_failures": true
-        }))
-        .unwrap();
-    assert!(context_with_failures["recent_bash_failures"].is_array());
     assert!(actor
         .needs_reconcile
         .load(std::sync::atomic::Ordering::Acquire));
@@ -1367,7 +1559,6 @@ fn workspace_generation_resumes_after_persisted_journal_records() {
             exclude_paths: Vec::new(),
         },
         test_policy(),
-        Ranking::V1,
         cache.path().to_path_buf(),
     )
     .unwrap();

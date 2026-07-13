@@ -981,76 +981,6 @@ impl BashSupervisor {
             remove_logs(&logs);
         }
     }
-
-    pub fn recent_failures_for_session(
-        &self,
-        session_id: &str,
-        query: &str,
-        limit: usize,
-    ) -> Vec<serde_json::Value> {
-        self.recent_failures_filtered(Some(session_id), query, limit)
-    }
-
-    fn recent_failures_filtered(
-        &self,
-        session_id: Option<&str>,
-        query: &str,
-        limit: usize,
-    ) -> Vec<serde_json::Value> {
-        let terms: Vec<String> = query
-            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-            .filter(|term| term.len() > 2)
-            .map(|term| term.to_ascii_lowercase())
-            .collect();
-        let mut keyed: Vec<_> = self
-            .runs
-            .lock()
-            .values()
-            .map(|record| {
-                let key = {
-                    let guard = record.lock();
-                    guard.ended_at.unwrap_or(guard.started_at)
-                };
-                (key, record.clone())
-            })
-            .collect();
-        keyed.sort_by(|(left, _), (right, _)| right.cmp(left));
-        let mut output = Vec::new();
-        let mut superseded_commands = HashSet::new();
-        for (_, record) in keyed {
-            let record = record.lock();
-            if session_id.is_some_and(|session_id| session_id != record.session_id) {
-                continue;
-            }
-            let command_key = format!("{}\0{}", record.cwd.to_string_lossy(), record.command);
-            if record.status == "succeeded" {
-                superseded_commands.insert(command_key);
-                continue;
-            }
-            if !matches!(record.status.as_str(), "failed" | "timed_out") {
-                continue;
-            }
-            if superseded_commands.contains(&command_key) {
-                continue;
-            }
-            let lower = record.output.to_ascii_lowercase();
-            if !terms.is_empty() && !terms.iter().any(|term| lower.contains(term)) {
-                continue;
-            }
-            output.push(json!({
-                "run_id": record.run_id,
-                "status": record.status,
-                "command": record.command,
-                "output": tail_chars(&record.output, 4_000),
-                "log_handle": format!("bash-log:{}", record.run_id),
-                "reason_codes": ["recent_bash_failure"]
-            }));
-            if output.len() >= limit {
-                break;
-            }
-        }
-        output
-    }
 }
 
 fn finalize_cancelled_before_start(
@@ -1617,39 +1547,6 @@ mod tests {
 
         assert_eq!(readiness.readiness, "unavailable");
         assert_eq!(readiness.resolved_executable, None);
-    }
-
-    #[test]
-    fn recent_failures_can_be_scoped_to_session() {
-        let cache = tempdir().unwrap();
-        let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
-        supervisor.runs.lock().insert(
-            "a".to_owned(),
-            Arc::new(Mutex::new(record_for_session(
-                cache.path(),
-                "a",
-                "session-a",
-                "failed",
-                "alpha failure",
-            ))),
-        );
-        supervisor.runs.lock().insert(
-            "b".to_owned(),
-            Arc::new(Mutex::new(record_for_session(
-                cache.path(),
-                "b",
-                "session-b",
-                "failed",
-                "beta failure",
-            ))),
-        );
-
-        let scoped = supervisor.recent_failures_for_session("session-a", "failure", 10);
-
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0]["run_id"], "a");
-        assert!(scoped[0]["output"].as_str().unwrap().contains("alpha"));
-        assert!(!scoped[0]["output"].as_str().unwrap().contains("beta"));
     }
 
     #[tokio::test]

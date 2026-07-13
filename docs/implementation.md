@@ -28,19 +28,19 @@ Do not expose an unauthenticated CodeWeave endpoint to a public network.
 
 ## Workspace lifecycle
 
-CodeWeave serves exactly one repository, configured through `workspace.path` and fixed for the process lifetime. The path is canonicalized once at startup (`security::canonical_root`); a missing or non-directory path fails startup with `WORKSPACE_NOT_FOUND` / `WORKSPACE_NOT_DIRECTORY`. The single repository actor is built eagerly at `initialize`, before the transport binds — the index scan and file watcher are running and Bash readiness is pre-probed by the time the first request arrives, so the first `code_context` pays no build cost. The persistent index lives under `.codeweave-cache`, keyed by the repository's canonical path.
+CodeWeave serves exactly one repository, configured through `workspace.path` and fixed for the process lifetime. The path is canonicalized once at startup (`security::canonical_root`); a missing or non-directory path fails startup with `WORKSPACE_NOT_FOUND` / `WORKSPACE_NOT_DIRECTORY`. The single repository actor is built eagerly at `initialize`, before the transport binds—the index scan and file watcher are running and Bash readiness is pre-probed before the first `code_retrieve` call. The persistent index lives under `.codeweave-cache`, keyed by the repository's canonical path.
 
 There is no runtime repository switching and no cached-actor map. `server.statefulMode` controls only transport session isolation (per-chat Bash runs and `changes` attribution); it never changes which repository is served. Run two projects as two instances on two ports.
 
 ## Retrieval and ranking
 
-`code_context` scores files with an additive, deterministic ranker: exact-phrase, required-term, exact-symbol, symbol, and path matches each contribute a fixed weight, with coverage, dirty-file, recent-mutation, and document-type adjustments, then a size normalization. Each contribution emits a `reason_code`, so a result explains why it ranked. The scorer is selected by `index.ranking`.
+The calling coding agent owns intent interpretation. CodeWeave exposes deterministic retrieval primitives and does not contain a second agent or infer architecture from prose.
 
-- **`v1`** (default) renders a short excerpt centered on the match around each hit.
-- **`v2`** keeps that exact-match loop and adds two things. First, a **filename-affinity boost**: the fraction of query terms present in a file's path adds to its score, with a full path-name match adding a further bonus — this fixes v1's one measured weakness, where filename and configuration lookups (`config.example.json`, `Cargo.toml`) ranked poorly. Document frequency reuses the existing token index rather than a separate corpus-statistics structure, so the boost adds no per-mutation bookkeeping. Second, **symbol-bounded rendering**: at index time each file is split into chunks (one per top-level symbol, sequential parts for symbols longer than 150 lines, remainder chunks for the gaps) stored on the file entry and rebuilt on load, so a per-file incremental refresh replaces a file's chunks as a unit. A result renders the whole enclosing symbol when it fits the render cap; a larger symbol renders a window centered on the match. Results carry additive `chunk_kind` and `complete_symbol` fields.
+`code_retrieve` is the sole public repository retrieval boundary. It batches up to 12 explicit filename, symbol, literal/regex text, reference, outline, repository-map, and exact-read operations in one MCP round trip. Operations execute in request order and return independent results or errors, so a failed selector does not discard successful evidence.
 
-`v2` is benchmarked against `v1` with the offline `eval/` harness on both this repository (`cargo run -p eval -- --ranking {v1,v2}`) and CrawlerAI (`cargo run -p eval -- --repo crawlerai --ranking {v1,v2}`). Repository-scoped baselines prevent results from overwriting each other, and record Git revision plus dirty-worktree state. On CodeWeave, v2 improves Recall@1/@5, Recall@10, and MRR@10 with search latency at or below v1. The first CrawlerAI run also improves Recall@1, Recall@10, and MRR, while exposing higher response size and latency plus misses on natural-language ownership queries. Returning whole symbols raises the mean characters per response — an intentional trade favoring completeness and accuracy, bounded by the render cap and the char budget. An earlier chunk-level BM25F design was built, measured to regress natural-language recall, and dropped; the shipped `v2` carries no BM25F in the hot path. See `docs/improvement-plan.md` (P4) for the full comparison.
+The implementation delegates to internal indexed search and exact-read primitives. Those internal functions are not advertised as MCP tools. Lexical and tree-sitter reference results retain their evidence labels; semantic evidence is reported only after a successful `code_intelligence` operation.
 
+The public contract is covered by batch-operation, partial-error, exact-symbol, text-search, reference, outline, repository-map, and exact-read tests.
 ## Tool registry and profiles
 
 Every advertised tool is defined once in the tool registry (`src/tools/`), which is the single source of truth. Each `ToolDefinition` carries its name, title, description, a safety classification (which drives the MCP annotation hints), its profile membership, and a pointer to its flat draft-07 input schema in `src/tools/schemas/`. The registry drives four consumers that were previously hand-maintained in separate places: the `tools/list` payload, the transport's callable-name gate, profile filtering, and the schema-shape validation. Adding or changing a tool happens in exactly one place.
@@ -60,7 +60,7 @@ CodeWeave exposes narrow write tools:
 
 - `code_write` for one whole-file write;
 - `code_replace` for one exact replacement;
-- `code_replace_range` for replacing the complete line range selected by a fetch handle;
+- `code_replace_range` for replacing the complete line range selected by a retrieval handle;
 - `code_insert` for one symbol-relative insertion;
 - `code_delete` for one deletion;
 - `code_rename` for one rename.
@@ -77,16 +77,16 @@ Tool errors include the stable `code` and `message` fields plus retry metadata w
 
 The public `bash` tool passes a command string to the configured executable as `bash -c <command>`. It accepts an optional workspace-relative `cwd`, background mode, and a timeout bounded by `policy.bash.maxTimeoutMs`. The supervisor retains combined, stdout, and stderr logs, limits returned output, enforces one active run at a time, and terminates process trees on cancellation or timeout. On Windows, it retains the existing Job Object cleanup and fallback warning behavior.
 
-Lifecycle operations have separate public contracts: `bash_status` and `bash_output` are read-only, while `bash_cancel` mutates process state. Run IDs use the `run_<uuid>` form, logs use `bash-log:<run_id>`, and `status_fetch` maps to `code_fetch` with `{"kind":"bash_status","value":"run_..."}`.
+Lifecycle operations have separate public contracts: `bash_status` and `bash_output` are read-only, while `bash_cancel` mutates process state. Run IDs use the `run_<uuid>` form and logs use `bash-log:<run_id>`. The same retained state can also be read through a `code_retrieve` operation with `operation: "read"` and target `bash_status` or `bash_log`.
 
 This feature assumes a trusted client. Bash commands are not restricted to the configured `workspace.path`; they can access anything the CodeWeave operating-system account can access. Windows installations must explicitly configure Git Bash, WSL Bash, MSYS2, Cygwin Bash, or another compatible executable through `policy.bash.executable`.
 
 ## Recommended agent workflow
 
 1. Review the repository summary with `workspace(action="summary")`.
-2. Retrieve ranked context, using required, optional, excluded, and document-type filters for broad scopes.
-3. Search for precise definitions and references; regex is raw text search, while `references` is the symbol call-site mode.
-4. Fetch exact file ranges, metadata, or compact responses as needed.
+2. Submit explicit `code_retrieve` discovery operations for filenames, symbols, text, references, outlines, or repository maps.
+3. Add `read` operations for exact files, ranges, symbols, metadata, handles, continuations, or retained Bash output.
+4. Use `code_intelligence` only when semantic evidence is required.
 5. Preview multi-file edits when useful, then apply the smallest coherent edit.
 6. Run formatting, tests, and builds.
 7. Inspect Git status and diff.

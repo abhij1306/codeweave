@@ -7,12 +7,6 @@ mod path_filter;
 pub use handle::{content_hash, decode_handle, encode_handle, RangeHandle};
 pub use lines::slice_lines;
 
-/// The deterministic tokenization used by retrieval, exposed for small
-/// workspace-level intent checks such as explicit worktree prioritization.
-pub fn query_terms_for_intent(query: &str) -> Vec<String> {
-    metadata::query_terms(query)
-}
-
 use crate::model::{AppError, AppResult};
 use crate::security::{relative_string, validate_relative};
 use crate::symbols::{extract_symbols, language_name, Symbol};
@@ -237,30 +231,13 @@ pub struct ContextParams<'a> {
     pub ranking: Ranking,
 }
 
-/// Controls how `code_context` renders declaration bodies after ranking.
+/// Controls how the internal evaluation ranker renders declaration bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SymbolDetail {
-    Excerpt,
     Complete,
     #[default]
     Auto,
     None,
-}
-
-impl SymbolDetail {
-    pub fn parse(value: Option<&str>) -> AppResult<Self> {
-        match value.unwrap_or("auto") {
-            "excerpt" => Ok(Self::Excerpt),
-            "complete" => Ok(Self::Complete),
-            "auto" => Ok(Self::Auto),
-            "none" => Ok(Self::None),
-            other => Err(AppError::details(
-                "INVALID_SYMBOL_DETAIL",
-                "symbol_detail must be excerpt, complete, auto, or none",
-                json!({"symbol_detail": other}),
-            )),
-        }
-    }
 }
 
 /// Retrieval ranking algorithm selector (config `index.ranking`).
@@ -269,16 +246,6 @@ pub enum Ranking {
     #[default]
     V1,
     V2,
-}
-
-impl Ranking {
-    /// Parse a config value; unknown strings fall back to `V1`.
-    pub fn parse(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "v2" => Ranking::V2,
-            _ => Ranking::V1,
-        }
-    }
 }
 
 /// Cap on rendered lines per v2 result. Symbols up to this length render whole
@@ -297,6 +264,7 @@ struct ContextV2<'a> {
     neutral: &'a [String],
     relevance: &'a [String],
     query_lower: &'a str,
+    literal_phrases: &'a [String],
     dirty: &'a HashSet<String>,
     recent_mutations: &'a HashSet<String>,
     min_score: f64,
@@ -607,10 +575,13 @@ impl CodeIndex {
         self.find_symbols(path, name).into_iter().next()
     }
 
-    /// Return every exact declaration matching `name`, optionally constrained to
-    /// one workspace-relative path. This keeps fetch callers from depending on
-    /// the incidental ordering of the symbol index.
+    /// Return every declaration matching `name`, optionally constrained to one
+    /// workspace-relative path. Besides leaf names, this accepts qualified method
+    /// names such as `BrowserAttemptRunner.run` and `BrowserAttemptRunner::run`.
     pub fn find_symbols(&self, path: Option<&str>, name: &str) -> Vec<(String, Symbol, String)> {
+        let leaf_name = qualified_symbol_parts(name)
+            .map(|(_, leaf)| leaf)
+            .unwrap_or(name);
         if let Some(path) = path {
             let Some(file) = self.files.get(normalize(path).as_ref()) else {
                 return Vec::new();
@@ -618,7 +589,8 @@ impl CodeIndex {
             return file
                 .symbols
                 .iter()
-                .filter(|symbol| symbol.name == name)
+                .filter(|symbol| symbol.name == leaf_name)
+                .filter(|symbol| symbol_matches_qualified_name(file, symbol, name))
                 .cloned()
                 .map(|symbol| (file.path.clone(), symbol, file.hash.clone()))
                 .collect();
@@ -626,7 +598,7 @@ impl CodeIndex {
         let mut matches = Vec::new();
         for (path, symbol_index) in self
             .symbol_index
-            .get(name)
+            .get(leaf_name)
             .into_iter()
             .flat_map(|entries| entries.iter())
         {
@@ -636,7 +608,9 @@ impl CodeIndex {
             let Some(symbol) = file.symbols.get(*symbol_index) else {
                 continue;
             };
-            matches.push((file.path.clone(), symbol.clone(), file.hash.clone()));
+            if symbol_matches_qualified_name(file, symbol, name) {
+                matches.push((file.path.clone(), symbol.clone(), file.hash.clone()));
+            }
         }
         matches
     }
@@ -1019,6 +993,7 @@ impl CodeIndex {
             ));
         }
         let query_lower = query.to_ascii_lowercase();
+        let literal_phrases = quoted_phrases(query);
         let path_filters = PathFilterSet::new(path_filters);
         let mut candidate_files = self.candidate_files(&candidate_terms);
         let mut candidate_paths: HashSet<&str> = candidate_files
@@ -1073,6 +1048,7 @@ impl CodeIndex {
                 neutral: &neutral,
                 relevance: &relevance,
                 query_lower: &query_lower,
+                literal_phrases: &literal_phrases,
                 dirty,
                 recent_mutations,
                 min_score,
@@ -1094,6 +1070,7 @@ impl CodeIndex {
                 &required,
                 &neutral,
                 &relevance,
+                &literal_phrases,
                 dirty,
                 recent_mutations,
                 (0.0, None),
@@ -1120,6 +1097,63 @@ impl CodeIndex {
                 break;
             }
             reasons = compact_reason_codes(reasons);
+            let exact_symbols = exact_symbol_matches(file, &relevance);
+            if exact_symbols.len() > 1 {
+                for symbol in exact_symbols {
+                    if results.len() >= max_results || used >= budget_chars {
+                        break;
+                    }
+                    let remaining = budget_chars.saturating_sub(used);
+                    let (excerpt_start, excerpt_end) =
+                        excerpt_lines_with_count(symbol.start_line, file.line_count, 6);
+                    let (preview, start_line, end_line, _complete_symbol) = render_context_preview(
+                        file,
+                        excerpt_start,
+                        excerpt_end,
+                        Some((symbol.start_line, symbol.end_line)),
+                        symbol_detail,
+                        true,
+                        remaining,
+                    );
+                    if matches!(symbol_detail, SymbolDetail::Auto)
+                        && preview.as_ref().is_none_or(String::is_empty)
+                    {
+                        continue;
+                    }
+                    used += preview.as_ref().map_or(0, String::len);
+                    let handle = encode_handle(&RangeHandle {
+                        version: 1,
+                        workspace_id: workspace_id.to_owned(),
+                        path: file.path.clone(),
+                        start_line,
+                        end_line,
+                        content_hash: file.hash.clone(),
+                        symbol: Some(symbol.name.clone()),
+                    })?;
+                    let mut symbol_reasons = reasons.clone();
+                    symbol_reasons.push("multi_symbol_match".to_owned());
+                    let symbol_reasons = compact_reason_codes(symbol_reasons);
+                    let group = context_group(&file.document_type, &symbol_reasons);
+                    *groups.entry(group.clone()).or_default() += 1;
+                    results.push(SearchMatch {
+                        path: file.path.clone(),
+                        start_line,
+                        end_line,
+                        preview,
+                        document_type: file.document_type.clone(),
+                        score,
+                        group,
+                        reason_codes: symbol_reasons,
+                        handle,
+                        chunk_kind: None,
+                        complete_symbol: None,
+                    });
+                }
+                if results.len() >= max_results || used >= budget_chars {
+                    break;
+                }
+                continue;
+            }
             let symbol = file
                 .symbols
                 .iter()
@@ -1137,7 +1171,7 @@ impl CodeIndex {
                 exact_symbol,
                 remaining,
             );
-            if matches!(symbol_detail, SymbolDetail::Excerpt | SymbolDetail::Auto)
+            if matches!(symbol_detail, SymbolDetail::Auto)
                 && preview.as_ref().is_none_or(String::is_empty)
             {
                 continue;
@@ -1202,6 +1236,7 @@ impl CodeIndex {
             neutral,
             relevance,
             query_lower,
+            literal_phrases,
             dirty,
             recent_mutations,
             min_score,
@@ -1259,6 +1294,7 @@ impl CodeIndex {
                 required,
                 neutral,
                 relevance,
+                literal_phrases,
                 dirty,
                 recent_mutations,
                 (filename_score, filename_reason),
@@ -1290,9 +1326,66 @@ impl CodeIndex {
             if results.len() >= max_results || used >= budget_chars {
                 break;
             }
-            // Render the chunk enclosing the match, so the excerpt is a whole
-            // symbol rather than a fixed line window.
             let match_line = byte_to_line(&hit.file.line_starts, hit.first);
+            let reasons = compact_reason_codes(hit.reasons.clone());
+            let exact_symbols = exact_symbol_matches(hit.file, relevance);
+            if exact_symbols.len() > 1 {
+                for symbol in exact_symbols {
+                    if results.len() >= max_results || used >= budget_chars {
+                        break;
+                    }
+                    let remaining = budget_chars.saturating_sub(used);
+                    let (excerpt_start, excerpt_end) =
+                        excerpt_lines_with_count(symbol.start_line, hit.file.line_count, 6);
+                    let (preview, start_line, end_line, complete_symbol) = render_context_preview(
+                        hit.file,
+                        excerpt_start,
+                        excerpt_end,
+                        Some((symbol.start_line, symbol.end_line)),
+                        symbol_detail,
+                        true,
+                        remaining,
+                    );
+                    if matches!(symbol_detail, SymbolDetail::Auto)
+                        && preview.as_ref().is_none_or(String::is_empty)
+                    {
+                        continue;
+                    }
+                    used += preview.as_ref().map_or(0, String::len);
+                    let chunk = hit.file.chunks().iter().find(|chunk| {
+                        chunk.start_line <= symbol.start_line && chunk.end_line >= symbol.end_line
+                    });
+                    let handle = encode_handle(&RangeHandle {
+                        version: 1,
+                        workspace_id: workspace_id.to_owned(),
+                        path: hit.file.path.clone(),
+                        start_line,
+                        end_line,
+                        content_hash: hit.file.hash.clone(),
+                        symbol: Some(symbol.name.clone()),
+                    })?;
+                    let mut symbol_reasons = reasons.clone();
+                    symbol_reasons.push("multi_symbol_match".to_owned());
+                    let symbol_reasons = compact_reason_codes(symbol_reasons);
+                    let group = context_group(&hit.file.document_type, &symbol_reasons);
+                    *groups.entry(group.clone()).or_default() += 1;
+                    results.push(SearchMatch {
+                        path: hit.file.path.clone(),
+                        start_line,
+                        end_line,
+                        preview,
+                        document_type: hit.file.document_type.clone(),
+                        score: hit.score,
+                        group,
+                        reason_codes: symbol_reasons,
+                        handle,
+                        chunk_kind: chunk.map(|chunk| chunk_kind_label(chunk.kind).to_owned()),
+                        complete_symbol: Some(complete_symbol),
+                    });
+                }
+                continue;
+            }
+
             let chunk = hit
                 .file
                 .chunks()
@@ -1302,28 +1395,31 @@ impl CodeIndex {
             let Some(chunk) = chunk else {
                 continue;
             };
-
-            // Render the whole chunk when it fits the line cap (so small symbols
-            // come back complete); for a larger symbol fall back to a window
-            // centered on the match, so the excerpt stays relevant and the budget
-            // is not blown by one big definition.
-            let chunk_span = chunk.end_line.saturating_sub(chunk.start_line) + 1;
-            let (render_start, render_end) = if chunk_span <= MAX_RENDER_LINES {
-                (chunk.start_line.max(1), chunk.end_line.max(1))
-            } else {
-                excerpt_lines_with_count(match_line, hit.file.line_count, MAX_RENDER_LINES / 2)
-            };
+            let exact_symbol = reasons.iter().any(|reason| reason == "exact_symbol");
+            let exact_declaration = exact_symbols.first().copied();
+            let symbol_range = exact_declaration
+                .map(|symbol| (symbol.start_line, symbol.end_line))
+                .or_else(|| {
+                    chunk
+                        .symbol
+                        .as_ref()
+                        .map(|_| (chunk.start_line, chunk.end_line))
+                });
+            let symbol_span = symbol_range
+                .map(|(start, end)| end.saturating_sub(start) + 1)
+                .unwrap_or(0);
+            let wants_complete = symbol_detail == SymbolDetail::Complete
+                || (symbol_detail == SymbolDetail::Auto && exact_symbol);
+            let (render_start, render_end) =
+                if wants_complete && symbol_span > 0 && symbol_span <= MAX_RENDER_LINES {
+                    symbol_range.expect("checked symbol range")
+                } else {
+                    excerpt_lines_with_count(match_line, hit.file.line_count, 6)
+                };
             let remaining = budget_chars.saturating_sub(used);
             if remaining == 0 {
                 break;
             }
-            let reasons = hit.reasons.clone();
-            let reasons = compact_reason_codes(reasons);
-            let exact_symbol = reasons.iter().any(|reason| reason == "exact_symbol");
-            let symbol_range = chunk
-                .symbol
-                .as_ref()
-                .map(|_| (chunk.start_line, chunk.end_line));
             let (preview, start_line, end_line, complete_symbol) = render_context_preview(
                 hit.file,
                 render_start,
@@ -1333,7 +1429,7 @@ impl CodeIndex {
                 exact_symbol,
                 remaining,
             );
-            if matches!(symbol_detail, SymbolDetail::Excerpt | SymbolDetail::Auto)
+            if matches!(symbol_detail, SymbolDetail::Auto)
                 && preview.as_ref().is_none_or(String::is_empty)
             {
                 continue;
@@ -1346,7 +1442,9 @@ impl CodeIndex {
                 start_line,
                 end_line,
                 content_hash: hit.file.hash.clone(),
-                symbol: chunk.symbol.clone(),
+                symbol: exact_declaration
+                    .map(|symbol| symbol.name.clone())
+                    .or_else(|| chunk.symbol.clone()),
             })?;
             let group = context_group(&hit.file.document_type, &reasons);
             *groups.entry(group.clone()).or_default() += 1;
@@ -1512,7 +1610,7 @@ impl CodeIndex {
             if !reference_scope_allows(reference_scope, file) {
                 continue;
             }
-            let mut windows: Vec<(usize, usize, usize)> = Vec::new();
+            let mut windows: Vec<(usize, usize, usize, &'static str)> = Vec::new();
             let mut lines_in_current_window = 0usize;
             for (index, line) in file.content.lines().enumerate() {
                 let line_number = index + 1;
@@ -1531,25 +1629,29 @@ impl CodeIndex {
                 }
                 let start = index.saturating_sub(context_lines) + 1;
                 let end = (index + context_lines + 1).min(file.line_count);
-                if let Some((_, _, previous_end)) = windows.last_mut() {
+                if let Some((_, _, previous_end, previous_kind)) = windows.last_mut() {
                     if start <= previous_end.saturating_add(1) && lines_in_current_window < 3 {
                         *previous_end = (*previous_end).max(end);
+                        if reference_kind_priority(kind) < reference_kind_priority(previous_kind) {
+                            *previous_kind = kind;
+                        }
                         lines_in_current_window += 1;
                         continue;
                     }
                 }
-                windows.push((line_number, start, end));
+                windows.push((line_number, start, end, kind));
                 lines_in_current_window = 1;
             }
             total_windows += windows.len();
+            windows.sort_by(|a, b| {
+                reference_kind_priority(a.3)
+                    .cmp(&reference_kind_priority(b.3))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
             let mut file_results = VecDeque::new();
-            for (line_number, start, end) in windows.into_iter().take(per_file_limit) {
-                let line = file
-                    .content
-                    .lines()
-                    .nth(line_number.saturating_sub(1))
-                    .unwrap_or_default();
-                let reference_kind = classify_reference_kind(file, line, symbol_name);
+            for (line_number, start, end, reference_kind) in
+                windows.into_iter().take(per_file_limit)
+            {
                 let classification_evidence =
                     if file.language != "text" && file.language != "markdown" {
                         "syntactic"
@@ -1576,14 +1678,22 @@ impl CodeIndex {
                     "evidence": "lexical",
                     "classification_evidence": classification_evidence,
                     "reference_kind": reference_kind,
-                    "score": 1.0,
-                    "reason_codes": ["reference_match"]
+                    "score": reference_kind_score(reference_kind),
+                    "reason_codes": [format!("{reference_kind}_reference")]
                 }));
             }
             if !file_results.is_empty() {
                 groups.push(file_results);
             }
         }
+        groups.sort_by_key(|group| {
+            group
+                .front()
+                .and_then(|result| result.get("reference_kind"))
+                .and_then(serde_json::Value::as_str)
+                .map(reference_kind_priority)
+                .unwrap_or(u8::MAX)
+        });
         let mut results = Vec::new();
         while results.len() < max_results {
             let mut added = false;
@@ -1746,6 +1856,25 @@ fn normalized_terms(values: &[String]) -> Vec<String> {
 /// Render a ranked result without changing its range/handle contract. `complete`
 /// intentionally omits a partial body when the declaration cannot fit; callers
 /// can follow the handle with `code_fetch`.
+fn exact_symbol_matches<'a>(file: &'a FileEntry, relevance: &[String]) -> Vec<&'a Symbol> {
+    let mut matches = Vec::new();
+    for term in relevance {
+        if let Some(symbol) = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name.to_ascii_lowercase() == *term)
+        {
+            if !matches.iter().any(|existing: &&Symbol| {
+                existing.start_line == symbol.start_line && existing.end_line == symbol.end_line
+            }) {
+                matches.push(symbol);
+            }
+        }
+    }
+    matches.sort_by_key(|symbol| symbol.start_line);
+    matches
+}
+
 fn render_context_preview(
     file: &FileEntry,
     excerpt_start: usize,
@@ -1806,6 +1935,29 @@ fn reference_scope_allows(scope: &str, file: &FileEntry) -> bool {
 /// Tree-sitter is the parser used to index this file. This lightweight node
 /// classification intentionally stays conservative: resolution remains lexical
 /// until the optional LSP backend supplies a semantic target.
+fn reference_kind_priority(kind: &str) -> u8 {
+    match kind {
+        "declaration" => 0,
+        "call" => 1,
+        "write" => 2,
+        "type" => 3,
+        "import" => 4,
+        "read" => 5,
+        _ => 6,
+    }
+}
+
+fn reference_kind_score(kind: &str) -> f64 {
+    match kind {
+        "declaration" | "call" => 1.0,
+        "write" => 0.9,
+        "type" => 0.85,
+        "import" => 0.75,
+        "read" => 0.65,
+        _ => 0.5,
+    }
+}
+
 fn classify_reference_kind(file: &FileEntry, line: &str, symbol: &str) -> &'static str {
     let trimmed = line.trim();
     if trimmed.starts_with("use ")
@@ -1835,6 +1987,47 @@ fn classify_reference_kind(file: &FileEntry, line: &str, symbol: &str) -> &'stat
     }
 }
 
+fn qualified_symbol_parts(name: &str) -> Option<(&str, &str)> {
+    let dot = name.rfind('.').map(|index| (index, 1));
+    let colon = name.rfind("::").map(|index| (index, 2));
+    let (index, width) = match (dot, colon) {
+        (Some(dot), Some(colon)) => {
+            if dot.0 > colon.0 {
+                dot
+            } else {
+                colon
+            }
+        }
+        (Some(dot), None) => dot,
+        (None, Some(colon)) => colon,
+        (None, None) => return None,
+    };
+    let qualifier = &name[..index];
+    let leaf = &name[index + width..];
+    (!qualifier.is_empty() && !leaf.is_empty()).then_some((qualifier, leaf))
+}
+
+fn symbol_matches_qualified_name(file: &FileEntry, symbol: &Symbol, requested: &str) -> bool {
+    if symbol.name == requested {
+        return true;
+    }
+    let Some((qualifier, leaf)) = qualified_symbol_parts(requested) else {
+        return false;
+    };
+    if symbol.name != leaf {
+        return false;
+    }
+    let owner = qualified_symbol_parts(qualifier)
+        .map(|(_, leaf)| leaf)
+        .unwrap_or(qualifier);
+    file.symbols.iter().any(|candidate| {
+        candidate.name == owner
+            && candidate.start_line <= symbol.start_line
+            && candidate.end_line >= symbol.end_line
+            && (candidate.start_line < symbol.start_line || candidate.end_line > symbol.end_line)
+    })
+}
+
 fn file_matches_term(file: &FileEntry, term: &str) -> bool {
     file.search_content.contains(term)
         || file.path_lower.contains(term)
@@ -1851,6 +2044,7 @@ fn base_file_score(
     required: &[String],
     neutral: &[String],
     relevance: &[String],
+    literal_phrases: &[String],
     dirty: &HashSet<String>,
     recent_mutations: &HashSet<String>,
     layer: (f64, Option<&str>),
@@ -1867,6 +2061,17 @@ fn base_file_score(
         score += 60.0;
         reasons.push("exact_phrase".to_owned());
         first = lower.find(query_lower);
+    }
+    for phrase in literal_phrases {
+        if path_lower.contains(phrase) {
+            score += 120.0;
+            reasons.push("exact_path_literal".to_owned());
+            first = first.or(Some(0));
+        } else if lower.contains(phrase) {
+            score += 85.0;
+            reasons.push("exact_literal".to_owned());
+            first = first.or_else(|| lower.find(phrase));
+        }
     }
     for term in required {
         if file_matches_term(file, term) {
@@ -1940,29 +2145,26 @@ fn base_file_score(
         "source" => score *= 1.1,
         _ => {}
     }
-    if implementation_intent(query_lower) {
-        match file.lifecycle.as_str() {
-            "historical_plan" => {
-                score -= 45.0;
-                reasons.push("historical_plan".to_owned());
-            }
-            "active_plan" => score -= 8.0,
-            _ => {}
-        }
-        if file.document_type == "source" && !file.path.starts_with("docs/") {
-            score += 6.0;
-            reasons.push("implementation_authority".to_owned());
-        }
-        if canonical_configuration_path(&file.path) {
-            score += 8.0;
-            reasons.push("canonical_config".to_owned());
-        }
-    }
     if score <= 0.0 {
         return None;
     }
     let size_units = file.content.len().max(100) as f64 / 8_192.0;
     score /= 1.0 + size_units.ln_1p().min(4.0) * 0.18;
+
+    let exact_symbol = reasons.iter().any(|reason| reason == "exact_symbol");
+    let first = if exact_symbol {
+        first
+    } else {
+        best_match_offset(
+            file,
+            query_lower,
+            required,
+            neutral,
+            relevance,
+            literal_phrases,
+        )
+        .or(first)
+    };
 
     Some(BaseFileScore {
         score,
@@ -1971,37 +2173,110 @@ fn base_file_score(
     })
 }
 
-fn implementation_intent(query_lower: &str) -> bool {
-    if ["documentation", "history", "historical", "plan", "plans"]
-        .iter()
-        .any(|word| query_lower.contains(word))
-    {
-        return false;
+fn quoted_phrases(query: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    for delimiter in ['"', '\'', '`'] {
+        let mut rest = query;
+        while let Some(start) = rest.find(delimiter) {
+            let after = &rest[start + delimiter.len_utf8()..];
+            let Some(end) = after.find(delimiter) else {
+                break;
+            };
+            let phrase = after[..end].trim().to_ascii_lowercase();
+            if phrase.len() >= 3
+                && (phrase.contains(' ') || phrase.contains('/') || phrase.contains('.'))
+            {
+                phrases.push(phrase);
+            }
+            rest = &after[end + delimiter.len_utf8()..];
+        }
     }
-    [
-        "implement",
-        "implementation",
-        "owner",
-        "ownership",
-        "resolve",
-        "resolution",
-        "runtime",
-        "error",
-        "where",
-        "persist",
-        "fallback",
-    ]
-    .iter()
-    .any(|word| query_lower.contains(word))
+    phrases.sort();
+    phrases.dedup();
+    phrases
 }
 
-fn canonical_configuration_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    (lower.contains("/config/")
-        || lower.ends_with(".toml")
-        || lower.ends_with(".yaml")
-        || lower.ends_with(".yml"))
-        && !lower.ends_with(".lock")
+fn best_match_offset(
+    file: &FileEntry,
+    query_lower: &str,
+    required: &[String],
+    neutral: &[String],
+    relevance: &[String],
+    literal_phrases: &[String],
+) -> Option<usize> {
+    let lines = file.search_content.lines().collect::<Vec<_>>();
+    let mut best: Option<(f64, usize)> = None;
+
+    for (index, line) in lines.iter().enumerate() {
+        let direct_match = (!query_lower.is_empty() && line.contains(query_lower))
+            || literal_phrases.iter().any(|phrase| line.contains(phrase))
+            || required.iter().any(|term| line.contains(term))
+            || neutral.iter().any(|term| line.contains(term))
+            || relevance.iter().any(|term| line.contains(term));
+        if !direct_match {
+            continue;
+        }
+
+        let start = index.saturating_sub(6);
+        let end = (index + 7).min(lines.len());
+        let window = lines[start..end].join("\n");
+        let mut score = 0.0;
+        if !query_lower.is_empty() && window.contains(query_lower) {
+            score += 40.0;
+        }
+        for phrase in literal_phrases {
+            if window.contains(phrase) {
+                score += 60.0;
+            }
+            if line.contains(phrase) {
+                score += 20.0;
+            }
+        }
+        for term in required {
+            if window.contains(term) {
+                score += 16.0;
+            }
+            if line.contains(term) {
+                score += 5.0;
+            }
+        }
+        for term in relevance {
+            if window.contains(term) {
+                score += 8.0;
+            }
+            if line.contains(term) {
+                score += 3.0;
+            }
+        }
+        for term in neutral {
+            if window.contains(term) {
+                score += 2.0;
+            }
+        }
+        if file
+            .symbols
+            .iter()
+            .any(|symbol| symbol.start_line == index + 1)
+        {
+            score += 4.0;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("import ")
+            || trimmed.starts_with("from ")
+            || trimmed.starts_with("use ")
+            || trimmed.starts_with("#include")
+        {
+            score *= 0.45;
+        }
+
+        match best {
+            Some((best_score, best_index))
+                if score < best_score || (score == best_score && index >= best_index) => {}
+            _ => best = Some((score, index)),
+        }
+    }
+
+    best.map(|(_, index)| line_start_byte(&file.content, index + 1))
 }
 
 fn context_group(document_type: &str, reasons: &[String]) -> String {

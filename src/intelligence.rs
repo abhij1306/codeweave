@@ -184,33 +184,177 @@ impl LspClient {
 }
 
 fn path_uri(path: &Path) -> String {
+    let mut raw = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = raw.strip_prefix("//?/UNC/") {
+        raw = format!("//{rest}");
+    } else if let Some(rest) = raw.strip_prefix("//?/") {
+        raw = rest.to_owned();
+    }
+
+    if let Some(unc) = raw.strip_prefix("//") {
+        let (authority, path) = unc.split_once('/').unwrap_or((unc, ""));
+        return format!(
+            "file://{}/{}",
+            percent_encode_uri_component(authority, false),
+            percent_encode_uri_component(path, true)
+        );
+    }
+
     format!(
         "file:///{}",
-        path.to_string_lossy()
-            .replace('\\', "/")
-            .trim_start_matches('/')
-            .replace(' ', "%20")
+        percent_encode_uri_component(raw.trim_start_matches('/'), true)
     )
 }
+
+fn percent_encode_uri_component(value: &str, preserve_path_separators: bool) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+        if unreserved || (preserve_path_separators && matches!(byte, b'/' | b':')) {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    encoded
+}
+
+fn percent_decode_uri(value: &str) -> AppResult<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(AppError::new(
+                    "INVALID_LSP_URI",
+                    "LSP file URI contains an incomplete percent escape",
+                ));
+            }
+            let pair = std::str::from_utf8(&bytes[index + 1..index + 3]).map_err(|_| {
+                AppError::new("INVALID_LSP_URI", "LSP file URI contains invalid UTF-8")
+            })?;
+            let byte = u8::from_str_radix(pair, 16).map_err(|_| {
+                AppError::new(
+                    "INVALID_LSP_URI",
+                    "LSP file URI contains an invalid percent escape",
+                )
+            })?;
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| AppError::new("INVALID_LSP_URI", "LSP file URI is not valid UTF-8"))
+}
+
+fn path_within_root(path: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let path = path
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase();
+        let root = root
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase();
+        path == root
+            || path
+                .strip_prefix(&root)
+                .is_some_and(|remaining| remaining.starts_with('\\'))
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(root)
+    }
+}
+
 fn uri_path(root: &Path, uri: &str) -> AppResult<PathBuf> {
     let raw = uri
-        .strip_prefix("file:///")
-        .ok_or_else(|| AppError::new("UNSUPPORTED_LSP_URI", "LSP returned a non-file URI"))?
-        .replace("%20", " ");
-    let path = PathBuf::from(raw);
-    let path = if path.is_absolute() {
-        path
-    } else {
-        PathBuf::from(format!("/{}", path.display()))
+        .strip_prefix("file://")
+        .ok_or_else(|| AppError::new("UNSUPPORTED_LSP_URI", "LSP returned a non-file URI"))?;
+    let decoded = percent_decode_uri(raw)?;
+
+    #[cfg(windows)]
+    let path = {
+        let normalized = decoded.replace('/', "\\");
+        if !raw.starts_with('/') {
+            PathBuf::from(format!("\\\\{normalized}"))
+        } else if normalized.len() >= 3
+            && normalized.starts_with('\\')
+            && normalized.as_bytes()[2] == b':'
+        {
+            PathBuf::from(&normalized[1..])
+        } else {
+            PathBuf::from(normalized)
+        }
     };
+    #[cfg(not(windows))]
+    let path = PathBuf::from(decoded);
+
     let canonical = path.canonicalize()?;
-    if !canonical.starts_with(root) {
+    let canonical_root = root.canonicalize()?;
+    if !path_within_root(&canonical, &canonical_root) {
         return Err(AppError::new(
             "OUTSIDE_ROOT",
             "LSP result is outside the workspace",
         ));
     }
     Ok(canonical)
+}
+
+fn workspace_relative_path(root: &Path, path: &Path) -> AppResult<String> {
+    let canonical_root = root.canonicalize()?;
+    let canonical_path = path.canonicalize()?;
+    if !path_within_root(&canonical_path, &canonical_root) {
+        return Err(AppError::new(
+            "OUTSIDE_ROOT",
+            "LSP result is outside the workspace",
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        let root = canonical_root
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_owned();
+        let path = canonical_path
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_owned();
+        let relative = if path.eq_ignore_ascii_case(&root) {
+            ""
+        } else {
+            path.get(root.len()..).ok_or_else(|| {
+                AppError::new(
+                    "OUTSIDE_ROOT",
+                    "LSP result could not be made workspace-relative",
+                )
+            })?
+        };
+        Ok(relative.trim_start_matches('\\').replace('\\', "/"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let relative = canonical_path.strip_prefix(&canonical_root).map_err(|_| {
+            AppError::new(
+                "OUTSIDE_ROOT",
+                "LSP result could not be made workspace-relative",
+            )
+        })?;
+        Ok(relative.to_string_lossy().replace('\\', "/"))
+    }
 }
 
 pub trait CodeIntelligenceBackend: Send + Sync {
@@ -514,7 +658,31 @@ fn normalize_locations(root: &Path, value: &Value) -> AppResult<Vec<Value>> {
     } else {
         vec![value.clone()]
     };
-    items.into_iter().map(|item|{let uri=item.get("uri").or_else(||item.get("targetUri")).and_then(Value::as_str).ok_or_else(||AppError::new("INVALID_LSP_RESPONSE","Location lacks URI"))?;let range=item.get("range").or_else(||item.get("targetSelectionRange")).ok_or_else(||AppError::new("INVALID_LSP_RESPONSE","Location lacks range"))?;let path=uri_path(root,uri)?;let relative=path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\',"/");Ok(json!({"path":relative,"line":range["start"]["line"].as_u64().unwrap_or(0)+1,"column":range["start"]["character"],"end_line":range["end"]["line"].as_u64().unwrap_or(0)+1,"end_column":range["end"]["character"],"evidence":"semantic"}))}).collect()
+    let canonical_root = root.canonicalize()?;
+    items
+        .into_iter()
+        .map(|item| {
+            let uri = item
+                .get("uri")
+                .or_else(|| item.get("targetUri"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| AppError::new("INVALID_LSP_RESPONSE", "Location lacks URI"))?;
+            let range = item
+                .get("range")
+                .or_else(|| item.get("targetSelectionRange"))
+                .ok_or_else(|| AppError::new("INVALID_LSP_RESPONSE", "Location lacks range"))?;
+            let path = uri_path(&canonical_root, uri)?;
+            let relative = workspace_relative_path(&canonical_root, &path)?;
+            Ok(json!({
+                "path": relative,
+                "line": range["start"]["line"].as_u64().unwrap_or(0) + 1,
+                "column": range["start"]["character"],
+                "end_line": range["end"]["line"].as_u64().unwrap_or(0) + 1,
+                "end_column": range["end"]["character"],
+                "evidence": "semantic"
+            }))
+        })
+        .collect()
 }
 
 fn utf16_offset(content: &str, line: u64, character: u64) -> AppResult<usize> {
@@ -577,9 +745,10 @@ fn workspace_edit_changes(root: &Path, edit: &Value) -> AppResult<Vec<Value>> {
             "WorkspaceEdit contains no supported text edits",
         ));
     }
+    let canonical_root = root.canonicalize()?;
     let mut output = Vec::new();
     for (uri, edits) in documents {
-        let path = uri_path(root, &uri)?;
+        let path = uri_path(&canonical_root, &uri)?;
         let before = fs::read_to_string(&path)?;
         let mut ranges = Vec::new();
         for item in edits
@@ -614,11 +783,7 @@ fn workspace_edit_changes(root: &Path, edit: &Value) -> AppResult<Vec<Value>> {
         for (start, end, text) in ranges.into_iter().rev() {
             after.replace_range(start..end, &text);
         }
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let relative = workspace_relative_path(&canonical_root, &path)?;
         output.push(json!({"kind":"replace","path":relative,"old_text":before,"new_text":after,"expected_replacements":1,"expected_hash":crate::index::content_hash(&fs::read_to_string(&path)?)}));
     }
     Ok(output)
@@ -666,6 +831,28 @@ mod tests {
             .expect("LSP rename compiles to transaction changes");
         assert!(!changes.is_empty());
         assert_eq!(client.status()["readiness"], "ready");
+    }
+
+    #[test]
+    fn file_uri_round_trips_spaces_and_unicode() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("café sample.py");
+        fs::write(&path, "value = 1\n").unwrap();
+
+        let uri = path_uri(&path);
+        assert!(uri.contains("%20"));
+        assert!(uri.contains("%C3%A9"));
+        assert_eq!(
+            uri_path(root.path(), &uri).unwrap(),
+            path.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_uri_strips_windows_verbatim_prefix() {
+        let uri = path_uri(Path::new(r"\\?\C:\Projects\Code Weave\sample.py"));
+        assert_eq!(uri, "file:///C:/Projects/Code%20Weave/sample.py");
     }
 
     #[test]

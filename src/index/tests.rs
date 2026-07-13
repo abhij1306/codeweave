@@ -927,3 +927,210 @@ fn v1_ranking_omits_chunk_fields() {
     assert!(top.get("chunk_kind").is_none());
     assert!(top.get("complete_symbol").is_none());
 }
+
+#[test]
+fn context_returns_each_exact_symbol_requested_from_one_file() {
+    for ranking in [Ranking::V1, Ranking::V2] {
+        let mut index = CodeIndex::default();
+        index.insert_entry(test_entry(
+            "src/contracts.rs",
+            "pub struct ExtractionRequest { pub url: String }\n\npub struct ExtractionResult { pub title: String }\n",
+        ));
+
+        let result = index
+            .context(ContextParams {
+                workspace_id: "main",
+                snapshot_id: "snap_test",
+                query: "ExtractionRequest ExtractionResult",
+                terms: &[],
+                required_terms: &[],
+                optional_terms: &[],
+                exclude_terms: &[],
+                document_types: &[],
+                min_score: 0.0,
+                path_filters: &[],
+                evidence: &[],
+                dirty: &HashSet::new(),
+                recent_mutations: &HashSet::new(),
+                budget_chars: 10_000,
+                max_results: 5,
+                symbol_detail: SymbolDetail::Auto,
+                ranking,
+            })
+            .unwrap();
+
+        assert_eq!(result["result_count"], 2, "ranking: {ranking:?}");
+        let previews = result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["preview"].as_str())
+            .collect::<Vec<_>>();
+        assert!(previews
+            .iter()
+            .any(|preview| preview.contains("ExtractionRequest")));
+        assert!(previews
+            .iter()
+            .any(|preview| preview.contains("ExtractionResult")));
+    }
+}
+
+#[test]
+fn context_prioritizes_quoted_runtime_error_text() {
+    let mut index = CodeIndex::default();
+    index.insert_entry(test_entry(
+        "src/browser_pool.rs",
+        "fn open_page() { panic!(\"Browser runtime failed to initialize\"); }\n",
+    ));
+    index.insert_entry(test_entry(
+        "docs/browser-notes.md",
+        "browser runtime browser runtime failed initialize failed initialize\n",
+    ));
+
+    let result = index
+        .context(ContextParams {
+            workspace_id: "main",
+            snapshot_id: "snap_test",
+            query: "where is \"Browser runtime failed to initialize\" emitted",
+            terms: &[],
+            required_terms: &[],
+            optional_terms: &[],
+            exclude_terms: &[],
+            document_types: &[],
+            min_score: 0.0,
+            path_filters: &[],
+            evidence: &[],
+            dirty: &HashSet::new(),
+            recent_mutations: &HashSet::new(),
+            budget_chars: 10_000,
+            max_results: 5,
+            symbol_detail: SymbolDetail::Auto,
+            ranking: Ranking::V2,
+        })
+        .unwrap();
+
+    assert_eq!(result["results"][0]["path"], "src/browser_pool.rs");
+    assert!(result["results"][0]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "exact_literal"));
+}
+
+#[test]
+fn context_centers_excerpt_on_best_local_term_coverage() {
+    let mut body = String::from("from acquisition.browser import browser_fallback\n");
+    for line in 0..20 {
+        body.push_str(&format!("# unrelated setup {line}\n"));
+    }
+    body.push_str("def consume_remaining_budget():\n");
+    body.push_str("    browser_fallback.consume_shared_retry_budget()\n");
+    let mut index = CodeIndex::default();
+    index.insert_entry(test_entry("src/fetch_context.py", &body));
+
+    let result = index
+        .context(ContextParams {
+            workspace_id: "main",
+            snapshot_id: "snap_test",
+            query: "browser fallback shared retry budget",
+            terms: &[],
+            required_terms: &[],
+            optional_terms: &[],
+            exclude_terms: &[],
+            document_types: &[],
+            min_score: 0.0,
+            path_filters: &[],
+            evidence: &[],
+            dirty: &HashSet::new(),
+            recent_mutations: &HashSet::new(),
+            budget_chars: 10_000,
+            max_results: 5,
+            symbol_detail: SymbolDetail::Auto,
+            ranking: Ranking::V2,
+        })
+        .unwrap();
+
+    let first = &result["results"][0];
+    assert!(first["start_line"].as_u64().unwrap() > 1);
+    assert!(first["preview"]
+        .as_str()
+        .unwrap()
+        .contains("consume_shared_retry_budget"));
+}
+
+#[test]
+fn v2_lexical_context_uses_a_bounded_excerpt() {
+    let mut body = String::from("pub fn orchestrate_acquisition() {\n");
+    for line in 0..40 {
+        if line == 20 {
+            body.push_str("    // browser fallback shares the retry budget\n");
+        } else {
+            body.push_str(&format!("    // implementation detail {line}\n"));
+        }
+    }
+    body.push_str("}\n");
+    let mut index = CodeIndex::default();
+    index.insert_entry(test_entry("src/acquisition.rs", &body));
+
+    let result = index
+        .context(ContextParams {
+            workspace_id: "main",
+            snapshot_id: "snap_test",
+            query: "how does browser fallback share retry budget",
+            terms: &[],
+            required_terms: &[],
+            optional_terms: &[],
+            exclude_terms: &[],
+            document_types: &[],
+            min_score: 0.0,
+            path_filters: &[],
+            evidence: &[],
+            dirty: &HashSet::new(),
+            recent_mutations: &HashSet::new(),
+            budget_chars: 10_000,
+            max_results: 5,
+            symbol_detail: SymbolDetail::Auto,
+            ranking: Ranking::V2,
+        })
+        .unwrap();
+
+    let preview = result["results"][0]["preview"].as_str().unwrap();
+    assert!(preview.lines().count() <= 13);
+    assert_eq!(result["results"][0]["complete_symbol"], false);
+    assert!(preview.contains("browser fallback"));
+}
+
+#[test]
+fn lexical_reference_search_prioritizes_calls_over_imports() {
+    let mut index = CodeIndex::default();
+    index.insert_entry(test_entry("src/owner.rs", "pub fn extract() {}\n"));
+    index.insert_entry(test_entry(
+        "src/a_import.rs",
+        "use crate::owner::extract;\n",
+    ));
+    index.insert_entry(test_entry("src/z_call.rs", "fn run() { extract(); }\n"));
+
+    let result = index
+        .search(SearchParams {
+            workspace_id: "main",
+            snapshot_id: "snap_test",
+            mode: "references",
+            query: "extract",
+            path_filters: &[],
+            case_sensitive: true,
+            max_results: 10,
+            context_lines: 0,
+            reference_scope: "all",
+            reference_kinds: &[],
+            definition_path: None,
+            definition_line: None,
+        })
+        .unwrap();
+
+    assert_eq!(result["results"][0]["path"], "src/z_call.rs");
+    assert_eq!(result["results"][0]["reference_kind"], "call");
+    assert!(
+        result["results"][0]["score"].as_f64().unwrap()
+            > result["results"][1]["score"].as_f64().unwrap()
+    );
+}

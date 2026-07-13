@@ -132,8 +132,12 @@ pub(super) fn query_terms(query: &str) -> Vec<String> {
 pub(super) fn compact_reason_codes(mut reasons: Vec<String>) -> Vec<String> {
     const PRIORITY: &[&str] = &[
         "exact_symbol",
+        "exact_path_literal",
+        "exact_literal",
         "exact_phrase",
+        "multi_symbol_match",
         "full_term_coverage",
+        "filename_affinity",
         "required_term",
         "path_match",
         "runtime_evidence",
@@ -147,6 +151,14 @@ pub(super) fn compact_reason_codes(mut reasons: Vec<String>) -> Vec<String> {
     for preferred in PRIORITY {
         if reasons.iter().any(|reason| reason == preferred) {
             compact.push((*preferred).to_owned());
+        }
+        if compact.len() == 3 {
+            return compact;
+        }
+    }
+    for reason in reasons {
+        if !compact.contains(&reason) {
+            compact.push(reason);
         }
         if compact.len() == 3 {
             break;

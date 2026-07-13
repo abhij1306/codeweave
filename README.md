@@ -238,7 +238,7 @@ Detailed guides:
 
 `workspace.artifactPaths` has the opposite purpose: it explicitly indexes configured paths even when normal Git ignore rules would skip them. Do not list the same directory in both settings.
 
-`index.ranking` selects the `code_context` scorer. `"v1"` (default) is the exact-match scorer with short excerpts. `"v2"` adds a filename-affinity boost — so filename and configuration lookups rank the right file first — and renders results bounded to the enclosing symbol (whole symbol when it fits, otherwise a window centered on the match), tagging each result with additive `chunk_kind` and `complete_symbol` fields. The request schema and every other response field are identical between the two modes.
+`code_retrieve` is the single public repository retrieval surface. The calling agent selects explicit operations for filename discovery, symbols, text search, references, outlines, repository maps, or exact reads. CodeWeave performs those operations deterministically and can batch up to 12 of them in one call.
 
 `intelligence` configures optional persistent language servers. Disabled adapters retain tree-sitter and lexical behavior. Enabled adapters start lazily on the first `code_intelligence` request and restart once after failure. CodeWeave never installs these executables automatically; run `codeweave doctor --config config.json` after changing their paths.
 
@@ -252,8 +252,8 @@ This execution surface is trusted-client functionality, not a sandbox. File tool
 
 `server.toolProfile` selects which tools the server advertises and accepts. It is resolved once at startup from a single tool registry that is the sole source of truth for every advertised tool:
 
-- `full` (default) — all 27 tools.
-- `read-only` — read/search/inspect only: `workspace`, `code_context`, `code_capabilities`, `code_fetch`, `code_search`, `code_preview`, and the read-only git tools (`git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`). No writes, no bash.
+- `full` (default) — all 26 tools.
+- `read-only` — read/search/inspect only, including `workspace`, `code_retrieve`, `code_capabilities`, `code_intelligence`, `code_preview`, and the read-only git tools. No writes, no bash.
 - `edit` — read plus in-repo writes (`code_write`/`code_replace`/…/`code_transaction`, `git_stage`/`git_commit`/`git_restore`), but no `bash` and no network-facing `git_push`.
 - `custom` — start from the full set and refine with `"tools": { "include": [...], "exclude": [...] }`. A non-empty `include` is an allowlist; `exclude` subtracts. Unknown tool names fail startup.
 
@@ -274,15 +274,13 @@ Never commit `config.json`, `.mcp-token`, tunnel credentials, generated caches, 
 | Tool | Purpose |
 | --- | --- |
 | `workspace` | Summarize the configured repository, refresh its index, report diagnostics, and inspect session changes |
-| `code_context` | Retrieve ranked semantic and syntax-aware context |
-| `code_capabilities` | Inspect supported search modes, fetch kinds, edit capabilities, limits, and known limitations |
-| `code_search` | Search text, regex, filenames, symbols, references, outlines, or the repository map |
-| `code_fetch` | Read exact files, line ranges, symbols, handles, continuations, Bash status, and Bash logs |
+| `code_retrieve` | Discover and read repository evidence with explicit batched operations |
+| `code_capabilities` | Inspect retrieval, intelligence, editing, execution, and limit contracts |
 | `code_preview` | Preview a multi-file edit transaction and return the diff without writing files |
 | `code_transaction` | Apply a multi-file edit transaction with preconditions, validation, diff output, and rollback |
 | `code_write` | Create or overwrite exactly one file |
 | `code_replace` | Replace exact text in exactly one file |
-| `code_replace_range` | Replace the complete line range selected by a fetch handle |
+| `code_replace_range` | Replace the complete line range selected by a retrieval handle |
 | `code_insert` | Insert text relative to a named symbol in one file |
 | `code_delete` | Delete exactly one file |
 | `code_rename` | Rename exactly one file |
@@ -296,16 +294,15 @@ Never commit `config.json`, `.mcp-token`, tunnel credentials, generated caches, 
 
 A typical coding-agent workflow is:
 
-1. Open an approved repository with `workspace`.
-2. Use `code_context` for unfamiliar code.
-3. Locate exact definitions with `code_search`; use `references` for indexed symbol call-site discovery rather than regex.
-4. Read only the required ranges with `code_fetch`; use `response_detail: "compact"` or `metadata` items when full debug fields or content are unnecessary.
+1. Open the configured repository with `workspace` and inspect `code_capabilities` when needed.
+2. Decompose the task in the calling agent, then issue one `code_retrieve` batch containing explicit `find_file`, `find_symbol`, `search_text`, `find_references`, `symbols_overview`, `repo_map`, or `read` operations.
+3. Use `read` operations for exact files, ranges, symbols, metadata, handles, continuations, or retained Bash output.
+4. Use `code_intelligence` only when semantic definition, reference, diagnostic, or rename-preview evidence is required.
 5. Preview multi-file edits with `code_preview`, then apply with `code_transaction` or a narrow write wrapper.
 6. Run focused checks with `bash` and inspect retained output with `bash_status` or `bash_output`.
 7. Review the final state with `git_status` and `git_diff`.
 
 See [docs/implementation.md](docs/implementation.md) and [docs/tools.md](docs/tools.md).
-
 ## Security
 
 CodeWeave can read and modify source code and run arbitrary Bash commands as its operating-system user. Treat every connected App or Connector as a trusted coding agent.

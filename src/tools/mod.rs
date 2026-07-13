@@ -127,40 +127,23 @@ pub fn registry() -> &'static [ToolDefinition] {
             input_schema: workspace::workspace,
         },
         ToolDefinition {
-            name: "code_context",
-            title: "Ranked Code Context",
-            description: "Find relevant code for a task. Pass short identifiers or concepts using terms, required_terms, optional_terms, exclude_terms, and document_types.",
+            name: "code_retrieve",
+            title: "Code Retrieval",
+            description: "Use this single tool for all repository discovery and exact reads. Submit one or more explicit operations: find_file, find_symbol, search_text, find_references, symbols_overview, repo_map, or read.",
             safety: ToolSafety::Read,
             profiles: &[ReadOnly, Edit],
-            input_schema: retrieval::code_context,
+            input_schema: retrieval::code_retrieve,
         },
         ToolDefinition {
             name: "code_capabilities",
             title: "CodeWeave Capabilities",
-            description: "Return supported search modes, fetch kinds, edit capabilities, limits, workspace identity, and known limitations.",
+            description: "Return the code_retrieve operation contract, edit capabilities, limits, workspace identity, and known limitations.",
             safety: ToolSafety::Read,
             profiles: &[ReadOnly, Edit],
             input_schema: retrieval::code_capabilities,
         },
         ToolDefinition {
-            name: "code_fetch",
-            title: "Fetch Exact Code or Logs",
-            description: "Read a file, file range, symbol, Bash log, or previous continuation. For a single file, pass path directly; use items to batch reads.",
-            safety: ToolSafety::Read,
-            profiles: &[ReadOnly, Edit],
-            input_schema: retrieval::code_fetch,
-        },
-        ToolDefinition {
-            name: "code_search",
-            title: "Deterministic Code Search",
-            description: "Search the project by text, regex, filename, symbol, references, outline, or repository map. Filename mode accepts plain substrings or * and ? wildcards. repo_map paths are strict subtree scopes. Literal text search is the default. Note: references mode is lexical (whole-word matches, evidence:\"lexical\"), not a semantic resolver — it may include unrelated same-named identifiers.",
-            safety: ToolSafety::Read,
-            profiles: &[ReadOnly, Edit],
-            input_schema: retrieval::code_search,
-        },
-        ToolDefinition {
-            name: "code_intelligence",
-            title: "Code Intelligence",
+            name: "code_intelligence",            title: "Code Intelligence",
             description: "Resolve definitions, references, diagnostics, or a rename preview through the optional semantic backend. Results always label semantic, syntactic, or lexical evidence.",
             safety: ToolSafety::Read,
             profiles: &[ReadOnly, Edit],
@@ -185,7 +168,7 @@ pub fn registry() -> &'static [ToolDefinition] {
         ToolDefinition {
             name: "code_replace_range",
             title: "Replace Fetched Range in One File",
-            description: "Replace the complete line range selected by a code_fetch handle in exactly one file.",
+            description: "Replace the complete line range selected by a code_retrieve read handle in exactly one file.",
             safety: ToolSafety::WriteClosed,
             profiles: &[Edit],
             input_schema: edits::code_replace_range,
@@ -463,7 +446,7 @@ mod tests {
         let full = names_in(Some(Profile::Full));
         let expected: Vec<String> = registry().iter().map(|t| t.name.to_owned()).collect();
         assert_eq!(full, expected);
-        assert_eq!(full.len(), 28);
+        assert_eq!(full.len(), 26);
     }
 
     #[test]
@@ -473,10 +456,8 @@ mod tests {
             read_only,
             vec![
                 "workspace",
-                "code_context",
+                "code_retrieve",
                 "code_capabilities",
-                "code_fetch",
-                "code_search",
                 "code_intelligence",
                 "code_preview",
                 "git_status",
@@ -517,12 +498,12 @@ mod tests {
     #[test]
     fn custom_include_is_an_allowlist_and_exclude_subtracts() {
         let selection = CustomSelection {
-            include: vec!["code_context".into(), "code_fetch".into()],
-            exclude: vec!["code_fetch".into()],
+            include: vec!["code_retrieve".into(), "code_intelligence".into()],
+            exclude: vec!["code_intelligence".into()],
         };
         let access = resolve_access(None, &selection, true).unwrap();
-        assert!(access.is_allowed("code_context"));
-        assert!(!access.is_allowed("code_fetch"));
+        assert!(access.is_allowed("code_retrieve"));
+        assert!(!access.is_allowed("code_intelligence"));
         assert!(!access.is_allowed("bash"));
     }
 
@@ -552,7 +533,7 @@ mod tests {
         let access =
             resolve_access(Some(Profile::Full), &CustomSelection::default(), true).unwrap();
         let items = access.list_payload().as_array().unwrap();
-        assert_eq!(items.len(), 28);
+        assert_eq!(items.len(), 26);
         for item in items {
             let schema = &item["inputSchema"];
             assert_eq!(schema["type"], "object");

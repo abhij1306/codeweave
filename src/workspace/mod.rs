@@ -2,26 +2,26 @@ mod edit;
 mod fetch;
 mod io_helpers;
 mod journal;
+mod retrieve;
 mod util;
 
 pub use journal::MutationRecord;
 use journal::{load_journal, open_journal, rotate_journal_if_needed};
-use util::{stale_snapshot, summarize_changed_paths, ChangedPathSummary};
+use util::{summarize_changed_paths, ChangedPathSummary};
 
 use crate::bash::{BashSupervisor, StartRequest};
-use crate::index::{
-    content_hash, CodeIndex, ContextParams, Ranking, SearchParams, SymbolDetail,
-    WorkspaceExclusions,
-};
+use crate::index::{content_hash, CodeIndex, SearchParams, WorkspaceExclusions};
 use crate::model::{
     bool_value, required_str, string_list, usize_value, AppError, AppResult, PolicyConfig,
     WorkspaceConfig,
 };
 use crate::repository::{CliGitBackend, RepoStatus, RepositoryBackend};
 use crate::security::{canonical_root, relative_string, validate_relative};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -36,9 +36,82 @@ use std::time::{Duration, Instant};
 const POLL_RECONCILE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Maximum bytes of an instruction file (AGENTS.md/CLAUDE.md) inlined into a summary
-/// response before it is truncated and the caller is pointed at code_fetch.
+/// response before it is truncated and the caller is pointed at a code_retrieve read.
 const INSTRUCTION_INLINE_CAP: usize = 4_096;
 const PROTOCOL_MAX_RESULTS: usize = 200;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GitDiffScope {
+    staged: bool,
+    paths: Vec<String>,
+    symbol: Option<String>,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    hunk_ids: Vec<String>,
+}
+
+impl GitDiffScope {
+    fn from_params(params: &Value) -> Self {
+        Self {
+            staged: bool_value(params, "staged", false),
+            paths: string_list(params, "paths"),
+            symbol: params
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            start_line: params
+                .get("start_line")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+            end_line: params
+                .get("end_line")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+            hunk_ids: string_list(params, "hunk_ids"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GitDiffContinuation {
+    version: u8,
+    snapshot_id: String,
+    offset: usize,
+    scope: GitDiffScope,
+}
+
+fn git_diff_scope_supplied(params: &Value) -> bool {
+    [
+        "paths",
+        "staged",
+        "symbol",
+        "start_line",
+        "end_line",
+        "hunk_ids",
+    ]
+    .iter()
+    .any(|field| params.get(*field).is_some())
+}
+
+fn encode_git_diff_continuation(value: &GitDiffContinuation) -> AppResult<String> {
+    let json = serde_json::to_vec(value)?;
+    Ok(format!("git-diff:v1:{}", URL_SAFE_NO_PAD.encode(json)))
+}
+
+fn decode_git_diff_continuation(value: &str) -> AppResult<GitDiffContinuation> {
+    let payload = value
+        .strip_prefix("git-diff:v1:")
+        .ok_or_else(|| AppError::invalid("Invalid git diff continuation"))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| AppError::invalid("Invalid git diff continuation"))?;
+    let continuation: GitDiffContinuation = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::invalid("Invalid git diff continuation"))?;
+    if continuation.version != 1 {
+        return Err(AppError::invalid("Unsupported git diff continuation"));
+    }
+    Ok(continuation)
+}
 
 fn result_limit(
     params: &Value,
@@ -81,44 +154,6 @@ fn add_result_limits(
         if !warnings.is_empty() {
             object.insert("warnings".to_owned(), Value::Array(warnings));
         }
-    }
-}
-
-/// A deliberately small deterministic vocabulary. This is an opt-in ranking
-/// hint, never an inferred semantic judgement or model call.
-fn should_prioritize_changes(
-    value: Option<&str>,
-    query: &str,
-    evidence: &[String],
-) -> AppResult<bool> {
-    match value.unwrap_or("auto") {
-        "prefer" => Ok(true),
-        "ignore" => Ok(false),
-        "auto" => {
-            if evidence.iter().any(|item| item == "changes") {
-                return Ok(true);
-            }
-            let words = crate::index::query_terms_for_intent(query);
-            Ok(words.iter().any(|word| {
-                matches!(
-                    word.as_str(),
-                    "changed"
-                        | "change"
-                        | "changes"
-                        | "dirty"
-                        | "worktree"
-                        | "unstaged"
-                        | "staged"
-                        | "diff"
-                        | "modified"
-                )
-            }))
-        }
-        other => Err(AppError::details(
-            "INVALID_CHANGE_PRIORITY",
-            "change_priority must be auto, prefer, or ignore",
-            json!({"change_priority": other}),
-        )),
     }
 }
 
@@ -216,7 +251,6 @@ pub struct WorkspaceActor {
     pub name: String,
     root: PathBuf,
     policy: PolicyConfig,
-    ranking: Ranking,
     artifact_paths: Vec<String>,
     exclusions: WorkspaceExclusions,
     index: RwLock<CodeIndex>,
@@ -352,7 +386,6 @@ impl WorkspaceActor {
     pub fn open(
         config: &WorkspaceConfig,
         policy: PolicyConfig,
-        ranking: Ranking,
         cache_root: PathBuf,
     ) -> AppResult<Self> {
         let opened_started = Instant::now();
@@ -467,7 +500,6 @@ impl WorkspaceActor {
             name: config.name.clone(),
             root,
             policy,
-            ranking,
             artifact_paths: config.artifact_paths.clone(),
             exclusions,
             index: RwLock::new(index),
@@ -737,24 +769,14 @@ impl WorkspaceActor {
             "root": self.root,
             "generation": self.generation(),
             "snapshot_id": self.snapshot(),
-            "search_modes": ["literal", "regex", "filename", "symbol", "references", "outline", "repo_map"],
-            "fetch_kinds": ["path", "handle", "symbol", "metadata", "bash_status", "bash_log", "continuation"],
-            "context": {
-                "query_max_chars": 2000,
-                "supports_required_terms": true,
-                "supports_optional_terms": true,
-                "supports_exclude_terms": true,
-                "supports_document_types": true,
-                "supports_min_score": true,
-                "supports_change_priority": true,
-                "symbol_detail": {
-                    "default": "auto",
-                    "values": ["excerpt", "complete", "auto", "none"]
-                },
-                "returns_scores": true,
-                "returns_groups": true
-            },
-            "fetch": {
+            "retrieval": {
+                "tool": "code_retrieve",
+                "max_operations": 12,
+                "operations": ["find_file", "find_symbol", "search_text", "find_references", "symbols_overview", "repo_map", "read"],
+                "read_targets": ["path", "handle", "symbol", "metadata", "bash_status", "bash_log", "continuation"],
+                "text_syntax": ["literal", "regex"],
+                "reference_scopes": ["all", "production", "tests"],
+                "reference_kinds": ["declaration", "call", "import", "type", "read", "write", "other"],
                 "supports_qualified_symbols": true,
                 "ambiguous_symbols_return_candidates": true
             },
@@ -786,13 +808,12 @@ impl WorkspaceActor {
                 "max_bash_timeout_ms": self.policy.bash.max_timeout_ms
             },
             "known_limitations": [
-                "regex mode is raw text search; use references mode for indexed symbol call-site discovery",
+                "find_references uses indexed lexical or syntactic evidence; use code_intelligence when semantic resolution is required",
                 "include_imports returns lexical import prelude only, not inferred dependency usage",
                 "hosted connector lazy-loading behavior is outside the server-side MCP list_tools contract"
             ]
         }))
     }
-
     pub fn summary(&self, session_id: &str, stateless_session: bool) -> AppResult<Value> {
         let started = Instant::now();
         let reconcile_started = Instant::now();
@@ -840,7 +861,7 @@ impl WorkspaceActor {
         });
         // Instruction files are inlined into every summary/open. Cap the inlined body
         // so a large AGENTS.md/CLAUDE.md cannot dominate the response; the caller can
-        // read the rest with code_fetch(path) when truncated.
+        // read the rest with a code_retrieve path read when truncated.
         let instructions = ["AGENTS.md", "CLAUDE.md"]
             .into_iter()
             .filter_map(|path| {
@@ -858,7 +879,7 @@ impl WorkspaceActor {
                             "content": &file.content[..end],
                             "content_truncated": true,
                             "content_bytes": full_len,
-                            "guidance": "Instruction file truncated; read the full file with code_fetch(path)."
+                            "guidance": "Instruction file truncated; use code_retrieve with operation=read and target=path."
                         })
                     } else {
                         json!({"path": path, "content": file.content})
@@ -956,146 +977,6 @@ impl WorkspaceActor {
             self.reconcile_pending()?;
         }
         self.summary(session_id, stateless_session)
-    }
-
-    #[allow(dead_code)]
-    pub fn code_context(&self, params: &Value) -> AppResult<Value> {
-        self.code_context_for_session("default", params)
-    }
-
-    pub fn code_context_for_session(&self, session_id: &str, params: &Value) -> AppResult<Value> {
-        let started = Instant::now();
-        let reconcile_pending = self.read_reconcile_pending();
-        let query = params.get("query").and_then(Value::as_str).unwrap_or("");
-        if let Some(expected) = params.get("snapshot_id").and_then(Value::as_str) {
-            let current = self.snapshot();
-            if expected != current {
-                return Err(stale_snapshot(expected, &current));
-            }
-        }
-        let default_budget = match params
-            .get("budget")
-            .and_then(Value::as_str)
-            .unwrap_or("medium")
-        {
-            "small" => 8_000,
-            "large" => self.policy.max_context_chars,
-            _ => 20_000.min(self.policy.max_context_chars),
-        };
-        let requested_chars = usize_value(params, "max_chars", default_budget);
-        let budget = requested_chars.min(self.policy.max_context_chars);
-        let paths = string_list(params, "paths");
-        let evidence = string_list(params, "evidence");
-        let terms = string_list(params, "terms");
-        let required_terms = string_list(params, "required_terms");
-        let optional_terms = string_list(params, "optional_terms");
-        let exclude_terms = string_list(params, "exclude_terms");
-        let document_types = string_list(params, "document_types");
-        let min_score = params
-            .get("min_score")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        if query.trim().is_empty() && terms.is_empty() && required_terms.is_empty() {
-            return Err(AppError::details(
-                "QUERY_REJECTED",
-                "code_context requires query, terms, or required_terms",
-                json!({"fields": ["query", "terms", "required_terms"]}),
-            ));
-        }
-        let (requested_results, max_results, limit_warnings) =
-            result_limit(params, 10, self.policy.max_search_results);
-        let symbol_detail =
-            SymbolDetail::parse(params.get("symbol_detail").and_then(Value::as_str))?;
-        let mut dirty: HashSet<String> = self
-            .repo_status
-            .read()
-            .dirty_files
-            .iter()
-            .cloned()
-            .collect();
-        let external = self.external_changed.lock().clone();
-        dirty.extend(external.iter().cloned());
-        let recent: HashSet<String> = self
-            .mutations
-            .lock()
-            .iter()
-            .rev()
-            .take(100)
-            .filter(|item| item.source != "external" || !external.contains(&item.path))
-            .map(|item| item.path.clone())
-            .collect();
-        let prioritize_changes = should_prioritize_changes(
-            params.get("change_priority").and_then(Value::as_str),
-            query,
-            &evidence,
-        )?;
-        if !prioritize_changes {
-            dirty.clear();
-        }
-        let recent = if prioritize_changes {
-            recent
-        } else {
-            HashSet::new()
-        };
-        let snapshot = self.snapshot();
-        let index_started = Instant::now();
-        let mut result = self.index.read().context(ContextParams {
-            workspace_id: &self.id,
-            snapshot_id: &snapshot,
-            query,
-            terms: &terms,
-            required_terms: &required_terms,
-            optional_terms: &optional_terms,
-            exclude_terms: &exclude_terms,
-            document_types: &document_types,
-            min_score,
-            path_filters: &paths,
-            evidence: &evidence,
-            dirty: &dirty,
-            recent_mutations: &recent,
-            budget_chars: budget,
-            max_results,
-            symbol_detail,
-            ranking: self.ranking,
-        })?;
-        let index_ms = index_started.elapsed().as_millis();
-        if let Some(object) = result.as_object_mut() {
-            if bool_value(params, "include_bash_failures", false)
-                || evidence.iter().any(|item| item == "bash_failures")
-            {
-                object.insert(
-                    "recent_bash_failures".to_owned(),
-                    json!(self.bash.recent_failures_for_session(session_id, query, 3)),
-                );
-            }
-            object.insert("reconcile_pending".to_owned(), json!(reconcile_pending));
-        }
-        add_result_limits(
-            &mut result,
-            requested_results,
-            max_results,
-            self.policy.max_search_results,
-            10,
-            limit_warnings,
-        );
-        if let Some(object) = result.as_object_mut() {
-            object.insert(
-                "char_limits".to_owned(),
-                json!({
-                    "requested_chars": requested_chars,
-                    "applied_chars": budget,
-                    "configured_max_chars": self.policy.max_context_chars,
-                }),
-            );
-        }
-        add_phase_metrics(
-            &mut result,
-            &[
-                ("index_context", index_ms),
-                ("total_local", started.elapsed().as_millis()),
-            ],
-        );
-        Ok(result)
     }
 
     pub fn code_search(&self, params: &Value) -> AppResult<Value> {
@@ -1357,12 +1238,46 @@ impl WorkspaceActor {
             let snapshot = self.snapshot();
             let requested_chars = usize_value(params, "max_chars", self.policy.max_context_chars);
             let applied_chars = requested_chars.min(self.policy.max_context_chars);
-            let raw =
-                self.repository
-                    .diff(&self.root, staged, &paths, self.policy.max_context_chars)?;
+            let requested_scope = GitDiffScope::from_params(params);
+            let (scope, offset) =
+                if let Some(token) = params.get("continuation").and_then(Value::as_str) {
+                    let continuation = decode_git_diff_continuation(token)?;
+                    if continuation.snapshot_id != snapshot {
+                        return Err(AppError::details(
+                            "STALE_CONTINUATION",
+                            "Repository changed after the diff continuation was created",
+                            json!({
+                                "expected_snapshot": continuation.snapshot_id,
+                                "current_snapshot": snapshot
+                            }),
+                        ));
+                    }
+                    if git_diff_scope_supplied(params) && requested_scope != continuation.scope {
+                        return Err(AppError::details(
+                            "CONTINUATION_SCOPE_MISMATCH",
+                            "Git diff continuation scope does not match the supplied filters",
+                            json!({
+                                "continuation_scope": continuation.scope,
+                                "requested_scope": requested_scope
+                            }),
+                        ));
+                    }
+                    (continuation.scope, continuation.offset)
+                } else {
+                    (requested_scope, 0)
+                };
+            for path in &scope.paths {
+                validate_relative(path)?;
+            }
+            let raw = self.repository.diff(
+                &self.root,
+                scope.staged,
+                &scope.paths,
+                self.policy.max_context_chars,
+            )?;
             let mut hunks = parse_diff_hunks(&raw);
-            if let Some(symbol) = params.get("symbol").and_then(Value::as_str) {
-                if paths.len() != 1 {
+            if let Some(symbol) = scope.symbol.as_deref() {
+                if scope.paths.len() != 1 {
                     return Err(AppError::invalid(
                         "git_diff symbol focus requires exactly one path",
                     ));
@@ -1370,7 +1285,7 @@ impl WorkspaceActor {
                 let symbols = self
                     .index
                     .read()
-                    .find_symbols(paths.first().map(String::as_str), symbol);
+                    .find_symbols(scope.paths.first().map(String::as_str), symbol);
                 if symbols.len() != 1 {
                     return Err(AppError::details(
                         if symbols.is_empty() {
@@ -1379,39 +1294,18 @@ impl WorkspaceActor {
                             "AMBIGUOUS_SYMBOL"
                         },
                         "git_diff symbol focus requires one indexed declaration",
-                        json!({"path": paths[0], "symbol": symbol, "candidates": symbols.into_iter().map(|(path, symbol, _)| json!({"path": path, "symbol": symbol})).collect::<Vec<_>>() }),
+                        json!({"path": scope.paths[0], "symbol": symbol, "candidates": symbols.into_iter().map(|(path, symbol, _)| json!({"path": path, "symbol": symbol})).collect::<Vec<_>>() }),
                     ));
                 }
                 let (_, symbol, _) = symbols.into_iter().next().expect("checked one symbol");
                 hunks.retain(|hunk| hunk_overlaps(hunk, symbol.start_line, symbol.end_line));
             }
-            if let (Some(start), Some(end)) = (
-                params.get("start_line").and_then(Value::as_u64),
-                params.get("end_line").and_then(Value::as_u64),
-            ) {
-                hunks.retain(|hunk| hunk_overlaps(hunk, start as usize, end as usize));
+            if let (Some(start), Some(end)) = (scope.start_line, scope.end_line) {
+                hunks.retain(|hunk| hunk_overlaps(hunk, start, end));
             }
-            let requested_hunks = string_list(params, "hunk_ids");
-            if !requested_hunks.is_empty() {
-                hunks.retain(|hunk| requested_hunks.iter().any(|id| id == &hunk.id));
+            if !scope.hunk_ids.is_empty() {
+                hunks.retain(|hunk| scope.hunk_ids.iter().any(|id| id == &hunk.id));
             }
-            let offset = if let Some(token) = params.get("continuation").and_then(Value::as_str) {
-                let (token_snapshot, offset) = token
-                    .rsplit_once(':')
-                    .ok_or_else(|| AppError::invalid("Invalid git diff continuation"))?;
-                if token_snapshot != snapshot {
-                    return Err(AppError::details(
-                        "STALE_CONTINUATION",
-                        "Repository changed after the diff continuation was created",
-                        json!({"expected_snapshot": token_snapshot, "current_snapshot": snapshot}),
-                    ));
-                }
-                offset
-                    .parse::<usize>()
-                    .map_err(|_| AppError::invalid("Invalid git diff continuation"))?
-            } else {
-                0
-            };
             let mut output = String::new();
             let mut selected = Vec::new();
             let mut next = None;
@@ -1433,10 +1327,20 @@ impl WorkspaceActor {
                     "new": {"start_line": hunk.new_start, "line_count": hunk.new_count}
                 }));
             }
-            let continuation = next.map(|index| format!("{snapshot}:{index}"));
+            let continuation = next
+                .map(|index| {
+                    encode_git_diff_continuation(&GitDiffContinuation {
+                        version: 1,
+                        snapshot_id: snapshot.clone(),
+                        offset: index,
+                        scope: scope.clone(),
+                    })
+                })
+                .transpose()?;
             let mut response = json!({
                 "action": "diff", "output": output, "hunks": selected,
                 "truncated": continuation.is_some(), "continuation": continuation,
+                "scope": scope,
                 "limits": {"requested_chars": requested_chars, "applied_chars": applied_chars, "configured_max_chars": self.policy.max_context_chars},
                 "generation": self.generation(), "snapshot_id": snapshot
             });

@@ -1,4 +1,3 @@
-use crate::index::Ranking;
 use crate::intelligence::IntelligenceService;
 use crate::model::{required_str, AppError, AppResult, DaemonConfig, WorkspaceConfig};
 use crate::security::{canonical_root, validate_relative};
@@ -232,22 +231,11 @@ impl WorkspaceManager {
                 let params = params.clone();
                 run_blocking(move || manager.workspace(&session, &params)).await
             }
-            "code_context" => {
+            "code_retrieve" => {
                 let actor = self.actor()?;
                 let params = params.clone();
                 let session_id = session.as_str().to_owned();
-                run_blocking(move || actor.code_context_for_session(&session_id, &params)).await
-            }
-            "code_search" => {
-                let actor = self.actor()?;
-                let params = params.clone();
-                run_blocking(move || actor.code_search(&params)).await
-            }
-            "code_fetch" => {
-                let actor = self.actor()?;
-                let params = params.clone();
-                let session_id = session.as_str().to_owned();
-                run_blocking(move || actor.code_fetch_for_session(&session_id, &params)).await
+                run_blocking(move || actor.code_retrieve_for_session(&session_id, &params)).await
             }
             "code_capabilities" => {
                 let actor = self.actor()?;
@@ -394,12 +382,10 @@ impl WorkspaceManager {
         }
 
         let repo = single_repo_config(&config)?;
-        let ranking = Ranking::parse(&config.index.ranking);
         let open_started = Instant::now();
         let actor = Arc::new(WorkspaceActor::open(
             &repo,
             config.policy.clone(),
-            ranking,
             PathBuf::from(config.cache_root.clone()),
         )?);
         let intelligence = Arc::new(IntelligenceService::new(
