@@ -21,7 +21,7 @@ cargo test
 
 PowerShell uses `Copy-Item config.example.json config.json` instead of `cp`.
 
-Configure only non-critical test repositories under `workspace.allowedRoots`. Local `config.json` files are ignored by Git.
+Point `workspace.path` at a non-critical test repository. Local `config.json` files are ignored by Git.
 
 ## Required checks
 

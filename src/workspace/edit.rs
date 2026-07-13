@@ -38,6 +38,8 @@ struct AppliedEdit {
     diff: String,
     snapshot_rebased_from: Option<String>,
     commit_ms: u128,
+    /// Per-file syntax preflight outcome ("checked" | "skipped"); see D5.
+    syntax_checks: Vec<Value>,
 }
 
 enum PreparedEdit {
@@ -134,6 +136,7 @@ impl WorkspaceActor {
             diff,
             snapshot_rebased_from,
             commit_ms,
+            syntax_checks,
         } = applied;
 
         // Shape the diff payload by response_detail before `planned` is moved into any
@@ -243,20 +246,28 @@ impl WorkspaceActor {
         }
 
         // A pending (detached) validation cannot drive a synchronous rollback;
-        // the edit stays applied and the caller decides after polling.
+        // the edit stays applied and the caller decides after polling. When the
+        // caller asked for rollback_on_failure, it does NOT apply on this path:
+        // the workspace may have legitimately moved on by the time validation
+        // finishes, so we surface the gap explicitly rather than silently
+        // reverting later. See docs/tools.md (deferred validation).
         if let Some(run_id) = validation_pending {
+            let rollback_requested = bool_value(params, "rollback_on_failure", true);
             self.reconcile_pending_async().await?;
             return Ok(json!({
                 "applied": true,
                 "rolled_back": false,
                 "validation_pending": true,
                 "validation_run_id": run_id,
-                "guidance": "Validation exceeded the foreground budget and is running detached; poll bash_status with validation_run_id.",
+                "rollback_on_failure_requested": rollback_requested,
+                "rollback_on_failure_not_applied": true,
+                "guidance": "Validation exceeded the foreground budget and is running detached; the edit is already applied. rollback_on_failure does NOT apply to detached validation — poll bash_status with validation_run_id and, if it fails, revert explicitly (e.g. code_transaction/git_restore).",
                 "snapshot_rebased_from": snapshot_rebased_from,
                 "diff": diff_value,
                 "diff_stat": diff_stat_value,
                 "diff_truncated": diff_truncated,
                 "diff_omitted": diff_omitted,
+                "syntax_checks": syntax_checks,
                 "validation": validation,
                 "generation": self.generation(),
                 "snapshot_id": self.snapshot(),
@@ -293,6 +304,7 @@ impl WorkspaceActor {
                     "diff_stat": diff_stat_value,
                     "diff_truncated": diff_truncated,
                     "diff_omitted": diff_omitted,
+                    "syntax_checks": syntax_checks,
                     "validation": validation,
                     "generation": self.generation(),
                     "snapshot_id": self.snapshot(),
@@ -312,6 +324,7 @@ impl WorkspaceActor {
                 "diff_stat": diff_stat_value,
                 "diff_truncated": diff_truncated,
                 "diff_omitted": diff_omitted,
+                "syntax_checks": syntax_checks,
                 "validation": validation,
                 "generation": self.generation(),
                 "snapshot_id": self.snapshot(),
@@ -332,6 +345,7 @@ impl WorkspaceActor {
             "diff_stat": diff_stat_value,
             "diff_truncated": diff_truncated,
             "diff_omitted": diff_omitted,
+            "syntax_checks": syntax_checks,
             "validation": validation,
             "generation": self.generation(),
             "snapshot_id": self.snapshot(),
@@ -434,15 +448,27 @@ impl WorkspaceActor {
         drop(index);
         let mut planned: Vec<PlannedFile> = plan.into_values().collect();
         planned.sort_by(|a, b| a.path.cmp(&b.path));
+        // Per-file syntax preflight result. Tree-sitter validates languages with a
+        // bundled grammar; for formats without one (YAML/TOML/Markdown/HTML/plain
+        // text) `parse_has_error` returns None and the SYNTAX_ERROR gate cannot
+        // fire — surface that as "skipped" so the bypass is visible instead of
+        // silently passing. Deletions carry no content to check.
+        let mut syntax_checks: Vec<Value> = Vec::new();
         for item in &planned {
             if let Some(after) = &item.after {
                 let absolute = self.root.join(&item.path);
-                if parse_has_error(&absolute, after) == Some(true) {
-                    return Err(AppError::details(
-                        "SYNTAX_ERROR",
-                        "Tree-sitter found syntax errors in planned content",
-                        json!({"path": item.path}),
-                    ));
+                match parse_has_error(&absolute, after) {
+                    Some(true) => {
+                        return Err(AppError::details(
+                            "SYNTAX_ERROR",
+                            "Tree-sitter found syntax errors in planned content",
+                            json!({"path": item.path}),
+                        ));
+                    }
+                    Some(false) => syntax_checks
+                        .push(json!({"path": item.path, "syntax_check": "checked"})),
+                    None => syntax_checks
+                        .push(json!({"path": item.path, "syntax_check": "skipped"})),
                 }
             }
         }
@@ -456,6 +482,7 @@ impl WorkspaceActor {
                 "snapshot_id": current_snapshot,
                 "snapshot_rebased_from": snapshot_rebased_from,
                 "diff": diff,
+                "syntax_checks": syntax_checks,
                 "files": planned.iter().map(|item| &item.path).collect::<Vec<_>>()
             })));
         }
@@ -472,6 +499,7 @@ impl WorkspaceActor {
             diff,
             snapshot_rebased_from,
             commit_ms,
+            syntax_checks,
         }))
     }
 
@@ -878,7 +906,7 @@ impl WorkspaceActor {
                 error.to_string(),
             )
         })?;
-        *self.repo_status.write() = self.repository.status(&self.root).unwrap_or_default();
+        self.refresh_repo_status();
         self.generation.store(generation, Ordering::Release);
         self.recompute_snapshot();
         self.publish_mutations(&records);
@@ -1089,7 +1117,7 @@ impl WorkspaceActor {
             })
             .collect();
         self.persist_mutations(&records)?;
-        *self.repo_status.write() = self.repository.status(&self.root).unwrap_or_default();
+        self.refresh_repo_status();
         self.generation.store(generation, Ordering::Release);
         self.recompute_snapshot();
         self.publish_mutations(&records);

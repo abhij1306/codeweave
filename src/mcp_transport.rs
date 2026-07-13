@@ -31,12 +31,12 @@ use rmcp::{
 use serde_json::Value;
 
 use crate::manager::SessionKey;
+use crate::tools::ToolAccess;
 use crate::{
-    health, is_loopback, live, prepare, tool_failure, tool_result, tools, AppState, Cli,
-    SERVER_NAME,
+    health, is_loopback, live, prepare, tool_failure, tool_result, AppState, Cli, SERVER_NAME,
 };
 
-const INSTRUCTIONS: &str = "Use code_capabilities to inspect supported contracts, code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, code_preview/code_transaction for multi-file edits, and the single-operation code_write/code_replace/code_replace_range/code_insert/code_delete/code_rename tools for narrow changes. Run commands with bash; inspect or stop retained runs with bash_status, bash_output, and bash_cancel. Bash executes as the CodeWeave OS user and is not sandboxed. Use the narrowly scoped git_status/git_diff/git_log/git_show/git_blame/git_preflight/git_stage/git_commit/git_restore/git_push tools for repository operations. CodeWeave manages one active repository per MCP session; call workspace with an absolute path to switch this session explicitly.";
+const INSTRUCTIONS: &str = "Use code_capabilities to inspect supported contracts, code_context for unfamiliar code, code_search for exact discovery, code_fetch for exact reads, code_preview/code_transaction for multi-file edits, and the single-operation code_write/code_replace/code_replace_range/code_insert/code_delete/code_rename tools for narrow changes. Run commands with bash; inspect or stop retained runs with bash_status, bash_output, and bash_cancel. Bash executes as the CodeWeave OS user and is not sandboxed. Use the narrowly scoped git_status/git_diff/git_log/git_show/git_blame/git_preflight/git_stage/git_commit/git_restore/git_push tools for repository operations. CodeWeave serves one repository, fixed for the server's lifetime and configured in config.json; call workspace to inspect its summary, changes, diagnostics, or skills.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CodeWeaveSessionId(String);
@@ -67,8 +67,10 @@ impl ServerHandler for CodeWeaveMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        serde_json::from_value(serde_json::json!({ "tools": tools() }))
-            .map_err(|error| McpError::internal_error(error.to_string(), None))
+        serde_json::from_value(
+            serde_json::json!({ "tools": self.state.tool_access.list_payload() }),
+        )
+        .map_err(|error| McpError::internal_error(error.to_string(), None))
     }
 
     async fn call_tool(
@@ -82,45 +84,39 @@ impl ServerHandler for CodeWeaveMcp {
             .map(Value::Object)
             .unwrap_or_else(|| serde_json::json!({}));
 
-        if ![
-            "workspace",
-            "code_context",
-            "code_capabilities",
-            "code_fetch",
-            "code_search",
-            "code_preview",
-            "code_transaction",
-            "code_write",
-            "code_replace",
-            "code_replace_range",
-            "code_insert",
-            "code_delete",
-            "code_rename",
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_show",
-            "git_blame",
-            "git_preflight",
-            "git_stage",
-            "git_commit",
-            "git_restore",
-            "git_push",
-            "bash",
-            "bash_status",
-            "bash_output",
-            "bash_cancel",
-        ]
-        .contains(&name)
-        {
+        // The registry is the single source of truth for callable names. An
+        // unknown name is a hard MCP error; a real tool that the active profile
+        // does not expose is a structured TOOL_NOT_IN_PROFILE failure so the
+        // caller can tell "no such tool" from "not in this profile".
+        if !ToolAccess::is_known_tool(name) {
             return Err(McpError::invalid_params(
                 format!("Unknown tool: {name}"),
                 None,
             ));
         }
+        if !self.state.tool_access.is_allowed(name) {
+            let value = tool_failure(crate::model::AppError::details(
+                "TOOL_NOT_IN_PROFILE",
+                format!(
+                    "Tool '{name}' is not available under the active tool profile '{}'",
+                    self.state.server.tool_profile
+                ),
+                serde_json::json!({"tool": name, "profile": self.state.server.tool_profile}),
+            ));
+            return serde_json::from_value(value)
+                .map_err(|error| McpError::internal_error(error.to_string(), None));
+        }
 
         let session = session_key(&context);
-        let result = match prepare(&self.state.manager, &self.state.config, name, args).await {
+        let result = match prepare(
+            &self.state.manager,
+            &self.state.config,
+            &self.state.tool_access,
+            name,
+            args,
+        )
+        .await
+        {
             Ok(prepared) => self.state.manager.dispatch(session, name, &prepared).await,
             Err(error) => Err(error),
         };
@@ -583,6 +579,8 @@ mod tests {
             stateful_mode: true,
             json_response: false,
             idle_timeout_ms: 5000,
+            tool_profile: "full".to_owned(),
+            tools: Default::default(),
         };
 
         assert!(configured_allowed_hosts(&server).is_empty());
@@ -600,6 +598,8 @@ mod tests {
             stateful_mode: true,
             json_response: false,
             idle_timeout_ms: 5000,
+            tool_profile: "full".to_owned(),
+            tools: Default::default(),
         };
 
         let hosts = configured_allowed_hosts(&server);
@@ -620,6 +620,8 @@ mod tests {
             stateful_mode: true,
             json_response: false,
             idle_timeout_ms: 5000,
+            tool_profile: "full".to_owned(),
+            tools: Default::default(),
         };
 
         let hosts = configured_allowed_hosts(&server);

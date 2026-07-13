@@ -123,15 +123,9 @@ pub fn test_bash_executable() -> String {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSettings {
-    #[serde(default)]
-    pub default_path: Option<String>,
-    /// Pin the instance to `default_path`: ignore any `path` argument passed to
-    /// `workspace(open)` so a tunneled single-repo deployment can never switch
-    /// to the wrong repository, even when the transport session id is lost.
-    #[serde(default)]
-    pub lock_to_default: bool,
-    #[serde(default)]
-    pub allowed_roots: Vec<String>,
+    /// The single repository this server serves for its entire lifetime.
+    /// Canonicalized once at startup; there is no runtime switching.
+    pub path: String,
     #[serde(default)]
     pub artifact_paths: Vec<String>,
     #[serde(default)]
@@ -154,13 +148,33 @@ fn default_explicit_only() -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexSettings {
+    /// Retrieval ranking algorithm: `"v1"` (legacy additive file scorer) or
+    /// `"v2"` (chunk-granular BM25F). Unknown values fall back to `v1`.
+    #[serde(default = "default_ranking")]
+    pub ranking: String,
+}
+
+fn default_ranking() -> String {
+    "v1".to_owned()
+}
+
+impl Default for IndexSettings {
+    fn default() -> Self {
+        Self {
+            ranking: default_ranking(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
-    #[serde(default)]
-    pub workspaces: Vec<WorkspaceConfig>,
-    #[serde(default)]
     pub workspace: WorkspaceSettings,
     #[serde(default)]
     pub skills: SkillsConfig,
+    #[serde(default)]
+    pub index: IndexSettings,
     pub policy: PolicyConfig,
     pub cache_root: String,
 }
@@ -291,11 +305,12 @@ mod tests {
             vec!["backend/artifacts/", "*.log"]
         );
 
-        let legacy: WorkspaceSettings = serde_json::from_value(serde_json::json!({
-            "defaultPath": "/workspace",
-            "allowedRoots": ["/"]
+        let settings: WorkspaceSettings = serde_json::from_value(serde_json::json!({
+            "path": "/workspace",
+            "excludePaths": ["backend/artifacts/", "*.log"]
         }))
         .unwrap();
-        assert!(legacy.exclude_paths.is_empty());
+        assert_eq!(settings.path, "/workspace");
+        assert_eq!(settings.exclude_paths, vec!["backend/artifacts/", "*.log"]);
     }
 }

@@ -29,11 +29,11 @@ For safer operation:
 - bind HTTP to `127.0.0.1` unless remote access is explicitly required;
 - keep bearer authentication enabled;
 - expose remote HTTP only through trusted HTTPS infrastructure;
-- restrict `workspace.allowedRoots` to the smallest useful directories;
+- point `workspace.path` at the single repository this instance should serve;
 - disable `policy.bash.enabled` when command execution is not required;
 - protect the token file and local configuration;
 - run under a dedicated, least-privileged operating-system account when practical;
 - test upgrades against a disposable repository;
 - review diffs before committing or pushing changes.
 
-`workspace.allowedRoots` constrains repository selection, file tools, and Bash `cwd` resolution. It does not sandbox Bash: commands may read, modify, execute, or transmit anything accessible to the CodeWeave operating-system account. CodeWeave does not make an untrusted model, prompt, extension, or MCP client safe. Only connect clients you trust and review their requested operations.
+The configured `workspace.path` constrains file tools and Bash `cwd` resolution. It does not sandbox Bash: commands may read, modify, execute, or transmit anything accessible to the CodeWeave operating-system account. CodeWeave does not make an untrusted model, prompt, extension, or MCP client safe. Only connect clients you trust and review their requested operations.

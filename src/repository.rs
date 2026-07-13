@@ -12,6 +12,11 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Default wall-clock bound for every git invocation. Without it a hung
+/// credential prompt, a stuck lock, or an unresponsive remote wedges the
+/// workspace actor indefinitely. Push reaches the network and keeps the
+/// longer [`GIT_PUSH_TIMEOUT`].
+const GIT_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_PUSH_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -55,18 +60,45 @@ pub trait RepositoryBackend: Send + Sync {
 pub struct CliGitBackend;
 
 impl CliGitBackend {
-    fn run_raw(&self, root: &Path, args: &[String]) -> AppResult<Output> {
-        Command::new("git")
+    /// Build a git command with stdio piped, credential prompts disabled, and
+    /// interactive askpass suppressed so a missing/expired credential fails fast
+    /// instead of blocking on a hidden prompt until the timeout fires.
+    fn command(root: &Path, args: &[String]) -> Command {
+        let mut command = Command::new("git");
+        command
             .current_dir(root)
             .arg("--no-pager")
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| {
-                AppError::details("GIT_UNAVAILABLE", error.to_string(), json!({"args": args}))
-            })
+            // Fail closed on any credential/prompt path rather than hang:
+            // - GIT_TERMINAL_PROMPT=0 turns terminal prompts into errors.
+            // - GIT_ASKPASS=echo makes the graphical/askpass path return
+            //   immediately (empty), so no dialog can wedge the actor.
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "echo");
+        #[cfg(unix)]
+        command.process_group(0);
+        command
+    }
+
+    /// Run a git command under a timeout, returning raw `Output`. Every
+    /// invocation is bounded so no git call can wedge the workspace actor.
+    fn run_raw_with_timeout(
+        &self,
+        root: &Path,
+        args: &[String],
+        timeout: Duration,
+    ) -> AppResult<Output> {
+        let child = Self::command(root, args).spawn().map_err(|error| {
+            AppError::details("GIT_UNAVAILABLE", error.to_string(), json!({"args": args}))
+        })?;
+        wait_for_output(child, args, timeout)
+    }
+
+    fn run_raw(&self, root: &Path, args: &[String]) -> AppResult<Output> {
+        self.run_raw_with_timeout(root, args, GIT_DEFAULT_TIMEOUT)
     }
 
     fn run(&self, root: &Path, args: &[String], max_chars: usize) -> AppResult<String> {
@@ -81,20 +113,7 @@ impl CliGitBackend {
         max_chars: usize,
         timeout: Duration,
     ) -> AppResult<String> {
-        let mut command = Command::new("git");
-        command
-            .current_dir(root)
-            .arg("--no-pager")
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        command.process_group(0);
-        let child = command.spawn().map_err(|error| {
-            AppError::details("GIT_UNAVAILABLE", error.to_string(), json!({"args": args}))
-        })?;
-        let output = wait_for_output(child, args, timeout)?;
+        let output = self.run_raw_with_timeout(root, args, timeout)?;
         checked_output(output, args, max_chars)
     }
 

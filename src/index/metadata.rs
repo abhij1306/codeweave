@@ -184,4 +184,10 @@ pub(super) fn normalize_entry(entry: &mut FileEntry) {
         entry.indexed_terms =
             build_indexed_terms(&entry.search_content, &entry.path_lower, &entry.symbols);
     }
+    if entry.chunks.is_empty() {
+        entry.chunks = super::chunks::build_chunks(&entry.content, &entry.symbols);
+    }
+    if entry.path_tf.is_empty() {
+        entry.path_tf = super::chunks::path_field(&entry.path_lower);
+    }
 }

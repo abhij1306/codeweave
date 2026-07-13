@@ -5,7 +5,7 @@ use super::util::{
     summarize_changed_paths, MAX_CHANGED_PATH_GROUPS, MAX_OBSERVED_CHANGED_PATHS,
 };
 use super::{validated_push_target, RunBaseline, WorkspaceActor};
-use crate::index::content_hash;
+use crate::index::{content_hash, Ranking};
 use crate::model::{test_bash_executable, BashConfig, PolicyConfig, WorkspaceConfig};
 use chrono::Utc;
 use serde_json::json;
@@ -56,6 +56,7 @@ fn test_actor_with_policy_and_exclusions(
                 exclude_paths,
             },
             policy,
+            Ranking::V1,
             cache,
         )
         .unwrap(),
@@ -1366,6 +1367,7 @@ fn workspace_generation_resumes_after_persisted_journal_records() {
             exclude_paths: Vec::new(),
         },
         test_policy(),
+        Ranking::V1,
         cache.path().to_path_buf(),
     )
     .unwrap();
@@ -1495,4 +1497,286 @@ fn workspace_summary_caps_and_groups_large_change_sets() {
     );
     assert_eq!(summary["repository"]["dirty_file_count"], 50);
     assert_eq!(summary["repository"]["dirty_files_truncated"], true);
+}
+
+// D7: coverage for edit-pipeline invariants that had no regression test.
+
+#[tokio::test]
+async fn overlapping_exact_edits_in_one_transaction_are_rejected() {
+    let root = tempdir().unwrap();
+    let original = "let value = compute(alpha, alpha);\n";
+    fs::write(root.path().join("value.rs"), original).unwrap();
+    let actor = test_actor(root.path());
+
+    // Two `replace` changes whose matched byte ranges overlap on the same file
+    // must be refused before anything is written.
+    let error = actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [
+                    {
+                        "kind": "replace",
+                        "path": "value.rs",
+                        "old_text": "compute(alpha, alpha)",
+                        "new_text": "compute(beta, beta)",
+                        "expected_hash": content_hash(original)
+                    },
+                    {
+                        "kind": "replace",
+                        "path": "value.rs",
+                        "old_text": "alpha, alpha",
+                        "new_text": "gamma, gamma",
+                        "expected_hash": content_hash(original)
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.0.code, "OVERLAPPING_EDITS");
+    assert_eq!(
+        fs::read_to_string(root.path().join("value.rs")).unwrap(),
+        original
+    );
+}
+
+#[tokio::test]
+async fn syntax_error_gate_blocks_broken_rust_and_leaves_file_untouched() {
+    let root = tempdir().unwrap();
+    let original = "fn value() -> i32 { 1 }\n";
+    fs::write(root.path().join("value.rs"), original).unwrap();
+    let actor = test_actor(root.path());
+
+    let error = actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [{
+                    "kind": "replace",
+                    "path": "value.rs",
+                    "old_text": "{ 1 }",
+                    "new_text": "{ 1 ",
+                    "expected_hash": content_hash(original)
+                }]
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.0.code, "SYNTAX_ERROR");
+    assert_eq!(
+        fs::read_to_string(root.path().join("value.rs")).unwrap(),
+        original
+    );
+}
+
+#[tokio::test]
+async fn json_edits_are_syntax_checked_and_yaml_edits_are_reported_skipped() {
+    let root = tempdir().unwrap();
+    let json_original = "{\n  \"a\": 1\n}\n";
+    let yaml_original = "a: 1\n";
+    fs::write(root.path().join("data.json"), json_original).unwrap();
+    fs::write(root.path().join("data.yaml"), yaml_original).unwrap();
+    let actor = test_actor(root.path());
+
+    // D5: JSON now has a bundled grammar, so a broken JSON edit is gated.
+    let error = actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [{
+                    "kind": "replace",
+                    "path": "data.json",
+                    "old_text": "\"a\": 1",
+                    "new_text": "\"a\": 1,",
+                    "expected_hash": content_hash(json_original)
+                }]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.0.code, "SYNTAX_ERROR");
+    assert_eq!(
+        fs::read_to_string(root.path().join("data.json")).unwrap(),
+        json_original
+    );
+
+    // A valid JSON edit reports the check ran; a YAML edit (no grammar) reports
+    // the bypass explicitly as "skipped" rather than silently passing.
+    let applied = actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [
+                    {
+                        "kind": "replace",
+                        "path": "data.json",
+                        "old_text": "\"a\": 1",
+                        "new_text": "\"a\": 2",
+                        "expected_hash": content_hash(json_original)
+                    },
+                    {
+                        "kind": "replace",
+                        "path": "data.yaml",
+                        "old_text": "a: 1",
+                        "new_text": "a: 2",
+                        "expected_hash": content_hash(yaml_original)
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(applied["applied"], true);
+    let checks = applied["syntax_checks"].as_array().unwrap();
+    let json_check = checks
+        .iter()
+        .find(|item| item["path"] == "data.json")
+        .unwrap();
+    let yaml_check = checks
+        .iter()
+        .find(|item| item["path"] == "data.yaml")
+        .unwrap();
+    assert_eq!(json_check["syntax_check"], "checked");
+    assert_eq!(yaml_check["syntax_check"], "skipped");
+}
+
+#[tokio::test]
+async fn symbol_anchored_insert_positions_place_content_relative_to_the_symbol() {
+    let cases = [
+        ("before", "// before-marker\nfn target() {\n    body();\n}\n"),
+        ("after", "fn target() {\n    body();\n}\n// after-marker\n"),
+        (
+            "inside_start",
+            "fn target() {\n// inside-marker\n    body();\n}\n",
+        ),
+        (
+            "inside_end",
+            "fn target() {\n    body();\n// inside-marker\n}\n",
+        ),
+    ];
+
+    for (position, expected) in cases {
+        let root = tempdir().unwrap();
+        let original = "fn target() {\n    body();\n}\n";
+        fs::write(root.path().join("value.rs"), original).unwrap();
+        let actor = test_actor(root.path());
+        let marker = match position {
+            "before" => "// before-marker\n",
+            "after" => "// after-marker\n",
+            _ => "// inside-marker\n",
+        };
+
+        let result = actor
+            .code_edit(
+                "test-session",
+                &json!({
+                    "changes": [{
+                        "kind": "insert",
+                        "path": "value.rs",
+                        "anchor_symbol": "target",
+                        "position": position,
+                        "content": marker,
+                        "expected_hash": content_hash(original)
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["applied"], true, "position {position} should apply");
+        assert_eq!(
+            fs::read_to_string(root.path().join("value.rs")).unwrap(),
+            expected,
+            "position {position} placement"
+        );
+    }
+}
+
+#[tokio::test]
+async fn same_file_multi_change_accumulates_on_the_in_progress_plan() {
+    let root = tempdir().unwrap();
+    let original = "one\ntwo\nthree\n";
+    fs::write(root.path().join("value.txt"), original).unwrap();
+    let actor = test_actor(root.path());
+
+    // Two distinct, non-overlapping edits to the same file in one transaction each
+    // match against the original text (overlap preflight is snapshot-based) but
+    // must both land: the second is planned on top of the first via put_plan, not
+    // re-read from disk. Only one expected_hash precondition is needed.
+    let result = actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [
+                    {
+                        "kind": "replace",
+                        "path": "value.txt",
+                        "old_text": "one",
+                        "new_text": "ONE",
+                        "expected_hash": content_hash(original)
+                    },
+                    {
+                        "kind": "replace",
+                        "path": "value.txt",
+                        "old_text": "three",
+                        "new_text": "THREE",
+                        "expected_hash": content_hash(original)
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["applied"], true);
+    assert_eq!(
+        fs::read_to_string(root.path().join("value.txt")).unwrap(),
+        "ONE\ntwo\nTHREE\n"
+    );
+}
+
+#[tokio::test]
+async fn deferred_validation_does_not_roll_back_even_when_rollback_requested() {
+    let root = tempdir().unwrap();
+    let original = "fn value() -> i32 { 1 }\n";
+    fs::write(root.path().join("value.rs"), original).unwrap();
+    let actor = test_actor_with_budget(root.path(), 200);
+
+    // rollback_on_failure is explicitly requested, but the validation is promoted
+    // to a detached run: the edit must stay applied and the response must make the
+    // no-rollback semantics explicit (D4).
+    let result = actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [{
+                    "kind": "replace",
+                    "path": "value.rs",
+                    "old_text": "{ 1 }",
+                    "new_text": "{ 2 }",
+                    "expected_hash": content_hash(original)
+                }],
+                "validate": ["echo checking; sleep 30"],
+                "rollback_on_failure": true
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["applied"], true);
+    assert_eq!(result["validation_pending"], true);
+    assert_eq!(result["rollback_on_failure_requested"], true);
+    assert_eq!(result["rollback_on_failure_not_applied"], true);
+    assert!(result["guidance"].is_string());
+    assert_eq!(
+        fs::read_to_string(root.path().join("value.rs")).unwrap(),
+        "fn value() -> i32 { 2 }\n"
+    );
+
+    let run_id = result["validation_run_id"].as_str().unwrap();
+    let _ = actor.bash.cancel_for_session("test-session", run_id);
 }

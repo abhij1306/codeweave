@@ -9,7 +9,9 @@ use journal::{load_journal, open_journal, rotate_journal_if_needed};
 use util::{stale_snapshot, summarize_changed_paths, ChangedPathSummary};
 
 use crate::bash::{BashSupervisor, StartRequest};
-use crate::index::{content_hash, CodeIndex, ContextParams, SearchParams, WorkspaceExclusions};
+use crate::index::{
+    content_hash, CodeIndex, ContextParams, Ranking, SearchParams, WorkspaceExclusions,
+};
 use crate::model::{
     bool_value, required_str, string_list, usize_value, AppError, AppResult, PolicyConfig,
     WorkspaceConfig,
@@ -45,6 +47,7 @@ pub struct WorkspaceActor {
     pub name: String,
     root: PathBuf,
     policy: PolicyConfig,
+    ranking: Ranking,
     artifact_paths: Vec<String>,
     exclusions: WorkspaceExclusions,
     index: RwLock<CodeIndex>,
@@ -52,6 +55,11 @@ pub struct WorkspaceActor {
     snapshot_id: RwLock<String>,
     repository: Arc<dyn RepositoryBackend>,
     repo_status: RwLock<RepoStatus>,
+    /// Set when a `git status` refresh failed and the cached `repo_status` may be
+    /// out of date. Surfaced as `repo_status_stale: true` in responses so callers
+    /// don't treat a silently-empty status as "clean" (D8). Cleared on the next
+    /// successful refresh.
+    repo_status_stale: AtomicBool,
     opened_dirty_summary: ChangedPathSummary,
     opened_at: DateTime<Utc>,
     external_changed: Mutex<HashSet<String>>,
@@ -149,17 +157,33 @@ fn validated_push_target(params: &Value, current_branch: &str) -> AppResult<(Str
 }
 
 impl WorkspaceActor {
+    #[cfg(test)]
     pub fn root_path(&self) -> &Path {
         &self.root
     }
 
-    pub fn running_bash_count(&self) -> usize {
-        self.bash.running_count()
+    /// Number of files currently held in the code index. Reported by `/health`
+    /// so operators can confirm the eager startup scan populated the index.
+    pub fn index_file_count(&self) -> usize {
+        self.index.read().file_count()
+    }
+
+    /// Milliseconds since the index was last reconciled against the filesystem.
+    /// A small value right after startup confirms the eager scan is fresh.
+    pub fn last_reconcile_elapsed_ms(&self) -> u128 {
+        self.last_reconcile.lock().elapsed().as_millis()
+    }
+
+    /// Pre-probe Bash readiness at startup so the first validated edit does not
+    /// pay the discovery/probe cost inline. Returns the readiness result.
+    pub fn probe_bash(&self) -> AppResult<()> {
+        self.bash.ensure_available()
     }
 
     pub fn open(
         config: &WorkspaceConfig,
         policy: PolicyConfig,
+        ranking: Ranking,
         cache_root: PathBuf,
     ) -> AppResult<Self> {
         let opened_started = Instant::now();
@@ -274,6 +298,7 @@ impl WorkspaceActor {
             name: config.name.clone(),
             root,
             policy,
+            ranking,
             artifact_paths: config.artifact_paths.clone(),
             exclusions,
             index: RwLock::new(index),
@@ -281,6 +306,7 @@ impl WorkspaceActor {
             snapshot_id: RwLock::new(snapshot_id),
             repository,
             repo_status: RwLock::new(repo_status),
+            repo_status_stale: AtomicBool::new(false),
             opened_dirty_summary: summarize_changed_paths(opened_dirty),
             opened_at: Utc::now(),
             external_changed: Mutex::new(HashSet::new()),
@@ -299,6 +325,35 @@ impl WorkspaceActor {
             open_diagnostics,
             _watcher: Mutex::new(watcher),
         })
+    }
+
+    /// Refresh the cached `repo_status` from `git status`. On failure, log a
+    /// warning and set `repo_status_stale` instead of silently clobbering the
+    /// cache with an empty default (D8): an empty status looks identical to a
+    /// clean tree, which would mislead callers about what is staged/dirty. The
+    /// previous (possibly-stale) status is retained so downstream logic still has
+    /// its best-known view.
+    pub(super) fn refresh_repo_status(&self) {
+        match self.repository.status(&self.root) {
+            Ok(status) => {
+                *self.repo_status.write() = status;
+                self.repo_status_stale.store(false, Ordering::Release);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    workspace = %self.id,
+                    error = %error,
+                    "git status refresh failed; repo_status may be stale"
+                );
+                self.repo_status_stale.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Whether the cached repository status is known to be out of date because a
+    /// refresh failed since the last successful `git status`.
+    pub(super) fn repo_status_stale(&self) -> bool {
+        self.repo_status_stale.load(Ordering::Acquire)
     }
 
     pub fn generation(&self) -> u64 {
@@ -706,7 +761,7 @@ impl WorkspaceActor {
                 &self.artifact_paths,
                 &self.exclusions,
             )?;
-            *self.repo_status.write() = self.repository.status(&self.root).unwrap_or_default();
+            self.refresh_repo_status();
             self.generation.fetch_add(1, Ordering::AcqRel);
             self.recompute_snapshot();
         } else {
@@ -785,6 +840,7 @@ impl WorkspaceActor {
             recent_mutations: &recent,
             budget_chars: budget,
             max_results,
+            ranking: self.ranking,
         })?;
         let index_ms = index_started.elapsed().as_millis();
         if let Some(object) = result.as_object_mut() {
@@ -1078,6 +1134,15 @@ impl WorkspaceActor {
                 output
             }
             "push" => {
+                // Push is the only network-facing write and is gated identically to
+                // git restore: it must be explicitly confirmed so a model cannot
+                // publish commits as a side effect of an otherwise-innocuous call.
+                if !bool_value(params, "confirm", false) {
+                    return Err(AppError::new(
+                        "CONFIRMATION_REQUIRED",
+                        "git push requires confirm=true",
+                    ));
+                }
                 let status = self.repository.status(&self.root)?;
                 let (remote, branch) = validated_push_target(params, &status.branch)?;
                 self.repository.push(&self.root, &remote, &branch)?
@@ -1089,6 +1154,7 @@ impl WorkspaceActor {
                         .diff(&self.root, true, &[], self.policy.max_context_chars)?;
                 let git_ms = git_started.elapsed().as_millis();
                 *self.repo_status.write() = status.clone();
+                self.repo_status_stale.store(false, Ordering::Release);
                 self.recompute_snapshot();
                 let mut result = json!({
                     "action": "preflight",
@@ -1118,7 +1184,7 @@ impl WorkspaceActor {
         };
         let git_ms = git_started.elapsed().as_millis();
         if matches!(action, "stage" | "commit") {
-            *self.repo_status.write() = self.repository.status(&self.root).unwrap_or_default();
+            self.refresh_repo_status();
             self.recompute_snapshot();
         }
         let mut response = json!({
@@ -1127,6 +1193,9 @@ impl WorkspaceActor {
             "generation": self.generation(),
             "snapshot_id": self.snapshot()
         });
+        if self.repo_status_stale() {
+            response["repo_status_stale"] = Value::Bool(true);
+        }
         add_phase_metrics(
             &mut response,
             &[

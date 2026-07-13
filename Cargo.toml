@@ -1,3 +1,14 @@
+[workspace]
+members = ["eval"]
+
+[lib]
+name = "codeweave_rust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codeweave-rust"
+path = "src/main.rs"
+
 [package]
 name = "codeweave-rust"
 version = "0.1.0"
@@ -43,6 +54,7 @@ tree-sitter-java = "0.23"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
+tree-sitter-json = "0.24"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -1,0 +1,317 @@
+{
+  "ranking": "v2",
+  "repo": "codeweave",
+  "query_count": 15,
+  "recall_at_1": 0.7333333333333333,
+  "recall_at_5": 1.0,
+  "recall_at_10": 1.0,
+  "mrr_at_10": 0.85,
+  "mean_chars": 11482.0,
+  "complete_symbol_rate": 0.2733333333333333,
+  "cold_index_ms": 529.7365000000001,
+  "warm_index_ms": 599.5696,
+  "search_p50_ms": 23.5964,
+  "search_p95_ms": 40.279799999999994,
+  "per_query": [
+    {
+      "id": "sym-resolve-access",
+      "category": "exact-symbol",
+      "hit_rank": 1,
+      "recall_at_1": true,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 18750,
+      "search_ms": 6.7199,
+      "complete_symbols": 0,
+      "total_results": 10,
+      "top_paths": [
+        "src/tools/mod.rs",
+        "eval/queries/codeweave.json",
+        "src/main.rs",
+        "docs/improvement-plan.md",
+        "docs/implementation.md"
+      ]
+    },
+    {
+      "id": "sym-workspace-manager",
+      "category": "exact-symbol",
+      "hit_rank": 1,
+      "recall_at_1": true,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 16188,
+      "search_ms": 7.857899999999999,
+      "complete_symbols": 1,
+      "total_results": 10,
+      "top_paths": [
+        "src/manager.rs",
+        "eval/queries/codeweave.json",
+        "src/main.rs",
+        "src/mcp_transport.rs",
+        "src/workspace/tests.rs"
+      ]
+    },
+    {
+      "id": "sym-bash-supervisor",
+      "category": "exact-symbol",
+      "hit_rank": 1,
+      "recall_at_1": true,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 11987,
+      "search_ms": 18.690600000000003,
+      "complete_symbols": 1,
+      "total_results": 10,
+      "top_paths": [
+        "src/bash.rs",
+        "src/workspace/mod.rs",
+        "src/process_runtime.rs",
+        "src/repository.rs",
+        "eval/queries/codeweave.json"
+      ]
+    },
+    {
+      "id": "file-config-example",
+      "category": "filename-lookup",
+      "hit_rank": 1,
+      "recall_at_1": true,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 10713,
+      "search_ms": 22.7732,
+      "complete_symbols": 1,
+      "total_results": 10,
+      "top_paths": [
+        "config.example.json",
+        "src/main.rs",
+        "eval/queries/codeweave.json",
+        "src/manager.rs",
+        "src/mcp_transport.rs"
+      ]
+    },
+    {
+      "id": "file-cargo",
+      "category": "filename-lookup",
+      "hit_rank": 2,
+      "recall_at_1": false,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 12145,
+      "search_ms": 10.537700000000001,
+      "complete_symbols": 2,
+      "total_results": 10,
+      "top_paths": [
+        "eval/queries/codeweave.json",
+        "Cargo.toml",
+        "eval/Cargo.toml",
+        "src/process_runtime.rs",
+        "eval/src/main.rs"
+      ]
+    },
+    {
+      "id": "intent-tool-profiles",
+      "category": "nl-intent",
+      "hit_rank": 1,
+      "recall_at_1": true,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 11093,
+      "search_ms": 40.279799999999994,
+      "complete_symbols": 2,
+      "total_results": 10,
+      "top_paths": [
+        "src/tools/mod.rs",
+        "src/main.rs",
+        "docs/improvement-plan.md",
+        "eval/queries/codeweave.json",
+        "docs/implementation.md"
+      ]
+    },
+    {
+      "id": "intent-token-auth",
+      "category": "nl-intent",
+      "hit_rank": 1,
+      "recall_at_1": true,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 9367,
+      "search_ms": 23.5964,
+      "complete_symbols": 3,
+      "total_results": 10,
+      "top_paths": [
+        "src/main.rs",
+        "eval/queries/codeweave.json",
+        "README.md",
+        "src/index/tests.rs",
+        "docs/implementation.md"
+      ]
+    },
+    {
+      "id": "intent-index-cache",
+      "category": "nl-intent",
+      "hit_rank": 2,
+      "recall_at_1": false,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 7035,
+      "search_ms": 31.546200000000002,
+      "complete_symbols": 5,
+      "total_results": 10,
+      "top_paths": [
+        "src/index/tests.rs",
+        "src/index/mod.rs",
+        "src/main.rs",
+        "eval/queries/codeweave.json",
+        "docs/improvement-plan.md"
+      ]
+    },
+    {
+      "id": "disc-context-ranking",
+      "category": "impl-discovery",
+      "hit_rank": 1,
+      "recall_at_1": true,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 8857,
+      "search_ms": 25.0225,
+      "complete_symbols": 6,
+      "total_results": 10,
+      "top_paths": [
+        "src/index/mod.rs",
+        "docs/improvement-plan.md",
+        "eval/queries/codeweave.json",
+        "src/model.rs",
+        "eval/src/main.rs"
+      ]
+    },
+    {
+      "id": "disc-code-transaction",
+      "category": "impl-discovery",
+      "hit_rank": 2,
+      "recall_at_1": false,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 12708,
+      "search_ms": 19.0093,
+      "complete_symbols": 2,
+      "total_results": 10,
+      "top_paths": [
+        "src/workspace/tests.rs",
+        "src/workspace/edit.rs",
+        "docs/improvement-plan.md",
+        "src/tools/mod.rs",
+        "eval/queries/codeweave.json"
+      ]
+    },
+    {
+      "id": "disc-git-push",
+      "category": "impl-discovery",
+      "hit_rank": 1,
+      "recall_at_1": true,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 11388,
+      "search_ms": 31.0543,
+      "complete_symbols": 4,
+      "total_results": 10,
+      "top_paths": [
+        "src/repository.rs",
+        "src/workspace/mod.rs",
+        "src/tools/schemas/git.rs",
+        "src/tools/mod.rs",
+        "src/workspace/tests.rs"
+      ]
+    },
+    {
+      "id": "disc-symbol-extract",
+      "category": "impl-discovery",
+      "hit_rank": 1,
+      "recall_at_1": true,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 12328,
+      "search_ms": 15.89,
+      "complete_symbols": 4,
+      "total_results": 10,
+      "top_paths": [
+        "src/symbols.rs",
+        "src/lib.rs",
+        "eval/queries/codeweave.json",
+        "src/main.rs",
+        "src/index/mod.rs"
+      ]
+    },
+    {
+      "id": "disc-http-transport",
+      "category": "impl-discovery",
+      "hit_rank": 1,
+      "recall_at_1": true,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 13785,
+      "search_ms": 23.7532,
+      "complete_symbols": 2,
+      "total_results": 10,
+      "top_paths": [
+        "src/mcp_transport.rs",
+        "src/main.rs",
+        "src/manager.rs",
+        "eval/queries/codeweave.json",
+        "docs/improvement-plan.md"
+      ]
+    },
+    {
+      "id": "disc-path-security",
+      "category": "impl-discovery",
+      "hit_rank": 1,
+      "recall_at_1": true,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 10466,
+      "search_ms": 29.0048,
+      "complete_symbols": 2,
+      "total_results": 10,
+      "top_paths": [
+        "src/security.rs",
+        "src/workspace/mod.rs",
+        "src/main.rs",
+        "src/manager.rs",
+        "src/workspace/io_helpers.rs"
+      ]
+    },
+    {
+      "id": "tests-workspace",
+      "category": "tests-for-symbol",
+      "hit_rank": 4,
+      "recall_at_1": false,
+      "recall_at_5": true,
+      "recall_at_10": true,
+      "result_count": 10,
+      "chars": 5420,
+      "search_ms": 40.8509,
+      "complete_symbols": 6,
+      "total_results": 10,
+      "top_paths": [
+        "src/workspace/mod.rs",
+        "src/workspace/edit.rs",
+        "src/main.rs",
+        "src/workspace/tests.rs",
+        "src/tools/schemas/workspace.rs"
+      ]
+    }
+  ]
+}

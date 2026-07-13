@@ -372,7 +372,6 @@ impl WorkspaceActor {
         let handle = encode_handle(&RangeHandle {
             version: 1,
             workspace_id: self.id.clone(),
-            snapshot_id: self.snapshot(),
             path: file.path.clone(),
             start_line,
             end_line,

@@ -1,22 +1,22 @@
 use super::*;
 
 fn test_entry(path: &str, content: &str) -> FileEntry {
+    let path_lower = path.to_ascii_lowercase();
+    let symbols = extract_symbols(Path::new(path), content);
     FileEntry {
         path: path.to_owned(),
-        path_lower: path.to_ascii_lowercase(),
+        path_lower: path_lower.clone(),
         content: content.to_owned(),
         search_content: content.to_ascii_lowercase(),
         line_count: content.lines().count().max(1),
         line_starts: line_starts(content),
-        indexed_terms: build_indexed_terms(
-            content,
-            path,
-            &extract_symbols(Path::new(path), content),
-        ),
+        indexed_terms: build_indexed_terms(content, path, &symbols),
         hash: content_hash(content),
         language: language_name(Path::new(path)).to_owned(),
         document_type: classify_document(path),
-        symbols: extract_symbols(Path::new(path), content),
+        chunks: chunks::build_chunks(content, &symbols),
+        path_tf: chunks::path_field(&path_lower),
+        symbols,
         size: content.len() as u64,
         modified_ns: 0,
     }
@@ -27,7 +27,6 @@ fn handles_round_trip() {
     let original = RangeHandle {
         version: 1,
         workspace_id: "w".into(),
-        snapshot_id: "s".into(),
         path: "a.rs".into(),
         start_line: 1,
         end_line: 2,
@@ -176,6 +175,7 @@ fn context_does_not_echo_instruction_shaped_query() {
             recent_mutations: &HashSet::new(),
             budget_chars: 12_000,
             max_results: 5,
+            ranking: Ranking::V1,
         })
         .unwrap()
         .to_string();
@@ -210,6 +210,7 @@ fn context_prefers_symbol_owner_over_wrapper() {
             recent_mutations: &HashSet::new(),
             budget_chars: 12_000,
             max_results: 2,
+            ranking: Ranking::V1,
         })
         .unwrap();
 
@@ -404,6 +405,7 @@ fn context_supports_weighted_terms_filters_scores_and_groups() {
             recent_mutations: &HashSet::new(),
             budget_chars: 10_000,
             max_results: 5,
+            ranking: Ranking::V1,
         })
         .unwrap();
 
@@ -621,6 +623,7 @@ fn context_skips_lockfiles_unless_explicitly_requested() {
             recent_mutations: &HashSet::new(),
             budget_chars: 8_000,
             max_results: 5,
+            ranking: Ranking::V1,
         })
         .unwrap();
     let paths: Vec<_> = result["results"]
@@ -743,4 +746,122 @@ fn exclusion_patterns_reject_reinclusion_rules() {
     let error =
         WorkspaceExclusions::new(workspace.path(), &["!generated/keep.rs".to_owned()]).unwrap_err();
     assert_eq!(error.0.code, "INVALID_EXCLUDE_PATTERN");
+}
+
+#[test]
+fn build_chunks_bounds_symbols_and_covers_remainder() {
+    let content = "use std::io;\n\nfn alpha() {\n    let _ = 1;\n}\n\nfn beta() {\n    let _ = 2;\n}\n";
+    let symbols = extract_symbols(Path::new("src/sample.rs"), content);
+    let built = chunks::build_chunks(content, &symbols);
+
+    // Chunks never overlap, and every non-blank line is covered. (Whitespace-only
+    // gaps are intentionally not emitted as remainder chunks — rendering them adds
+    // nothing.)
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+    let mut covered = vec![0u32; line_count + 1];
+    for chunk in &built {
+        for line in chunk.start_line..=chunk.end_line.min(line_count) {
+            covered[line] += 1;
+        }
+    }
+    assert!(
+        covered[1..].iter().all(|&hits| hits <= 1),
+        "chunks must not overlap: {covered:?}"
+    );
+    for (idx, text) in lines.iter().enumerate() {
+        if !text.trim().is_empty() {
+            assert_eq!(covered[idx + 1], 1, "non-blank line {} uncovered", idx + 1);
+        }
+    }
+
+    // The two top-level fns each become a complete Symbol chunk.
+    let symbol_names: Vec<_> = built
+        .iter()
+        .filter(|c| c.is_complete_symbol())
+        .filter_map(|c| c.symbol.as_deref())
+        .collect();
+    assert!(symbol_names.contains(&"alpha"));
+    assert!(symbol_names.contains(&"beta"));
+
+    // The leading `use` line is outside any symbol → a remainder chunk.
+    assert!(built
+        .iter()
+        .any(|c| matches!(c.kind, chunks::ChunkKind::Remainder)));
+}
+
+#[test]
+fn v2_ranking_reports_complete_symbol_and_chunk_kind() {
+    let mut index = CodeIndex::default();
+    index.insert_entry(test_entry(
+        "src/resolve.rs",
+        "use crate::x;\n\npub fn resolve_access_token() -> String {\n    String::from(\"token\")\n}\n",
+    ));
+
+    let optional: Vec<String> = Vec::new();
+    let result = index
+        .context(ContextParams {
+            workspace_id: "main",
+            snapshot_id: "snap",
+            query: "resolve_access_token",
+            required_terms: &[],
+            optional_terms: &optional,
+            exclude_terms: &[],
+            document_types: &[],
+            min_score: 0.0,
+            path_filters: &[],
+            evidence: &[],
+            dirty: &HashSet::new(),
+            recent_mutations: &HashSet::new(),
+            budget_chars: 12_000,
+            max_results: 5,
+            ranking: Ranking::V2,
+        })
+        .unwrap();
+
+    let top = &result["results"][0];
+    assert_eq!(top["path"], "src/resolve.rs");
+    // v2 emits the additive chunk fields; the match lands inside a whole symbol.
+    assert_eq!(top["chunk_kind"], "symbol");
+    assert_eq!(top["complete_symbol"], true);
+    // The rendered span covers the whole function definition.
+    assert!(top["preview"]
+        .as_str()
+        .unwrap()
+        .contains("pub fn resolve_access_token"));
+}
+
+#[test]
+fn v1_ranking_omits_chunk_fields() {
+    let mut index = CodeIndex::default();
+    index.insert_entry(test_entry(
+        "src/resolve.rs",
+        "pub fn resolve_access_token() -> String {\n    String::from(\"token\")\n}\n",
+    ));
+
+    let optional: Vec<String> = Vec::new();
+    let result = index
+        .context(ContextParams {
+            workspace_id: "main",
+            snapshot_id: "snap",
+            query: "resolve_access_token",
+            required_terms: &[],
+            optional_terms: &optional,
+            exclude_terms: &[],
+            document_types: &[],
+            min_score: 0.0,
+            path_filters: &[],
+            evidence: &[],
+            dirty: &HashSet::new(),
+            recent_mutations: &HashSet::new(),
+            budget_chars: 12_000,
+            max_results: 5,
+            ranking: Ranking::V1,
+        })
+        .unwrap();
+
+    // v1 is unchanged: the additive fields are absent from the response.
+    let top = &result["results"][0];
+    assert!(top.get("chunk_kind").is_none());
+    assert!(top.get("complete_symbol").is_none());
 }

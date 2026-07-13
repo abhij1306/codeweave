@@ -1,0 +1,27 @@
+{
+  "repo": "crawlerai",
+  "revision": "7f4d5d426359fed4e136be02ce3cc6057b3e28fd",
+  "note": "CrawlerAI retrieval fixtures based on real extraction, acquisition, API, frontend, and test ownership tasks. The revision pins the base checkout; generated baselines also record whether the evaluated worktree was dirty. Targets are workspace-relative tracked files.",
+  "queries": [
+    { "id": "sym-openrouter-parser", "category": "exact-symbol", "query": "parse_openrouter_completion annotations citations", "expected": ["backend/app/ai_visibility/openrouter_parser.py"] },
+    { "id": "sym-sitemap-normalize", "category": "exact-symbol", "query": "_normalize_sitemap_url empty domain", "expected": ["backend/app/crawl/sitemap_resolver.py"] },
+    { "id": "sym-extraction-contract", "category": "exact-symbol", "query": "ExtractionRequest ExtractionResult evidence contract", "expected": ["backend/app/extraction/contracts.py"] },
+    { "id": "file-backend-pyproject", "category": "filename-lookup", "query": "backend pyproject dependencies pytest ruff", "expected": ["backend/pyproject.toml"] },
+    { "id": "file-semantic-surface", "category": "filename-lookup", "query": "extraction semantic surface toml", "expected": ["backend/app/core/config/extraction_semantic_surface.toml"] },
+    { "id": "file-frontend-package", "category": "filename-lookup", "query": "frontend package json scripts dependencies", "expected": ["frontend/package.json"] },
+    { "id": "intent-browser-escalation", "category": "nl-intent", "query": "when HTTP acquisition escalates to browser fallback and consumes the retry budget", "expected": ["backend/app/acquisition/fetch/planned_http.py", "backend/app/acquisition/fetch/browser_policy.py"] },
+    { "id": "intent-extraction-engine", "category": "nl-intent", "query": "deterministic extraction evidence resolution confidence and model fallback orchestration", "expected": ["backend/app/extraction/engine.py"] },
+    { "id": "intent-memory-persistence", "category": "nl-intent", "query": "persist learned extraction memory selectors recipes and runtime state", "expected": ["backend/app/persistence/extraction_memory.py"] },
+    { "id": "intent-domain-profile", "category": "nl-intent", "query": "reuse saved domain acquisition profile and normalize crawl recipe settings", "expected": ["backend/app/crawl/profile/repository.py", "backend/app/crawl/profile/acquisition_contract.py"] },
+    { "id": "disc-record-stage", "category": "impl-discovery", "query": "record extraction pipeline stage persists verdict diagnostics and artifacts", "expected": ["backend/app/crawl/pipeline/record_extraction_stage.py"] },
+    { "id": "disc-retry-stage", "category": "impl-discovery", "query": "crawl pipeline retry stage browser escalation terminal failure", "expected": ["backend/app/crawl/pipeline/retry/stage.py"] },
+    { "id": "disc-mcp-tools", "category": "impl-discovery", "query": "hosted MCP tools call public extraction API", "expected": ["backend/app/mcp_server/tools.py"] },
+    { "id": "error-browser-runtime", "category": "runtime-error-to-source", "query": "Browser runtime failed to initialize", "expected": ["backend/app/acquisition/browser_pool.py"] },
+    { "id": "error-evidence-identity", "category": "runtime-error-to-source", "query": "representation canonicalization changed evidence identity", "expected": ["backend/app/extraction/adapters.py"] },
+    { "id": "tests-openrouter", "category": "tests-for-symbol", "query": "tests parse_openrouter_completion search annotations", "expected": ["backend/tests/unit/test_openrouter_ai_visibility.py"] },
+    { "id": "tests-extraction-architecture", "category": "tests-for-symbol", "query": "extraction architecture boundaries semantic surface manifest tests", "expected": ["backend/tests/unit/test_extraction_architecture.py"] },
+    { "id": "frontend-run-polling", "category": "impl-discovery", "query": "frontend crawl run polling status refresh interval", "expected": ["frontend/components/crawl/use-run-polling.ts"] },
+    { "id": "changed-extraction-engine", "category": "changed-file-priority", "query": "extraction pipeline evidence outcome diagnostics", "expected": ["backend/app/extraction/engine.py"], "dirty": ["backend/app/extraction/engine.py"] },
+    { "id": "artifact-eval-runner", "category": "artifact-exclusion", "query": "extraction evaluation gate reports fixtures runner", "expected": ["backend/eval/run.py"] }
+  ]
+}

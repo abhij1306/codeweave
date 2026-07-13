@@ -57,6 +57,7 @@ fn language(path: &Path) -> Option<Language> {
         "csharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
         "c" => Some(tree_sitter_c::LANGUAGE.into()),
         "cpp" => Some(tree_sitter_cpp::LANGUAGE.into()),
+        "json" => Some(tree_sitter_json::LANGUAGE.into()),
         _ => None,
     }
 }

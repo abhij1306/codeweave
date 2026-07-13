@@ -1,10 +1,12 @@
 # Tool Reference
 
+All tools are defined in a single registry and advertised subject to `server.toolProfile`. The `full` profile (default) exposes every tool below. `read-only` exposes only `workspace`, `code_context`, `code_capabilities`, `code_fetch`, `code_search`, `code_preview`, and the read-only git tools (`git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`). `edit` adds the write tools but excludes `bash` and `git_push`. `custom` refines the full set via `server.tools.include`/`exclude`. Calling a real tool that the active profile does not expose returns `TOOL_NOT_IN_PROFILE`. See the configuration reference for details.
+
 ## `workspace`
 
-Opens or switches this MCP session's active repository, returns a summary, refreshes repository state, reports diagnostics, reports session changes, and explicitly lists or reads configured skills.
+Returns a summary of the configured repository, refreshes its index, reports diagnostics, reports session changes, and explicitly lists or reads configured skills. Actions: `summary` (default), `refresh`, `changes`, `diagnostics`, `skills`, `skill`.
 
-Dynamic paths must resolve inside `workspace.allowedRoots`.
+The repository is fixed for the server's lifetime (configured via `workspace.path`); there is no runtime repository switching.
 
 Workspace summaries cap exact dirty/change path arrays and include grouped directory counts under `repository.dirty_file_groups` and `dirty_ownership.groups`. This keeps status responses bounded while retaining the location and scale of large change sets.
 
@@ -16,6 +18,8 @@ Use `required_terms`, `optional_terms`, `exclude_terms`, `document_types`, and `
 
 Recent Bash failures are excluded by default so unrelated retrieval stays focused. Set `include_bash_failures: true` only when runtime failures are relevant to the current debugging query.
 
+**Ranking (`index.ranking`).** The scorer is selected by the `index.ranking` config key (`"v1"` default, `"v2"` opt-in) and applies to `code_context` results. `v1` is the additive exact-match scorer that renders a short excerpt around each match. `v2` adds a filename-affinity boost (so filename and config lookups rank the right file first) and **symbol-bounded rendering**: a result spans the whole enclosing symbol when it fits the render cap, otherwise a window centered on the match. Under `v2` each result carries two additive fields — `chunk_kind` (`"symbol"`, `"symbol_part"`, or `"remainder"`) and `complete_symbol` (`true` when the excerpt is a whole symbol). Both fields are omitted under `v1`; the request schema and all other response fields are identical between the two.
+
 ## `code_capabilities`
 
 Returns the active workspace identity, supported search modes, fetch kinds, edit capabilities, policy limits, and known limitations. Use this when an agent needs to avoid schema trial-and-error.
@@ -25,6 +29,8 @@ Returns the active workspace identity, supported search modes, fetch kinds, edit
 Supports literal text, regular expressions, filenames, symbols, references, outlines, and repository-map searches. Regex mode is raw text search; use `references` for indexed symbol call-site discovery.
 
 Reference search merges adjacent matches into bounded excerpts and returns no more than three excerpts from one file, preventing a generated or high-churn caller from consuming the complete result set.
+
+Reference search is **lexical**, not semantic: after locating an indexed declaration it scans for whole-word (`\b<name>\b`) matches. Results carry `evidence: "lexical"` (both on the response and each result) and an `evidence_caveat`. It cannot distinguish overloads, shadowing, or unrelated identifiers that happen to share the name, and it misses aliased or dynamically dispatched uses. A semantic (LSP-backed) backend is planned; until then, treat these as candidate call sites.
 
 Filename mode treats plain queries as case-insensitive substrings by default. Queries containing `*` or `?` are interpreted as simple glob patterns, so `*output*safety*` matches `backend/app/core/records/output_safety.py`.
 
@@ -121,4 +127,6 @@ These tools remain narrower than unrestricted shell access. A scoped `git_diff` 
 
 Write-tool `validate` arrays contain Bash command strings. Commands run sequentially from the workspace root through the same supervisor. If one fails, later commands are skipped and the edit is rolled back unless `rollback_on_failure` is false. Validation entries report `command` and `result`.
 
-Bash is trusted-client functionality and is not sandboxed. `workspace.allowedRoots` constrains file tools and Bash `cwd`, but commands can access anything available to the CodeWeave operating-system user. CodeWeave reports Bash available only after a readiness probe passes. On Windows, an explicit absolute `policy.bash.executable` wins; otherwise CodeWeave probes the configured executable, discovers Git for Windows Bash from `PATH`, common Git install locations, and the Git executable location, and only uses WSL when that configured/probed executable actually passes readiness.
+**Deferred (detached) validation.** If a validation command exceeds the foreground budget it is promoted to a detached background run: the response returns `validation_pending: true` with a `validation_run_id`, and the edit **stays applied**. On this path `rollback_on_failure` does **not** apply — the response makes this explicit with `rollback_on_failure_not_applied: true` (and echoes the original request as `rollback_on_failure_requested`). There is no automatic post-hoc rollback, because the workspace may have legitimately moved on by the time validation finishes. Poll `bash_status` with `validation_run_id`; if it fails, revert explicitly (for example via `code_transaction` or `git_restore`).
+
+Bash is trusted-client functionality and is not sandboxed. The configured `workspace.path` constrains file tools and Bash `cwd`, but commands can access anything available to the CodeWeave operating-system user. CodeWeave reports Bash available only after a readiness probe passes. On Windows, an explicit absolute `policy.bash.executable` wins; otherwise CodeWeave probes the configured executable, discovers Git for Windows Bash from `PATH`, common Git install locations, and the Git executable location, and only uses WSL when that configured/probed executable actually passes readiness.

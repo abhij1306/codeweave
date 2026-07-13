@@ -1,3 +1,4 @@
+mod chunks;
 mod handle;
 mod lines;
 mod metadata;
@@ -28,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const INDEX_SCHEMA: &str = "codeweave-index-v6";
+const INDEX_SCHEMA: &str = "codeweave-index-v7";
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceExclusions {
@@ -144,6 +145,14 @@ pub struct FileEntry {
     pub size: u64,
     #[serde(default)]
     pub modified_ns: u128,
+    /// Symbol-bounded chunks for BM25F ranking (`v2`). Derived from `content` +
+    /// `symbols`; not persisted — rebuilt by `normalize_entry` on load/insert.
+    #[serde(skip, default)]
+    chunks: Vec<chunks::Chunk>,
+    /// Path field term frequencies, shared by every chunk of this file. Derived
+    /// from `path_lower`; not persisted.
+    #[serde(skip, default)]
+    path_tf: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -158,6 +167,14 @@ pub struct SearchMatch {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reason_codes: Vec<String>,
     pub handle: String,
+    /// Chunk provenance (v2 ranking only): `symbol`, `symbol_part`, or
+    /// `remainder`. Absent under v1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_kind: Option<String>,
+    /// True when the excerpt spans a complete symbol (v2 ranking only). Absent
+    /// under v1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete_symbol: Option<bool>,
 }
 
 pub struct SearchParams<'a> {
@@ -197,6 +214,64 @@ pub struct ContextParams<'a> {
     pub recent_mutations: &'a HashSet<String>,
     pub budget_chars: usize,
     pub max_results: usize,
+    /// Retrieval ranking algorithm. `V1` is the legacy additive file scorer;
+    /// `V2` is chunk-granular BM25F. Defaults to `V1` via `Ranking::default`.
+    pub ranking: Ranking,
+}
+
+/// Retrieval ranking algorithm selector (config `index.ranking`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Ranking {
+    #[default]
+    V1,
+    V2,
+}
+
+impl Ranking {
+    /// Parse a config value; unknown strings fall back to `V1`.
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "v2" => Ranking::V2,
+            _ => Ranking::V1,
+        }
+    }
+}
+
+/// Cap on rendered lines per v2 result. Symbols up to this length render whole
+/// (`complete_symbol: true`); longer symbols render a leading window so one large
+/// definition cannot dominate the character budget.
+const MAX_RENDER_LINES: usize = 28;
+
+/// Arguments for the v2 (chunk BM25F) ranker, shared out of `context()` so the
+/// two rankers reuse candidate collection and file eligibility.
+struct ContextV2<'a> {
+    workspace_id: &'a str,
+    snapshot_id: &'a str,
+    candidate_files: &'a [&'a FileEntry],
+    candidate_terms: &'a [String],
+    required: &'a [String],
+    optional: &'a [String],
+    query_lower: &'a str,
+    dirty: &'a HashSet<String>,
+    recent_mutations: &'a HashSet<String>,
+    min_score: f64,
+    budget_chars: usize,
+    max_results: usize,
+    eligible: &'a dyn Fn(&FileEntry) -> bool,
+}
+
+struct BaseFileScore {
+    score: f64,
+    first: usize,
+    reasons: Vec<String>,
+}
+
+fn chunk_kind_label(kind: chunks::ChunkKind) -> &'static str {
+    match kind {
+        chunks::ChunkKind::Symbol => "symbol",
+        chunks::ChunkKind::SymbolPart => "symbol_part",
+        chunks::ChunkKind::Remainder => "remainder",
+    }
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedIndex {
@@ -658,7 +733,6 @@ impl CodeIndex {
             "symbol" => {
                 let results = self.symbol_results(
                     workspace_id,
-                    snapshot_id,
                     query,
                     &path_filters,
                     max_results,
@@ -776,7 +850,6 @@ impl CodeIndex {
                 let handle = encode_handle(&RangeHandle {
                     version: 1,
                     workspace_id: workspace_id.to_owned(),
-                    snapshot_id: snapshot_id.to_owned(),
                     path: file.path.clone(),
                     start_line: start,
                     end_line: end,
@@ -841,6 +914,7 @@ impl CodeIndex {
             recent_mutations,
             budget_chars,
             max_results,
+            ranking,
         } = params;
         let legacy_terms = query_terms(query);
         let required = normalized_terms(required_terms);
@@ -880,117 +954,75 @@ impl CodeIndex {
                 }
             }
         }
-        let mut candidates: Vec<(f64, &FileEntry, usize, Vec<String>)> = Vec::new();
-        for file in candidate_files {
+
+        // File-level eligibility, shared by both rankers: path filters, document
+        // type, low-signal suppression, exclude/required terms, and evidence.
+        let eligible = |file: &FileEntry| -> bool {
             if !path_filters.allows(&file.path) {
-                continue;
+                return false;
             }
             if !document_types.is_empty()
                 && !document_types
                     .iter()
                     .any(|document_type| document_type == &file.document_type)
             {
-                continue;
+                return false;
             }
             if low_signal_context_path(&file.path)
                 && !path_filters.explicitly_requests(&file.path, &query_lower)
             {
-                continue;
+                return false;
             }
             if excluded.iter().any(|term| file_matches_term(file, term)) {
-                continue;
+                return false;
             }
             if !required.iter().all(|term| file_matches_term(file, term)) {
-                continue;
+                return false;
             }
             let changed = dirty.contains(&file.path) || recent_mutations.contains(&file.path);
-            let evidence_match = evidence.is_empty()
+            evidence.is_empty()
                 || evidence_allowed(&file.document_type, evidence)
-                || (evidence.iter().any(|item| item == "changes") && changed);
-            if !evidence_match {
+                || (evidence.iter().any(|item| item == "changes") && changed)
+        };
+
+        if ranking == Ranking::V2 {
+            return self.context_v2(ContextV2 {
+                workspace_id,
+                snapshot_id,
+                candidate_files: &candidate_files,
+                candidate_terms: &candidate_terms,
+                required: &required,
+                optional: &optional,
+                query_lower: &query_lower,
+                dirty,
+                recent_mutations,
+                min_score,
+                budget_chars,
+                max_results,
+                eligible: &eligible,
+            });
+        }
+
+        let mut candidates: Vec<(f64, &FileEntry, usize, Vec<String>)> = Vec::new();
+        for file in candidate_files {
+            if !eligible(file) {
                 continue;
             }
-            let lower = &file.search_content;
-            let path_lower = &file.path_lower;
-            let mut score = 0.0;
-            let mut first = None;
-            let mut reasons = Vec::new();
-            let mut matched_optional_terms = 0usize;
-            if !query_lower.is_empty() && lower.contains(&query_lower) {
-                score += 12.0;
-                reasons.push("exact_phrase".to_owned());
-                first = lower.find(&query_lower);
-            }
-            for term in &required {
-                if file_matches_term(file, term) {
-                    score += 15.0;
-                    reasons.push("required_term".to_owned());
-                    first = first.or_else(|| lower.find(term).or_else(|| path_lower.find(term)));
-                }
-            }
-            for term in &optional {
-                let count = lower.match_indices(term).take(50).count();
-                if count > 0 {
-                    matched_optional_terms += 1;
-                    score += (count as f64).ln_1p() * 3.0;
-                    first = first.or_else(|| lower.find(term));
-                }
-                if path_lower.contains(term) {
-                    score += 5.0;
-                    reasons.push("path_match".to_owned());
-                }
-                if let Some(symbol) = file
-                    .symbols
-                    .iter()
-                    .find(|symbol| symbol.name.to_ascii_lowercase() == *term)
-                {
-                    score += 25.0;
-                    reasons.push("exact_symbol".to_owned());
-                    first = Some(line_start_byte(&file.content, symbol.start_line));
-                } else if let Some(symbol) = file
-                    .symbols
-                    .iter()
-                    .find(|symbol| symbol.name.to_ascii_lowercase().contains(term))
-                {
-                    score += 7.0;
-                    reasons.push("symbol_match".to_owned());
-                    first =
-                        first.or_else(|| Some(line_start_byte(&file.content, symbol.start_line)));
-                }
-            }
-            if matched_optional_terms > 0 {
-                let coverage = matched_optional_terms as f64 / optional.len().max(1) as f64;
-                score += coverage * 10.0;
-                if matched_optional_terms == optional.len() {
-                    reasons.push("full_term_coverage".to_owned());
-                }
-            }
-            if dirty.contains(&file.path) {
-                score += 7.0;
-                reasons.push("dirty_file".to_owned());
-            }
-            if recent_mutations.contains(&file.path) {
-                score += 5.0;
-                reasons.push("recent_mutation".to_owned());
-            }
-            match file.document_type.as_str() {
-                "runtime_evidence" => {
-                    score *= 1.25;
-                    reasons.push("runtime_evidence".to_owned());
-                }
-                "test" => score *= 0.9,
-                "source" => score *= 1.1,
-                _ => {}
-            }
-            if score <= 0.0 {
+            let Some(base) = base_file_score(
+                file,
+                &query_lower,
+                &required,
+                &optional,
+                dirty,
+                recent_mutations,
+                (0.0, None),
+            ) else {
+                continue;
+            };
+            if base.score < min_score {
                 continue;
             }
-            let size_units = file.content.len().max(100) as f64 / 8_192.0;
-            score /= 1.0 + size_units.ln_1p().min(4.0) * 0.18;
-            if score < min_score {
-                continue;
-            }
-            candidates.push((score, file, first.unwrap_or(0), reasons));
+            candidates.push((base.score, file, base.first, base.reasons));
         }
         candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
         let mut results = Vec::new();
@@ -1021,7 +1053,6 @@ impl CodeIndex {
             let handle = encode_handle(&RangeHandle {
                 version: 1,
                 workspace_id: workspace_id.to_owned(),
-                snapshot_id: snapshot_id.to_owned(),
                 path: file.path.clone(),
                 start_line,
                 end_line,
@@ -1040,11 +1071,196 @@ impl CodeIndex {
                 group,
                 reason_codes: reasons,
                 handle,
+                chunk_kind: None,
+                complete_symbol: None,
             });
             if results.len() >= max_results || used >= budget_chars {
                 break;
             }
         }
+        Ok(json!({
+            "snapshot_id": snapshot_id,
+            "budget_chars": budget_chars,
+            "used_chars": used,
+            "result_count": results.len(),
+            "groups": groups.into_iter().map(|(group, count)| json!({"group": group, "count": count})).collect::<Vec<_>>(),
+            "results": results,
+            "guidance": if results.is_empty() { "Try literal, filename, or symbol search." } else { "Fetch only ranges needing more detail." }
+        }))
+    }
+
+    /// Chunk-granular BM25F ranking (`index.ranking: "v2"`).
+    ///
+    /// Ranks *files* by aggregate BM25F over the content/symbol/path fields (so a
+    /// file whose relevant terms are spread across several symbols still ranks),
+    /// applies deterministic post-boosts (exact symbol, dirty, recent mutation,
+    /// doc-type), then renders the best-matching chunk within each winning file as
+    /// a symbol-bounded excerpt. Response shape matches v1 with two additive
+    /// fields per result (`chunk_kind`, `complete_symbol`).
+    fn context_v2(&self, params: ContextV2<'_>) -> AppResult<serde_json::Value> {
+        let ContextV2 {
+            workspace_id,
+            snapshot_id,
+            candidate_files,
+            candidate_terms,
+            required,
+            optional,
+            query_lower,
+            dirty,
+            recent_mutations,
+            min_score,
+            budget_chars,
+            max_results,
+            eligible,
+        } = params;
+
+        // v2 reuses v1's proven per-file signal (which already ranks NL,
+        // discovery, and symbol queries well) and layers on the two things v1
+        // lacks: a filename-affinity boost (via the per-file path field) that
+        // fixes filename-lookup queries, and symbol-bounded rendering so results
+        // are whole symbols rather than fixed line windows.
+        struct ScoredFile<'a> {
+            score: f64,
+            file: &'a FileEntry,
+            first: usize,
+            reasons: Vec<String>,
+        }
+        let mut scored: Vec<ScoredFile<'_>> = Vec::new();
+
+        for file in candidate_files {
+            let file = *file;
+            if !eligible(file) {
+                continue;
+            }
+
+            // Filename affinity (the v1 weakness this ranker targets): when most
+            // query terms appear in the file's own path segments, the file *is*
+            // very likely the target even if its body barely mentions them. Boost
+            // proportionally to the fraction of query terms found in the path,
+            // with an extra bump when the path covers *every* query term (a
+            // near-certain filename lookup).
+            let path_hits = candidate_terms
+                .iter()
+                .filter(|term| file.path_tf().contains_key(term.as_str()))
+                .count();
+            let mut filename_score = 0.0;
+            let mut filename_reason = None;
+            if path_hits > 0 {
+                let affinity = path_hits as f64 / candidate_terms.len().max(1) as f64;
+                filename_score += affinity * 22.0;
+                if affinity >= 0.999 {
+                    filename_score += 18.0;
+                }
+                if affinity >= 0.5 {
+                    filename_reason = Some("filename_affinity");
+                }
+            }
+
+            let Some(base) = base_file_score(
+                file,
+                query_lower,
+                required,
+                optional,
+                dirty,
+                recent_mutations,
+                (filename_score, filename_reason),
+            ) else {
+                continue;
+            };
+            if base.score < min_score {
+                continue;
+            }
+            scored.push(ScoredFile {
+                score: base.score,
+                file,
+                first: base.first,
+                reasons: base.reasons,
+            });
+        }
+
+        scored.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.file.path.cmp(&b.file.path))
+        });
+
+        let mut results = Vec::new();
+        let mut used = 0usize;
+        let mut groups: BTreeMap<String, usize> = BTreeMap::new();
+
+        for hit in scored.into_iter().take(max_results.saturating_mul(3)) {
+            if results.len() >= max_results || used >= budget_chars {
+                break;
+            }
+            // Render the chunk enclosing the match, so the excerpt is a whole
+            // symbol rather than a fixed line window.
+            let match_line = byte_to_line(&hit.file.line_starts, hit.first);
+            let chunk = hit
+                .file
+                .chunks()
+                .iter()
+                .find(|chunk| chunk.start_line <= match_line && chunk.end_line >= match_line)
+                .or_else(|| hit.file.chunks().first());
+            let Some(chunk) = chunk else {
+                continue;
+            };
+
+            // Render the whole chunk when it fits the line cap (so small symbols
+            // come back complete); for a larger symbol fall back to a window
+            // centered on the match, so the excerpt stays relevant and the budget
+            // is not blown by one big definition.
+            let chunk_span = chunk.end_line.saturating_sub(chunk.start_line) + 1;
+            let (render_start, render_end) = if chunk_span <= MAX_RENDER_LINES {
+                (chunk.start_line.max(1), chunk.end_line.max(1))
+            } else {
+                excerpt_lines_with_count(match_line, hit.file.line_count, MAX_RENDER_LINES / 2)
+            };
+            let remaining = budget_chars.saturating_sub(used);
+            if remaining == 0 {
+                break;
+            }
+            let (excerpt, end_line) =
+                fit_excerpt(&hit.file.content, render_start, render_end, remaining);
+            if excerpt.is_empty() {
+                continue;
+            }
+            used += excerpt.len();
+
+            let start_line = render_start;
+            let complete_symbol = chunk.is_complete_symbol()
+                && render_start <= chunk.start_line
+                && end_line >= chunk.end_line;
+            let mut reasons = hit.reasons.clone();
+            if complete_symbol {
+                reasons.push("complete_symbol".to_owned());
+            }
+            let reasons = compact_reason_codes(reasons);
+            let handle = encode_handle(&RangeHandle {
+                version: 1,
+                workspace_id: workspace_id.to_owned(),
+                path: hit.file.path.clone(),
+                start_line,
+                end_line,
+                content_hash: hit.file.hash.clone(),
+                symbol: chunk.symbol.clone(),
+            })?;
+            let group = context_group(&hit.file.document_type, &reasons);
+            *groups.entry(group.clone()).or_default() += 1;
+            results.push(SearchMatch {
+                path: hit.file.path.clone(),
+                start_line,
+                end_line,
+                preview: excerpt,
+                document_type: hit.file.document_type.clone(),
+                score: hit.score,
+                group,
+                reason_codes: reasons,
+                handle,
+                chunk_kind: Some(chunk_kind_label(chunk.kind).to_owned()),
+                complete_symbol: Some(complete_symbol),
+            });
+        }
+
         Ok(json!({
             "snapshot_id": snapshot_id,
             "budget_chars": budget_chars,
@@ -1150,7 +1366,6 @@ impl CodeIndex {
                 let handle = encode_handle(&RangeHandle {
                     version: 1,
                     workspace_id: workspace_id.to_owned(),
-                    snapshot_id: snapshot_id.to_owned(),
                     path: file.path.clone(),
                     start_line: start,
                     end_line: end,
@@ -1165,6 +1380,7 @@ impl CodeIndex {
                     "preview": slice_lines(&file.content, start, end),
                     "handle": handle,
                     "match_type": "reference",
+                    "evidence": "lexical",
                     "score": 1.0,
                     "reason_codes": ["reference_match"]
                 }));
@@ -1193,6 +1409,12 @@ impl CodeIndex {
             "mode": "references",
             "symbol": symbol_name,
             "snapshot_id": snapshot_id,
+            // A5 honesty: reference lookup is a whole-word lexical scan (\b<name>\b).
+            // It cannot distinguish overloads, shadowing, or same-named identifiers
+            // in other scopes. Label the evidence so callers don't treat these as
+            // resolver-grade (semantic) references.
+            "evidence": "lexical",
+            "evidence_caveat": "Lexical whole-word matches; may include unrelated identifiers with the same name and miss aliased or dynamically referenced uses.",
             "definition_count": definitions.len(),
             "result_count": results.len(),
             "truncated": total_windows > results.len(),
@@ -1204,7 +1426,6 @@ impl CodeIndex {
     fn symbol_results(
         &self,
         workspace_id: &str,
-        snapshot_id: &str,
         query: &str,
         path_filters: &PathFilterSet<'_>,
         max_results: usize,
@@ -1233,7 +1454,6 @@ impl CodeIndex {
                 let handle = encode_handle(&RangeHandle {
                     version: 1,
                     workspace_id: workspace_id.to_owned(),
-                    snapshot_id: snapshot_id.to_owned(),
                     path: file.path.clone(),
                     start_line: symbol.start_line,
                     end_line: symbol.end_line,
@@ -1332,6 +1552,106 @@ fn file_matches_term(file: &FileEntry, term: &str) -> bool {
             .symbols
             .iter()
             .any(|symbol| symbol.name.to_ascii_lowercase().contains(term))
+}
+
+fn base_file_score(
+    file: &FileEntry,
+    query_lower: &str,
+    required: &[String],
+    optional: &[String],
+    dirty: &HashSet<String>,
+    recent_mutations: &HashSet<String>,
+    layer: (f64, Option<&str>),
+) -> Option<BaseFileScore> {
+    let (layered_score, layered_reason) = layer;
+    let lower = &file.search_content;
+    let path_lower = &file.path_lower;
+    let mut score = 0.0;
+    let mut first = None;
+    let mut reasons = Vec::new();
+    let mut matched_optional_terms = 0usize;
+
+    if !query_lower.is_empty() && lower.contains(query_lower) {
+        score += 12.0;
+        reasons.push("exact_phrase".to_owned());
+        first = lower.find(query_lower);
+    }
+    for term in required {
+        if file_matches_term(file, term) {
+            score += 15.0;
+            reasons.push("required_term".to_owned());
+            first = first.or_else(|| lower.find(term).or_else(|| path_lower.find(term)));
+        }
+    }
+    for term in optional {
+        let count = lower.match_indices(term).take(50).count();
+        if count > 0 {
+            matched_optional_terms += 1;
+            score += (count as f64).ln_1p() * 3.0;
+            first = first.or_else(|| lower.find(term));
+        }
+        if path_lower.contains(term) {
+            score += 5.0;
+            reasons.push("path_match".to_owned());
+        }
+        if let Some(symbol) = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name.to_ascii_lowercase() == *term)
+        {
+            score += 25.0;
+            reasons.push("exact_symbol".to_owned());
+            first = Some(line_start_byte(&file.content, symbol.start_line));
+        } else if let Some(symbol) = file
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name.to_ascii_lowercase().contains(term))
+        {
+            score += 7.0;
+            reasons.push("symbol_match".to_owned());
+            first = first.or_else(|| Some(line_start_byte(&file.content, symbol.start_line)));
+        }
+    }
+    if matched_optional_terms > 0 {
+        let coverage = matched_optional_terms as f64 / optional.len().max(1) as f64;
+        score += coverage * 10.0;
+        if matched_optional_terms == optional.len() {
+            reasons.push("full_term_coverage".to_owned());
+        }
+    }
+
+    score += layered_score;
+    if let Some(reason) = layered_reason {
+        reasons.push(reason.to_owned());
+    }
+    if dirty.contains(&file.path) {
+        score += 7.0;
+        reasons.push("dirty_file".to_owned());
+    }
+    if recent_mutations.contains(&file.path) {
+        score += 5.0;
+        reasons.push("recent_mutation".to_owned());
+    }
+    match file.document_type.as_str() {
+        "runtime_evidence" => {
+            score *= 1.25;
+            reasons.push("runtime_evidence".to_owned());
+        }
+        "test" => score *= 0.9,
+        "source" => score *= 1.1,
+        _ => {}
+    }
+    if score <= 0.0 {
+        return None;
+    }
+    let size_units = file.content.len().max(100) as f64 / 8_192.0;
+    score /= 1.0 + size_units.ln_1p().min(4.0) * 0.18;
+
+    Some(BaseFileScore {
+        score,
+        first: first.unwrap_or(0),
+        reasons,
+    })
 }
 
 fn context_group(document_type: &str, reasons: &[String]) -> String {
@@ -1517,6 +1837,8 @@ fn read_entry(
     let indexed_terms = build_indexed_terms(&search_content, &path_lower, &symbols);
     let line_count = content.lines().count().max(1);
     let line_starts = line_starts(&content);
+    let file_chunks = chunks::build_chunks(&content, &symbols);
+    let path_tf = chunks::path_field(&path_lower);
     Ok(Some(FileEntry {
         path: relative,
         path_lower,
@@ -1531,6 +1853,8 @@ fn read_entry(
         symbols,
         size: metadata.len(),
         modified_ns,
+        chunks: file_chunks,
+        path_tf,
     }))
 }
 

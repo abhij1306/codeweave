@@ -9,9 +9,6 @@ pub struct RangeHandle {
     pub version: u8,
     #[serde(rename = "w", alias = "workspace_id")]
     pub workspace_id: String,
-    #[allow(dead_code)]
-    #[serde(default, skip_serializing)]
-    pub snapshot_id: String,
     #[serde(rename = "p", alias = "path")]
     pub path: String,
     #[serde(rename = "a", alias = "start_line")]

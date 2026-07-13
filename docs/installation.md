@@ -45,28 +45,43 @@ source "$HOME/.cargo/env"
 ```bash
 git clone <repository-url>
 cd codeweave
-cp config.example.json config.json
 cargo build --release
 ```
 
 PowerShell:
 
 ```powershell
-Copy-Item config.example.json config.json
 cargo build --release
 ```
 
+## First-run setup and pre-flight
+
+Create a configuration and bearer token for a project with `init`, then validate the real startup path with `doctor`:
+
+```bash
+cargo run -- init --path /absolute/path/to/project
+cargo run -- doctor --config config.json
+```
+
+PowerShell:
+
+```powershell
+cargo run -- init --path C:\Development\project
+cargo run -- doctor --config config.json
+```
+
+`init` refuses to replace an existing config unless given `--force`. `doctor` checks JSON/config validation, the workspace, Git, the HTTP port, bearer-token presence, eager index initialization, and Bash; a failed check produces a non-zero exit. It does not create a missing token — run `init` or start `serve` once after fixing the configuration.
+
 ## Configure
 
-Edit `config.json` and replace all example paths with valid local paths. Keep `allowedRoots` narrower than your home directory whenever possible.
+CodeWeave serves exactly one repository, fixed for the process lifetime. Edit `config.json` and set `workspace.path` to the absolute path of that repository; it is canonicalized once at startup. There is no runtime repository switching.
 
 Unix-style example:
 
 ```json
 {
   "workspace": {
-    "defaultPath": "/home/user/projects/example",
-    "allowedRoots": ["/home/user/projects"],
+    "path": "/home/user/projects/example",
     "artifactPaths": ["artifacts"],
     "excludePaths": ["**/__pycache__/", "**/.pytest_cache/", "**/.mypy_cache/", "**/.ruff_cache/", "*.log"]
   }
@@ -78,23 +93,26 @@ Windows example:
 ```json
 {
   "workspace": {
-    "defaultPath": "D:\\Development\\example",
-    "allowedRoots": ["D:\\Development"],
+    "path": "D:\\Development\\example",
     "artifactPaths": ["artifacts"],
     "excludePaths": ["**/__pycache__/", "**/.pytest_cache/", "**/.mypy_cache/", "**/.ruff_cache/", "*.log"]
   }
 }
 ```
 
+A missing or invalid `workspace.path` produces an actionable startup error (`WORKSPACE_NOT_FOUND` / `WORKSPACE_NOT_DIRECTORY`); the server does not start against a nonexistent repository.
+
 `excludePaths` uses workspace-relative gitignore-style patterns and removes matching files from indexing, watcher reconciliation, and change summaries. Negated (`!`) reinclusion patterns are not supported. Add repository-specific generated paths such as `backend/artifacts/`, `.claude/`, `.serena/`, or `.verity/` only when agents do not need to search them.
 
-`artifactPaths` explicitly includes paths that normal Git ignore rules would omit, so a directory should not appear in both lists. Per-workspace entries under `workspaces` can override these lists; dynamically opened repositories inherit the values shown under `workspace`.
+`artifactPaths` explicitly includes paths that normal Git ignore rules would omit, so a directory should not appear in both lists.
 
 Do not commit `config.json` or `.mcp-token`.
 
 `server.authMode` accepts only `bearer` or `none`. With HTTP transport and bearer authentication enabled, CodeWeave automatically creates `.mcp-token` on the first run if the configured token file is missing. Existing non-empty token files are reused. Stdio transport neither reads nor creates the bearer-token file.
 
-The token is an internal HTTP origin credential for the CodeWeave server. It is not an LLM API key and should not be entered into ChatGPT, Claude, Perplexity, or another AI client.
+The token is an internal HTTP origin credential for the CodeWeave server. It is not an LLM API key and should not be entered into ChatGPT, Claude, or another AI client.
+
+`server.toolProfile` selects which tools the server advertises: `full` (default, all tools), `read-only` (read/search/inspect and read-only git only), `edit` (adds writes, no `bash` or `git_push`), or `custom` (refine the full set with `server.tools.include`/`exclude`). It is resolved once at startup; an unknown profile or an unknown tool name in a custom list fails startup with an actionable error. See the configuration reference in the README and `docs/tools.md`.
 
 ## Run
 
@@ -104,11 +122,19 @@ HTTP:
 cargo run --release -- --transport http --config config.json
 ```
 
+Explicit `serve` is equivalent:
+
+```bash
+cargo run --release -- serve --transport http --config config.json
+```
+
 Stdio:
 
 ```bash
 cargo run --release -- --transport stdio --config config.json
 ```
+
+Both bare invocations remain supported for compatibility.
 
 ## Update
 

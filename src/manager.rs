@@ -1,5 +1,6 @@
 use crate::model::{required_str, AppError, AppResult, DaemonConfig, WorkspaceConfig};
-use crate::security::validate_relative;
+use crate::security::{canonical_root, validate_relative};
+use crate::index::Ranking;
 use crate::workspace::WorkspaceActor;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -11,9 +12,12 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-const MAX_CACHED_WORKSPACES: usize = 8;
 const MAX_LATENCY_SAMPLES: usize = 128;
 
+/// Opaque per-request attribution token. It no longer routes to a workspace —
+/// there is exactly one repository for the process lifetime — but it still
+/// scopes Bash runs and journal/`changes` attribution so a stateful HTTP
+/// deployment keeps per-chat isolation for those concerns.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionKey(String);
 
@@ -45,13 +49,12 @@ impl Default for SessionKey {
     }
 }
 
+/// Single-repository manager. Holds exactly one `WorkspaceActor`, built eagerly
+/// at `initialize` from `workspace.path`, and serves it to every request.
 #[derive(Default)]
 pub struct WorkspaceManager {
     config: RwLock<Option<DaemonConfig>>,
-    sessions: RwLock<HashMap<SessionKey, String>>,
-    actors: RwLock<HashMap<String, Arc<WorkspaceActor>>>,
-    actor_lru: Mutex<VecDeque<String>>,
-    open_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    actor: RwLock<Option<Arc<WorkspaceActor>>>,
     latency: Mutex<HashMap<String, VecDeque<u128>>>,
     lifecycle: Mutex<()>,
     operation_gate: tokio::sync::RwLock<()>,
@@ -129,6 +132,59 @@ fn reject_legacy_execution_config(config: &Value) -> AppResult<()> {
     ))
 }
 
+/// Reject removed multi-workspace config keys with an actionable message instead
+/// of silently ignoring them (serde would drop unknown fields otherwise).
+fn reject_legacy_workspace_config(config: &Value) -> AppResult<()> {
+    let mut keys = Vec::new();
+    if config.get("workspaces").is_some() {
+        keys.push("workspaces");
+    }
+    if let Some(workspace) = config.get("workspace").and_then(Value::as_object) {
+        for key in ["defaultPath", "lockToDefault", "allowedRoots"] {
+            if workspace.contains_key(key) {
+                keys.push(key);
+            }
+        }
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::details(
+        "LEGACY_WORKSPACE_CONFIG",
+        "Multi-workspace configuration was removed; configure exactly one repository via workspace.path",
+        json!({"removed_keys": keys, "expected": {"workspace": {"path": "C:/absolute/path/to/repo"}}}),
+    ))
+}
+
+/// Derive the actor's construction input from the single configured repository.
+/// `id`/`name` are derived from the canonical path (the actor embeds `id` in the
+/// summary and provenance handles); the actor itself is unchanged.
+fn single_repo_config(config: &DaemonConfig) -> AppResult<WorkspaceConfig> {
+    let requested = config.workspace.path.trim();
+    if requested.is_empty() {
+        return Err(AppError::invalid(
+            "workspace.path is required (absolute path to the repository)",
+        ));
+    }
+    let canonical = canonical_root(Path::new(requested))?;
+    let canonical_text = canonical.to_string_lossy().into_owned();
+    let name = canonical
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Repository")
+        .to_owned();
+    let mut hasher = DefaultHasher::new();
+    canonical_text.hash(&mut hasher);
+    let id = format!("repo-{:016x}", hasher.finish());
+    Ok(WorkspaceConfig {
+        id,
+        name,
+        path: canonical_text,
+        artifact_paths: config.workspace.artifact_paths.clone(),
+        exclude_paths: config.workspace.exclude_paths.clone(),
+    })
+}
+
 impl WorkspaceManager {
     pub async fn dispatch(
         self: &Arc<Self>,
@@ -145,9 +201,9 @@ impl WorkspaceManager {
         }
     }
 
-    pub fn close_session(&self, session: &SessionKey) {
-        self.sessions.write().remove(session);
-        self.evict_idle_actors();
+    pub fn close_session(&self, _session: &SessionKey) {
+        // Single-repo model: sessions no longer bind to a workspace and the sole
+        // actor lives for the process lifetime, so there is nothing to evict.
     }
 
     async fn dispatch_inner(
@@ -175,29 +231,29 @@ impl WorkspaceManager {
                 run_blocking(move || manager.workspace(&session, &params)).await
             }
             "code_context" => {
-                let actor = self.active_actor(session)?;
+                let actor = self.actor()?;
                 let params = params.clone();
                 let session_id = session.as_str().to_owned();
                 run_blocking(move || actor.code_context_for_session(&session_id, &params)).await
             }
             "code_search" => {
-                let actor = self.active_actor(session)?;
+                let actor = self.actor()?;
                 let params = params.clone();
                 run_blocking(move || actor.code_search(&params)).await
             }
             "code_fetch" => {
-                let actor = self.active_actor(session)?;
+                let actor = self.actor()?;
                 let params = params.clone();
                 let session_id = session.as_str().to_owned();
                 run_blocking(move || actor.code_fetch_for_session(&session_id, &params)).await
             }
             "code_capabilities" => {
-                let actor = self.active_actor(session)?;
+                let actor = self.actor()?;
                 run_blocking(move || actor.code_capabilities()).await
             }
             "code_write" | "code_replace" | "code_replace_range" | "code_insert"
             | "code_delete" | "code_rename" | "code_preview" | "code_transaction" => {
-                let actor = self.active_actor(session)?;
+                let actor = self.actor()?;
                 let mut prepared = params.clone();
                 if prepared.get("snapshot_id").is_none() {
                     if let Some(snapshot) = actor.summary_ids()?.get("snapshot_id") {
@@ -208,7 +264,7 @@ impl WorkspaceManager {
             }
             "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame" | "git_preflight"
             | "git_stage" | "git_commit" | "git_restore" | "git_push" => {
-                let actor = self.active_actor(session)?;
+                let actor = self.actor()?;
                 let params = params.clone();
                 run_blocking(move || actor.git(&params)).await
             }
@@ -256,9 +312,7 @@ impl WorkspaceManager {
                     )));
                 }
                 prepared["action"] = Value::String(action.to_owned());
-                self.active_actor(session)?
-                    .run(session.as_str(), &prepared)
-                    .await
+                self.actor()?.run(session.as_str(), &prepared).await
             }
             _ => Err(AppError::details(
                 "METHOD_NOT_FOUND",
@@ -275,100 +329,81 @@ impl WorkspaceManager {
         Ok(result)
     }
 
+    /// Build the single repository actor eagerly (index scan + file watcher start
+    /// happen inside `WorkspaceActor::open`) and pre-probe Bash so the first
+    /// validated edit does not pay the discovery cost inline.
     fn initialize(&self, params: &Value) -> AppResult<Value> {
         reject_legacy_execution_config(params)?;
+        reject_legacy_workspace_config(params)?;
         let config: DaemonConfig = serde_json::from_value(params.clone())?;
-        if config.workspace.lock_to_default && config.workspace.default_path.is_none() {
-            return Err(AppError::invalid(
-                "workspace.lockToDefault requires workspace.defaultPath",
-            ));
-        }
-        for actor in self.actors.read().values() {
-            let running_runs = actor.running_bash_count();
-            if running_runs > 0 {
-                return Err(AppError::details(
-                    "WORKSPACE_BUSY",
-                    "Cannot reinitialize while Bash runs are active",
-                    json!({"running_runs": running_runs}),
-                ));
-            }
-        }
-        if config.workspaces.is_empty()
-            && config.workspace.default_path.is_none()
-            && config.workspace.allowed_roots.is_empty()
-        {
-            return Err(AppError::invalid(
-                "Configure workspace.defaultPath, workspace.allowedRoots, or one legacy workspace",
-            ));
-        }
         if config.skills.enabled && !config.skills.explicit_only {
             return Err(AppError::invalid(
                 "skills.explicitOnly must remain true; automatic skill invocation is not supported",
             ));
         }
-        let mut ids = std::collections::HashSet::new();
-        for workspace in &config.workspaces {
-            if !ids.insert(workspace.id.clone()) {
-                return Err(AppError::details(
-                    "DUPLICATE_WORKSPACE",
-                    "Workspace ids must be unique",
-                    json!({"workspace_id": workspace.id}),
-                ));
-            }
-        }
+
+        let repo = single_repo_config(&config)?;
+        let ranking = Ranking::parse(&config.index.ranking);
+        let open_started = Instant::now();
+        let actor = Arc::new(WorkspaceActor::open(
+            &repo,
+            config.policy.clone(),
+            ranking,
+            PathBuf::from(config.cache_root.clone()),
+        )?);
+        let open_ms = open_started.elapsed().as_millis();
+
+        let bash_probe_started = Instant::now();
+        let bash_available = actor.probe_bash().is_ok();
+        let bash_probe_ms = bash_probe_started.elapsed().as_millis();
+
         let _lifecycle = self.lifecycle.lock();
-        *self.config.write() = Some(config.clone());
-        self.sessions.write().clear();
-        self.actors.write().clear();
-        self.actor_lru.lock().clear();
-        self.open_locks.lock().clear();
+        *self.config.write() = Some(config);
+        *self.actor.write() = Some(actor.clone());
         self.latency.lock().clear();
-        let prewarmed = self.prewarm_default_workspace(&config)?;
+
+        tracing::info!(
+            workspace = %repo.path,
+            file_count = actor.index_file_count(),
+            open_ms,
+            bash_available,
+            bash_probe_ms,
+            "workspace initialized (eager index + watcher, bash pre-probed)"
+        );
+
         Ok(json!({
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
-            "configured_workspaces": config.workspaces.iter().map(|w| json!({"id": w.id, "name": w.name})).collect::<Vec<_>>(),
-            "default_workspace_prewarmed": prewarmed.is_some(),
-            "prewarm": prewarmed
+            "workspace": {"id": repo.id, "name": repo.name, "path": repo.path},
+            "index_ready": true,
+            "file_count": actor.index_file_count(),
+            "bash_available": bash_available,
+            "phase_ms": {"actor_open": open_ms, "bash_probe": bash_probe_ms}
         }))
-    }
-
-    fn prewarm_default_workspace(&self, config: &DaemonConfig) -> AppResult<Option<Value>> {
-        if config.workspace.default_path.is_none() && config.workspaces.len() != 1 {
-            return Ok(None);
-        }
-        self.open_workspace(
-            &SessionKey::stateless(),
-            &json!({"action": "open", "_summary_ids": true}),
-        )
-        .map(Some)
     }
 
     fn health(&self) -> AppResult<Value> {
         let config = self.config.read();
+        let actor = self.actor.read().clone();
         Ok(json!({
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
             "initialized": config.is_some(),
-            "active_sessions": self.sessions.read().len(),
-            "cached_workspaces": self.actors.read().len(),
-            "configured_workspaces": config.as_ref().map(|c| c.workspaces.len()).unwrap_or(0),
+            "index_ready": actor.is_some(),
+            "file_count": actor.as_ref().map(|a| a.index_file_count()),
+            "last_reconcile_ms_ago": actor.as_ref().map(|a| a.last_reconcile_elapsed_ms()),
             "latency_metrics": self.latency_metrics(),
-            "session_workspace_mode": true,
-            "stateless_workspace_warning": "Stateless HTTP requests share one legacy workspace key; enable server.statefulMode for isolated chat sessions."
         }))
     }
 
     fn workspace(&self, session: &SessionKey, params: &Value) -> AppResult<Value> {
-        let stateless_unpinned = self.stateless_unpinned(session);
         match params
             .get("action")
             .and_then(Value::as_str)
-            .unwrap_or("open")
+            .unwrap_or("summary")
         {
-            "open" => self.open_workspace(session, params),
             "summary" => {
-                let actor = self.active_actor(session)?;
+                let actor = self.actor()?;
                 if params
                     .get("_summary_ids")
                     .and_then(Value::as_bool)
@@ -376,21 +411,19 @@ impl WorkspaceManager {
                 {
                     actor.summary_ids()
                 } else {
-                    actor.summary(session.as_str(), stateless_unpinned)
+                    actor.summary(session.as_str(), false)
                 }
             }
-            "refresh" => self.active_actor(session)?.refresh(
+            "refresh" => self.actor()?.refresh(
                 params
                     .get("force")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 session.as_str(),
-                stateless_unpinned,
+                false,
             ),
-            "changes" => self
-                .active_actor(session)?
-                .changes(session.as_str(), params),
-            "diagnostics" => self.active_actor(session)?.diagnostics(),
+            "changes" => self.actor()?.changes(session.as_str(), params),
+            "diagnostics" => self.actor()?.diagnostics(),
             "skills" => self.list_skills(),
             "skill" => self.read_skill(params),
             action => Err(AppError::details(
@@ -401,227 +434,13 @@ impl WorkspaceManager {
         }
     }
 
-    fn open_workspace(&self, session: &SessionKey, params: &Value) -> AppResult<Value> {
-        let ids_only = params
-            .get("_summary_ids")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let started = Instant::now();
-        let config = self.config()?;
-        let pinned = config.workspace.lock_to_default && config.workspace.default_path.is_some();
-        let summarize = |actor: &WorkspaceActor| -> AppResult<Value> {
-            let mut summary = if ids_only {
-                actor.summary_ids()?
-            } else {
-                actor.summary(session.as_str(), session.is_stateless() && !pinned)?
-            };
-            if pinned {
-                if let Some(object) = summary.as_object_mut() {
-                    object.insert("pinned".to_owned(), json!(true));
-                }
-            }
-            Ok(summary)
-        };
-        // A pinned single-repo instance ignores any caller-supplied `path` so a
-        // dropped transport session can never resolve to the wrong repository.
-        let requested_path = if pinned {
-            None
-        } else {
-            params.get("path").and_then(Value::as_str)
-        };
-        let workspace = if let Some(path) = requested_path {
-            self.workspace_for_path(&config, path)?
-        } else if let Some(path) = config.workspace.default_path.as_deref() {
-            self.workspace_for_path(&config, path)?
-        } else if config.workspaces.len() == 1 {
-            config.workspaces[0].clone()
-        } else {
-            return Err(AppError::details(
-                "WORKSPACE_REQUIRED",
-                "Pass an absolute path or configure workspace.defaultPath",
-                json!({"suggested_action": "workspace(action='open', path='...')"}),
-            ));
-        };
-
-        let canonical_workspace = self.canonicalize_workspace(&config, &workspace)?;
-        if let Some(actor) = self.active_actor_if_open(session) {
-            if actor.root_path() == Path::new(&canonical_workspace.path) {
-                self.record_session_binding(session, &canonical_workspace.path);
-                let mut summary = summarize(&actor)?;
-                add_elapsed(&mut summary, started.elapsed().as_millis(), true);
-                add_phase_metrics(
-                    &mut summary,
-                    &[
-                        ("actor_cache_lookup", 0),
-                        ("total_local", started.elapsed().as_millis()),
-                    ],
-                );
-                return Ok(summary);
-            }
-            let running_runs = actor.running_bash_count();
-            if running_runs > 0 {
-                return Err(AppError::details(
-                    "WORKSPACE_BUSY",
-                    "Cannot switch repositories while Bash runs are active in this session",
-                    json!({"running_runs": running_runs, "suggested_action": "Wait for or cancel active Bash runs before switching repositories"}),
-                ));
-            }
-        }
-
-        let key = canonical_workspace.path.clone();
-        let open_lock = self.workspace_open_lock(&key);
-        let mut actor_open_ms = 0;
-        let (actor_result, actor_cache_hit, cache_lookup_ms) = {
-            let _open_guard = open_lock.lock();
-            let cache_lookup_started = Instant::now();
-            let cached_actor = self.actors.read().get(&key).cloned();
-            let cache_lookup_ms = cache_lookup_started.elapsed().as_millis();
-            let actor_cache_hit = cached_actor.is_some();
-            let actor_result = if let Some(actor) = cached_actor {
-                Ok(actor)
-            } else {
-                let actor_open_started = Instant::now();
-                match WorkspaceActor::open(
-                    &canonical_workspace,
-                    config.policy.clone(),
-                    PathBuf::from(config.cache_root),
-                ) {
-                    Ok(actor) => {
-                        actor_open_ms = actor_open_started.elapsed().as_millis();
-                        let actor = Arc::new(actor);
-                        self.actors.write().insert(key.clone(), actor.clone());
-                        Ok(actor)
-                    }
-                    Err(error) => Err(error),
-                }
-            };
-            (actor_result, actor_cache_hit, cache_lookup_ms)
-        };
-        self.release_workspace_open_lock(&key, &open_lock);
-        let actor = actor_result?;
-        self.record_session_binding(session, &key);
-        self.touch_actor(&key);
-        self.evict_idle_actors();
-        let mut summary = summarize(&actor)?;
-        add_elapsed(&mut summary, started.elapsed().as_millis(), actor_cache_hit);
-        add_phase_metrics(
-            &mut summary,
-            &[
-                ("actor_cache_lookup", cache_lookup_ms),
-                ("actor_open", actor_open_ms),
-                ("total_local", started.elapsed().as_millis()),
-            ],
-        );
-        Ok(summary)
-    }
-
-    fn workspace_open_lock(&self, key: &str) -> Arc<Mutex<()>> {
-        self.open_locks
-            .lock()
-            .entry(key.to_owned())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    }
-
-    fn release_workspace_open_lock(&self, key: &str, lock: &Arc<Mutex<()>>) {
-        let mut locks = self.open_locks.lock();
-        if locks
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, lock) && Arc::strong_count(lock) == 2)
-        {
-            locks.remove(key);
-        }
-    }
-
-    fn active_actor_if_open(&self, session: &SessionKey) -> Option<Arc<WorkspaceActor>> {
-        let key = self.sessions.read().get(session).cloned()?;
-        let actor = self.actors.read().get(&key).cloned();
-        if actor.is_some() {
-            self.touch_actor(&key);
-        } else {
-            self.sessions.write().remove(session);
-        }
-        actor
-    }
-
-    fn record_session_binding(&self, session: &SessionKey, key: &str) {
-        self.sessions
-            .write()
-            .insert(session.clone(), key.to_owned());
-    }
-
-    fn active_actor(&self, session: &SessionKey) -> AppResult<Arc<WorkspaceActor>> {
-        if let Some(actor) = self.active_actor_if_open(session) {
-            return Ok(actor);
-        }
-
-        let config = self.config()?;
-        if config.workspace.default_path.is_some() || config.workspaces.len() == 1 {
-            self.workspace(session, &json!({"action": "open", "_summary_ids": true}))?;
-            if let Some(actor) = self.active_actor_if_open(session) {
-                return Ok(actor);
-            }
-        }
-
-        Err(AppError::details(
-            "WORKSPACE_NOT_OPEN",
-            "No repository is active for this session. Open one explicitly or configure workspace.defaultPath.",
-            json!({
-                "suggested_action": "workspace(action='open', path='C:/absolute/path/to/project')"
-            }),
-        ))
-    }
-
-    fn stateless_unpinned(&self, session: &SessionKey) -> bool {
-        if !session.is_stateless() {
-            return false;
-        }
-        let Ok(config) = self.config() else {
-            return true;
-        };
-        !(config.workspace.lock_to_default && config.workspace.default_path.is_some())
-    }
-
-    fn touch_actor(&self, key: &str) {
-        let mut lru = self.actor_lru.lock();
-        lru.retain(|item| item != key);
-        lru.push_back(key.to_owned());
-    }
-
-    fn evict_idle_actors(&self) {
-        let mut scanned = 0usize;
-        while self.actors.read().len() > MAX_CACHED_WORKSPACES {
-            scanned += 1;
-            if scanned > self.actors.read().len() {
-                return;
-            }
-            if self.actors.read().len() <= MAX_CACHED_WORKSPACES {
-                return;
-            }
-            let Some(candidate) = self.actor_lru.lock().pop_front() else {
-                return;
-            };
-            if self
-                .sessions
-                .read()
-                .values()
-                .any(|active_key| active_key == &candidate)
-            {
-                self.touch_actor(&candidate);
-                continue;
-            }
-            let can_remove = self
-                .actors
-                .read()
-                .get(&candidate)
-                .map(|actor| actor.running_bash_count() == 0)
-                .unwrap_or(false);
-            if can_remove {
-                self.actors.write().remove(&candidate);
-            } else if self.actors.read().contains_key(&candidate) {
-                self.touch_actor(&candidate);
-            }
-        }
+    fn actor(&self) -> AppResult<Arc<WorkspaceActor>> {
+        self.actor.read().clone().ok_or_else(|| {
+            AppError::new(
+                "NOT_INITIALIZED",
+                "Daemon has not been initialized with a repository",
+            )
+        })
     }
 
     fn record_latency(&self, method: &str, elapsed_ms: u128) {
@@ -657,103 +476,6 @@ impl WorkspaceManager {
             );
         }
         Value::Object(methods)
-    }
-
-    fn workspace_for_path(
-        &self,
-        config: &DaemonConfig,
-        requested: &str,
-    ) -> AppResult<WorkspaceConfig> {
-        let canonical_text = self.canonical_workspace_path(config, requested)?;
-        for workspace in &config.workspaces {
-            if self.canonical_workspace_path(config, &workspace.path)? == canonical_text {
-                let mut configured = workspace.clone();
-                configured.path = canonical_text;
-                return Ok(configured);
-            }
-        }
-        self.dynamic_workspace(config, &canonical_text)
-    }
-
-    fn canonicalize_workspace(
-        &self,
-        config: &DaemonConfig,
-        workspace: &WorkspaceConfig,
-    ) -> AppResult<WorkspaceConfig> {
-        let mut workspace = workspace.clone();
-        workspace.path = self.canonical_workspace_path(config, &workspace.path)?;
-        Ok(workspace)
-    }
-
-    fn canonical_workspace_path(
-        &self,
-        config: &DaemonConfig,
-        requested: &str,
-    ) -> AppResult<String> {
-        let canonical = fs::canonicalize(requested).map_err(|error| {
-            AppError::details(
-                "WORKSPACE_NOT_FOUND",
-                format!("Cannot open workspace: {error}"),
-                json!({"path": requested}),
-            )
-        })?;
-        if !canonical.is_dir() {
-            return Err(AppError::new(
-                "WORKSPACE_NOT_DIRECTORY",
-                "Workspace path is not a directory",
-            ));
-        }
-        let mut allowed_roots = config.workspace.allowed_roots.clone();
-        if allowed_roots.is_empty() {
-            allowed_roots.extend(
-                config
-                    .workspaces
-                    .iter()
-                    .filter_map(|workspace| Path::new(&workspace.path).parent())
-                    .map(|path| path.to_string_lossy().into_owned()),
-            );
-            if let Some(default_path) = config.workspace.default_path.as_deref() {
-                if let Some(parent) = Path::new(default_path).parent() {
-                    allowed_roots.push(parent.to_string_lossy().into_owned());
-                }
-            }
-        }
-        let allowed = allowed_roots.iter().any(|root| {
-            fs::canonicalize(root)
-                .map(|value| canonical.starts_with(value))
-                .unwrap_or(false)
-        });
-        if !allowed {
-            return Err(AppError::details(
-                "WORKSPACE_OUTSIDE_ALLOWED_ROOTS",
-                "Workspace path is outside configured allowed roots",
-                json!({"path": canonical, "allowed_roots": allowed_roots}),
-            ));
-        }
-        Ok(canonical.to_string_lossy().into_owned())
-    }
-
-    fn dynamic_workspace(
-        &self,
-        config: &DaemonConfig,
-        requested: &str,
-    ) -> AppResult<WorkspaceConfig> {
-        let canonical_text = self.canonical_workspace_path(config, requested)?;
-        let canonical = Path::new(&canonical_text);
-        let name = canonical
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("Repository");
-        let mut hasher = DefaultHasher::new();
-        canonical_text.hash(&mut hasher);
-        let workspace_id = format!("repo-{:016x}", hasher.finish());
-        Ok(WorkspaceConfig {
-            id: workspace_id,
-            name: name.to_owned(),
-            path: canonical_text,
-            artifact_paths: config.workspace.artifact_paths.clone(),
-            exclude_paths: config.workspace.exclude_paths.clone(),
-        })
     }
 
     fn list_skills(&self) -> AppResult<Value> {
@@ -828,13 +550,6 @@ impl WorkspaceManager {
     }
 }
 
-fn add_elapsed(value: &mut Value, elapsed_ms: u128, already_open: bool) {
-    if let Some(object) = value.as_object_mut() {
-        object.insert("request_elapsed_ms".to_owned(), json!(elapsed_ms));
-        object.insert("already_open".to_owned(), json!(already_open));
-    }
-}
-
 fn add_operation_elapsed(value: &mut Value, elapsed_ms: u128) {
     if let Some(object) = value.as_object_mut() {
         object.insert("elapsed_ms".to_owned(), json!(elapsed_ms));
@@ -847,25 +562,11 @@ fn add_latency_metrics(value: &mut Value, metrics: Value) {
     }
 }
 
-fn add_phase_metrics(value: &mut Value, phases: &[(&str, u128)]) {
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "phase_ms".to_owned(),
-            Value::Object(
-                phases
-                    .iter()
-                    .map(|(name, elapsed)| ((*name).to_owned(), json!(elapsed)))
-                    .collect(),
-            ),
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{
-        test_bash_executable, BashConfig, PolicyConfig, SkillsConfig, WorkspaceConfig,
+        test_bash_executable, BashConfig, IndexSettings, PolicyConfig, SkillsConfig,
         WorkspaceSettings,
     };
     use tempfile::tempdir;
@@ -888,15 +589,13 @@ mod tests {
         max_file_bytes: usize,
     ) -> Value {
         serde_json::to_value(DaemonConfig {
-            workspaces: vec![WorkspaceConfig {
-                id: "main".to_owned(),
-                name: "Main".to_owned(),
+            workspace: WorkspaceSettings {
                 path: root.to_string_lossy().into_owned(),
                 artifact_paths: Vec::new(),
                 exclude_paths: Vec::new(),
-            }],
-            workspace: Default::default(),
-            skills: Default::default(),
+            },
+            skills: SkillsConfig::default(),
+            index: IndexSettings::default(),
             policy: PolicyConfig {
                 max_file_bytes,
                 max_context_chars: 50_000,
@@ -908,20 +607,87 @@ mod tests {
         .unwrap()
     }
 
+    fn sleep_command() -> &'static str {
+        "echo started; sleep 30"
+    }
+
     #[test]
-    fn initialize_rejects_lock_to_default_without_default_path() {
+    fn initialize_builds_single_actor_eagerly_from_workspace_path() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
-        let mut config = daemon_config(root.path(), cache.path(), 1_000_000);
-        config["workspace"]["lockToDefault"] = json!(true);
+        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let manager = WorkspaceManager::default();
+
+        let result = manager
+            .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
+            .unwrap();
+
+        assert_eq!(result["index_ready"], true);
+        assert!(result["file_count"].as_u64().unwrap() >= 1);
+        assert!(result["phase_ms"]["actor_open"].is_number());
+
+        // The actor is available immediately (eager start) — the first code tool
+        // pays zero index-build cost.
+        let actor = manager.actor().unwrap();
+        assert_eq!(actor.root_path(), std::fs::canonicalize(root.path()).unwrap());
+    }
+
+    #[test]
+    fn initialize_rejects_missing_workspace_path() {
+        let cache = tempdir().unwrap();
+        let mut config = daemon_config(cache.path(), cache.path(), 1_000_000);
+        config["workspace"]["path"] = json!("");
 
         let error = WorkspaceManager::default().initialize(&config).unwrap_err();
 
         assert_eq!(error.0.code, "INVALID_ARGUMENT");
-        assert!(error
-            .0
-            .message
-            .contains("workspace.lockToDefault requires workspace.defaultPath"));
+        assert!(error.0.message.contains("workspace.path"));
+    }
+
+    #[test]
+    fn initialize_rejects_nonexistent_workspace_path() {
+        let cache = tempdir().unwrap();
+        let mut config = daemon_config(cache.path(), cache.path(), 1_000_000);
+        config["workspace"]["path"] = json!(cache.path().join("does-not-exist"));
+
+        let error = WorkspaceManager::default().initialize(&config).unwrap_err();
+
+        assert_eq!(error.0.code, "WORKSPACE_NOT_FOUND");
+    }
+
+    #[test]
+    fn initialize_rejects_removed_multi_workspace_keys() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        for (mutate, expected_key) in [
+            (
+                Box::new(|c: &mut Value| c["workspaces"] = json!([])) as Box<dyn Fn(&mut Value)>,
+                "workspaces",
+            ),
+            (
+                Box::new(|c: &mut Value| c["workspace"]["defaultPath"] = json!("/x")),
+                "defaultPath",
+            ),
+            (
+                Box::new(|c: &mut Value| c["workspace"]["lockToDefault"] = json!(true)),
+                "lockToDefault",
+            ),
+            (
+                Box::new(|c: &mut Value| c["workspace"]["allowedRoots"] = json!(["/x"])),
+                "allowedRoots",
+            ),
+        ] {
+            let mut config = daemon_config(root.path(), cache.path(), 1_000_000);
+            mutate(&mut config);
+            let error = WorkspaceManager::default().initialize(&config).unwrap_err();
+            assert_eq!(error.0.code, "LEGACY_WORKSPACE_CONFIG", "{expected_key}");
+            let removed = error.0.details.as_ref().unwrap()["removed_keys"]
+                .as_array()
+                .unwrap();
+            assert!(removed.iter().any(|k| k == expected_key), "{expected_key}");
+        }
     }
 
     #[test]
@@ -954,640 +720,92 @@ mod tests {
         assert!(error.0.message.contains("policy.bash"));
     }
 
-    fn sleep_command() -> &'static str {
-        "echo started; sleep 30"
-    }
-
     #[test]
-    fn code_tools_reuse_prewarmed_default_repository() {
+    fn code_tools_share_the_single_actor_across_sessions() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
         let manager = WorkspaceManager::default();
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: Some(root.path().to_string_lossy().into_owned()),
-                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache.path().to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager.initialize(&config).unwrap();
+        manager
+            .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
+            .unwrap();
 
-        assert!(manager
-            .sessions
-            .read()
-            .contains_key(&SessionKey::stateless()));
-        let actor = manager.active_actor(&SessionKey::stdio()).unwrap();
+        let actor_a = manager.actor().unwrap();
+        let actor_b = manager.actor().unwrap();
+        assert!(Arc::ptr_eq(&actor_a, &actor_b));
         assert_eq!(
-            actor.root_path(),
+            actor_a.root_path(),
             std::fs::canonicalize(root.path()).unwrap()
         );
-        assert_eq!(manager.actors.read().len(), 1);
     }
 
     #[test]
-    fn configured_workspace_metadata_survives_canonical_open() {
+    fn code_tools_before_initialize_report_not_initialized() {
+        let manager = WorkspaceManager::default();
+        let Err(error) = manager.actor() else {
+            panic!("actor() must fail before initialize");
+        };
+        assert_eq!(error.0.code, "NOT_INITIALIZED");
+    }
+
+    #[test]
+    fn reinitialize_replaces_the_actor() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
         let manager = WorkspaceManager::default();
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: vec![WorkspaceConfig {
-                id: "configured-id".to_owned(),
-                name: "Configured Name".to_owned(),
-                path: root.path().to_string_lossy().into_owned(),
-                artifact_paths: vec!["logs".to_owned()],
-                exclude_paths: vec!["generated/".to_owned()],
-            }],
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: Some(root.path().to_string_lossy().into_owned()),
-                allowed_roots: Vec::new(),
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache.path().to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager.initialize(&config).unwrap();
 
-        let summary = manager
-            .workspace(&SessionKey::stdio(), &json!({"action": "open"}))
+        manager
+            .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
             .unwrap();
+        let first = manager.actor().unwrap();
 
-        assert_eq!(summary["workspace_id"], "configured-id");
-        assert_eq!(summary["name"], "Configured Name");
+        manager
+            .initialize(&daemon_config(root.path(), cache.path(), 512_000))
+            .unwrap();
+        let second = manager.actor().unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 
     #[test]
-    fn dynamic_open_switches_only_the_calling_session_and_reuses_cache() {
-        let root = tempdir().unwrap();
-        let first = root.path().join("first");
-        let second = root.path().join("second");
-        let cache = root.path().join("cache");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-        std::fs::write(first.join("main.rs"), "fn first() {}\n").unwrap();
-        std::fs::write(second.join("main.rs"), "fn second() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: None,
-                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache.to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager.initialize(&config).unwrap();
-        let session_a = SessionKey::new("a");
-        let session_b = SessionKey::new("b");
-        manager
-            .workspace(&session_a, &json!({"action": "open", "path": first}))
-            .unwrap();
-        manager
-            .workspace(&session_b, &json!({"action": "open", "path": second}))
-            .unwrap();
-
-        assert_eq!(
-            manager.active_actor(&session_a).unwrap().root_path(),
-            std::fs::canonicalize(&first).unwrap()
-        );
-        assert_eq!(
-            manager.active_actor(&session_b).unwrap().root_path(),
-            std::fs::canonicalize(&second).unwrap()
-        );
-        assert_eq!(std::fs::read_dir(cache.join("repos")).unwrap().count(), 2);
-    }
-
-    #[test]
-    fn http_session_keys_open_independent_active_workspaces() {
-        let root = tempdir().unwrap();
-        let first = root.path().join("first");
-        let second = root.path().join("second");
-        let cache = root.path().join("cache");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-        std::fs::write(first.join("main.rs"), "fn first() {}\n").unwrap();
-        std::fs::write(second.join("main.rs"), "fn second() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: None,
-                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache.to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager.initialize(&config).unwrap();
-        let session_a = SessionKey::new("http:a");
-        let session_b = SessionKey::new("http:b");
-
-        manager
-            .workspace(&session_a, &json!({"action": "open", "path": first}))
-            .unwrap();
-        manager
-            .workspace(&session_b, &json!({"action": "open", "path": second}))
-            .unwrap();
-
-        assert_eq!(
-            manager.active_actor(&session_a).unwrap().root_path(),
-            std::fs::canonicalize(&first).unwrap()
-        );
-        assert_eq!(
-            manager.active_actor(&session_b).unwrap().root_path(),
-            std::fs::canonicalize(&second).unwrap()
-        );
-    }
-
-    #[test]
-    fn unbound_http_session_uses_default_after_another_session_opens() {
-        let root = tempdir().unwrap();
-        let default_workspace = root.path().join("crawlerai");
-        let explicit_workspace = root.path().join("codeweave");
-        let cache = root.path().join("cache");
-        std::fs::create_dir_all(&default_workspace).unwrap();
-        std::fs::create_dir_all(&explicit_workspace).unwrap();
-        std::fs::write(default_workspace.join("main.rs"), "fn crawlerai() {}\n").unwrap();
-        std::fs::write(explicit_workspace.join("main.rs"), "fn codeweave() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: Some(default_workspace.to_string_lossy().into_owned()),
-                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache.to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager.initialize(&config).unwrap();
-        let auto_session = SessionKey::new("http:auto-opened");
-        let explicit_session = SessionKey::new("http:explicit-open");
-
-        assert_eq!(
-            manager.active_actor(&auto_session).unwrap().root_path(),
-            std::fs::canonicalize(&default_workspace).unwrap()
-        );
-        manager
-            .workspace(
-                &explicit_session,
-                &json!({"action": "open", "path": explicit_workspace}),
-            )
-            .unwrap();
-
-        assert_eq!(
-            manager.active_actor(&auto_session).unwrap().root_path(),
-            std::fs::canonicalize(&default_workspace).unwrap()
-        );
-        assert_eq!(
-            manager.active_actor(&explicit_session).unwrap().root_path(),
-            std::fs::canonicalize(&explicit_workspace).unwrap()
-        );
-    }
-
-    #[test]
-    fn stateless_session_uses_one_legacy_workspace_key() {
-        let root = tempdir().unwrap();
-        let first = root.path().join("first");
-        let second = root.path().join("second");
-        let cache = root.path().join("cache");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-        std::fs::write(first.join("main.rs"), "fn first() {}\n").unwrap();
-        std::fs::write(second.join("main.rs"), "fn second() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: None,
-                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache.to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager.initialize(&config).unwrap();
-
-        manager
-            .workspace(
-                &SessionKey::stateless(),
-                &json!({"action": "open", "path": first}),
-            )
-            .unwrap();
-        manager
-            .workspace(
-                &SessionKey::stateless(),
-                &json!({"action": "open", "path": second}),
-            )
-            .unwrap();
-
-        assert_eq!(manager.sessions.read().len(), 1);
-        assert_eq!(
-            manager
-                .active_actor(&SessionKey::stateless())
-                .unwrap()
-                .root_path(),
-            std::fs::canonicalize(&second).unwrap()
-        );
-    }
-
-    #[test]
-    fn pinned_instance_ignores_foreign_open_path() {
-        let root = tempdir().unwrap();
-        let pinned = root.path().join("pinned");
-        let other = root.path().join("other");
-        let cache = root.path().join("cache");
-        std::fs::create_dir_all(&pinned).unwrap();
-        std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(pinned.join("main.rs"), "fn pinned() {}\n").unwrap();
-        std::fs::write(other.join("main.rs"), "fn other() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: true,
-                default_path: Some(pinned.to_string_lossy().into_owned()),
-                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache.to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager.initialize(&config).unwrap();
-
-        // Explicitly asking for `other` must still resolve to the pinned repo,
-        // and the summary must advertise the pin.
-        let summary = manager
-            .workspace(
-                &SessionKey::stateless(),
-                &json!({"action": "open", "path": other}),
-            )
-            .unwrap();
-        assert_eq!(summary.get("pinned").and_then(Value::as_bool), Some(true));
-        assert_eq!(
-            manager
-                .active_actor(&SessionKey::stateless())
-                .unwrap()
-                .root_path(),
-            std::fs::canonicalize(&pinned).unwrap()
-        );
-    }
-
-    #[test]
-    fn sessions_opening_same_repo_reuse_one_actor_and_clear_open_lock() {
+    fn summary_ids_flag_uses_lightweight_summary() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
-        std::fs::write(root.path().join("main.rs"), "fn shared() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: None,
-                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache.path().to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager.initialize(&config).unwrap();
-        let session_a = SessionKey::new("a");
-        let session_b = SessionKey::new("b");
-        manager
-            .workspace(&session_a, &json!({"action": "open", "path": root.path()}))
-            .unwrap();
-        let second = manager
-            .workspace(&session_b, &json!({"action": "open", "path": root.path()}))
-            .unwrap();
-
-        let actor_a = manager.active_actor(&session_a).unwrap();
-        let actor_b = manager.active_actor(&session_b).unwrap();
-        assert!(Arc::ptr_eq(&actor_a, &actor_b));
-        assert_eq!(manager.actors.read().len(), 1);
-        assert!(manager.open_locks.lock().is_empty());
-        assert_eq!(second["already_open"], true);
-        assert!(second["phase_ms"]["actor_cache_lookup"].is_number());
-    }
-
-    #[test]
-    fn closing_session_removes_active_mapping_and_allows_eviction() {
-        let root = tempdir().unwrap();
-        let cache = root.path().join("cache");
-        let manager = WorkspaceManager::default();
-        let mut workspaces = Vec::new();
-        for index in 0..=MAX_CACHED_WORKSPACES {
-            let workspace = root.path().join(format!("repo-{index}"));
-            std::fs::create_dir_all(&workspace).unwrap();
-            std::fs::write(
-                workspace.join("main.rs"),
-                format!("fn repo_{index}() {{}}\n"),
-            )
-            .unwrap();
-            workspaces.push(workspace);
-        }
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: None,
-                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache.to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager.initialize(&config).unwrap();
-        let sessions: Vec<_> = (0..=MAX_CACHED_WORKSPACES)
-            .map(|index| SessionKey::new(format!("session-{index}")))
-            .collect();
-        for (session, workspace) in sessions.iter().zip(&workspaces) {
-            manager
-                .workspace(session, &json!({"action": "open", "path": workspace}))
-                .unwrap();
-        }
-        assert!(manager.actors.read().len() > MAX_CACHED_WORKSPACES);
-
-        manager.close_session(&sessions[0]);
-
-        assert!(manager.sessions.read().get(&sessions[0]).is_none());
-        assert!(manager.actors.read().len() <= MAX_CACHED_WORKSPACES);
-    }
-
-    #[test]
-    fn stateless_session_reports_workspace_isolation_warning() {
-        let root = tempdir().unwrap();
-        let cache = tempdir().unwrap();
-        std::fs::write(root.path().join("main.rs"), "fn shared() {}\n").unwrap();
+        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
         let manager = WorkspaceManager::default();
         manager
             .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
             .unwrap();
 
         let summary = manager
-            .workspace(&SessionKey::stateless(), &json!({"action": "open"}))
+            .workspace(
+                &SessionKey::stdio(),
+                &json!({"action": "summary", "_summary_ids": true}),
+            )
             .unwrap();
 
-        assert!(summary["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|warning| warning.as_str().is_some_and(
-                |text| text.contains("Stateless HTTP requests share one legacy workspace key")
-            )));
+        assert!(summary.get("workspace_id").is_some());
+        assert!(summary.get("snapshot_id").is_some());
+        assert!(summary.get("generation").is_some());
+        assert!(summary.get("root").is_none());
+        assert!(summary.get("mutations").is_none());
     }
 
     #[test]
-    fn pinned_stateless_session_does_not_report_workspace_isolation_warning() {
-        let root = tempdir().unwrap();
-        let cache = tempdir().unwrap();
-        std::fs::write(root.path().join("main.rs"), "fn pinned() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
-        let mut config = daemon_config(root.path(), cache.path(), 1_000_000);
-        config["workspace"]["defaultPath"] = json!(root.path());
-        config["workspace"]["lockToDefault"] = json!(true);
-        manager.initialize(&config).unwrap();
-
-        let summary = manager
-            .workspace(&SessionKey::stateless(), &json!({"action": "open"}))
-            .unwrap();
-
-        assert!(!summary["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|warning| warning.as_str().is_some_and(
-                |text| text.contains("Stateless HTTP requests share one legacy workspace key")
-            )));
-    }
-
-    #[tokio::test]
-    async fn running_bash_blocks_only_owning_session_switch_and_global_reinitialize() {
-        let root = tempdir().unwrap();
-        let first = root.path().join("first");
-        let second = root.path().join("second");
-        let cache = root.path().join("cache");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-        std::fs::write(first.join("main.rs"), "fn first() {}\n").unwrap();
-        std::fs::write(second.join("main.rs"), "fn second() {}\n").unwrap();
-        let manager = Arc::new(WorkspaceManager::default());
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: None,
-                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache.to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager
-            .dispatch(SessionKey::stdio(), "initialize", &config)
-            .await
-            .unwrap();
-        let session_a = SessionKey::new("a");
-        let session_b = SessionKey::new("b");
-        manager
-            .dispatch(
-                session_a.clone(),
-                "workspace",
-                &json!({"action": "open", "path": first}),
-            )
-            .await
-            .unwrap();
-        let started = manager
-            .dispatch(
-                session_a.clone(),
-                "bash",
-                &json!({"command": sleep_command(), "background": true}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(started["background"], true);
-
-        let switch_error = manager
-            .dispatch(
-                session_a.clone(),
-                "workspace",
-                &json!({"action": "open", "path": second}),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(switch_error.0.code, "WORKSPACE_BUSY");
-
-        manager
-            .dispatch(
-                session_b,
-                "workspace",
-                &json!({"action": "open", "path": second}),
-            )
-            .await
-            .unwrap();
-
-        let reinitialize_error = manager
-            .dispatch(SessionKey::stdio(), "initialize", &config)
-            .await
-            .unwrap_err();
-        assert_eq!(reinitialize_error.0.code, "WORKSPACE_BUSY");
-
-        let run_id = started["run_id"].as_str().unwrap();
-        let _ = manager
-            .dispatch(session_a, "bash_cancel", &json!({"run_id": run_id}))
-            .await;
-    }
-
-    #[tokio::test]
-    async fn bash_run_registry_is_scoped_by_session() {
+    fn workspace_open_action_is_no_longer_supported() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = Arc::new(WorkspaceManager::default());
-        let config = daemon_config(root.path(), cache.path(), 1_000_000);
+        let manager = WorkspaceManager::default();
         manager
-            .dispatch(SessionKey::stdio(), "initialize", &config)
-            .await
+            .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
             .unwrap();
-        let session_a = SessionKey::new("http:a");
-        let session_b = SessionKey::new("http:b");
-        for session in [&session_a, &session_b] {
-            manager
-                .dispatch(
-                    session.clone(),
-                    "workspace",
-                    &json!({"action": "open", "path": root.path()}),
-                )
-                .await
-                .unwrap();
-        }
 
-        let started = manager
-            .dispatch(
-                session_a.clone(),
-                "bash",
-                &json!({"command": sleep_command(), "background": true}),
-            )
-            .await
-            .unwrap();
-        let run_id = started["run_id"].as_str().unwrap();
-
-        let retry_from_other_session = manager
-            .dispatch(
-                session_b.clone(),
-                "bash",
-                &json!({"command": sleep_command(), "background": true}),
-            )
-            .await
+        let error = manager
+            .workspace(&SessionKey::stdio(), &json!({"action": "open"}))
             .unwrap_err();
-        assert_eq!(retry_from_other_session.0.code, "RUN_BUSY");
-        assert!(retry_from_other_session
-            .0
-            .details
-            .as_ref()
-            .unwrap()
-            .get("active_run")
-            .is_none_or(Value::is_null));
-
-        let cross_session_cancel = manager
-            .dispatch(session_b, "bash_cancel", &json!({"run_id": run_id}))
-            .await
-            .unwrap_err();
-        assert_eq!(cross_session_cancel.0.code, "RUN_NOT_FOUND");
-
-        let _ = manager
-            .dispatch(session_a, "bash_cancel", &json!({"run_id": run_id}))
-            .await;
+        assert_eq!(error.0.code, "INVALID_WORKSPACE_ACTION");
     }
 
     #[tokio::test]
@@ -1599,10 +817,6 @@ mod tests {
         let config = daemon_config(root.path(), cache.path(), 1_000_000);
         manager
             .dispatch(SessionKey::stdio(), "initialize", &config)
-            .await
-            .unwrap();
-        manager
-            .dispatch(SessionKey::stdio(), "workspace", &json!({"action": "open"}))
             .await
             .unwrap();
 
@@ -1621,6 +835,8 @@ mod tests {
 
         assert!(summary["latency_metrics"]["workspace"]["p50_ms"].is_number());
         assert!(health["latency_metrics"]["workspace"]["p90_ms"].is_number());
+        assert_eq!(health["index_ready"], true);
+        assert!(health["file_count"].as_u64().unwrap() >= 1);
     }
 
     #[tokio::test]
@@ -1635,7 +851,11 @@ mod tests {
             .await
             .unwrap();
         manager
-            .dispatch(SessionKey::stdio(), "workspace", &json!({"action": "open"}))
+            .dispatch(
+                SessionKey::stdio(),
+                "workspace",
+                &json!({"action": "summary"}),
+            )
             .await
             .unwrap();
         manager
@@ -1651,147 +871,6 @@ mod tests {
         assert!(health["latency_metrics"].get("workspace").is_none());
     }
 
-    #[test]
-    fn failed_open_clears_per_workspace_lock_without_switching_session() {
-        let root = tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        std::fs::create_dir(&workspace).unwrap();
-        std::fs::write(workspace.join("main.rs"), "fn valid() {}\n").unwrap();
-        let cache_file = root.path().join("cache-file");
-        std::fs::write(&cache_file, "not a directory").unwrap();
-        let manager = WorkspaceManager::default();
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: None,
-                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache_file.to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager.initialize(&config).unwrap();
-        let session = SessionKey::stdio();
-
-        let error = manager
-            .workspace(&session, &json!({"action": "open", "path": workspace}))
-            .unwrap_err();
-
-        assert_eq!(error.0.code, "INTERNAL_ERROR");
-        assert!(manager.open_locks.lock().is_empty());
-        assert!(manager.sessions.read().get(&session).is_none());
-    }
-
-    #[test]
-    fn dynamic_open_rejects_paths_outside_allowed_roots_without_switching_session() {
-        let allowed = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        std::fs::write(allowed.path().join("main.rs"), "fn allowed() {}\n").unwrap();
-        std::fs::write(outside.path().join("main.rs"), "fn outside() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: None,
-                allowed_roots: vec![allowed.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: allowed.path().join("cache").to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager.initialize(&config).unwrap();
-        let session = SessionKey::stdio();
-        manager
-            .workspace(&session, &json!({"action": "open", "path": allowed.path()}))
-            .unwrap();
-        let error = manager
-            .workspace(&session, &json!({"action": "open", "path": outside.path()}))
-            .unwrap_err();
-        assert_eq!(error.0.code, "WORKSPACE_OUTSIDE_ALLOWED_ROOTS");
-        assert_eq!(
-            manager.active_actor(&session).unwrap().root_path(),
-            std::fs::canonicalize(allowed.path()).unwrap()
-        );
-    }
-
-    #[test]
-    fn actor_cache_eviction_scans_past_active_lru_entries() {
-        let root = tempdir().unwrap();
-        let cache = root.path().join("cache");
-        let manager = WorkspaceManager::default();
-        let mut workspaces = Vec::new();
-        for index in 0..=MAX_CACHED_WORKSPACES {
-            let workspace = root.path().join(format!("repo-{index}"));
-            std::fs::create_dir_all(&workspace).unwrap();
-            std::fs::write(
-                workspace.join("main.rs"),
-                format!("fn repo_{index}() {{}}\n"),
-            )
-            .unwrap();
-            workspaces.push(workspace);
-        }
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: None,
-                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache.to_string_lossy().into_owned(),
-        })
-        .unwrap();
-        manager.initialize(&config).unwrap();
-        let sessions: Vec<_> = (0..MAX_CACHED_WORKSPACES)
-            .map(|index| SessionKey::new(format!("session-{index}")))
-            .collect();
-        for (session, workspace) in sessions.iter().zip(&workspaces) {
-            manager
-                .workspace(session, &json!({"action": "open", "path": workspace}))
-                .unwrap();
-        }
-
-        manager
-            .workspace(
-                &sessions[0],
-                &json!({"action": "open", "path": workspaces[MAX_CACHED_WORKSPACES]}),
-            )
-            .unwrap();
-
-        assert_eq!(manager.actors.read().len(), MAX_CACHED_WORKSPACES);
-        let evicted = std::fs::canonicalize(&workspaces[0])
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert!(!manager.actors.read().contains_key(&evicted));
-    }
-
     #[tokio::test]
     async fn bash_dispatch_validates_command_fields_and_forces_start_action() {
         let root = tempdir().unwrap();
@@ -1801,10 +880,6 @@ mod tests {
         let config = daemon_config(root.path(), cache.path(), 1_000_000);
         manager
             .dispatch(SessionKey::stdio(), "initialize", &config)
-            .await
-            .unwrap();
-        manager
-            .dispatch(SessionKey::stdio(), "workspace", &json!({"action": "open"}))
             .await
             .unwrap();
 
@@ -1836,165 +911,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_cache_eviction_skips_running_idle_actor() {
+    async fn bash_run_registry_is_scoped_by_session() {
         let root = tempdir().unwrap();
-        let cache = root.path().join("cache");
-        let mut workspaces = Vec::new();
-        for index in 0..=MAX_CACHED_WORKSPACES {
-            let workspace = root.path().join(format!("repo-{index}"));
-            std::fs::create_dir_all(&workspace).unwrap();
-            std::fs::write(
-                workspace.join("main.rs"),
-                format!("fn repo_{index}() {{}}\n"),
-            )
-            .unwrap();
-            workspaces.push(workspace);
-        }
+        let cache = tempdir().unwrap();
+        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
         let manager = Arc::new(WorkspaceManager::default());
-        let config = serde_json::to_value(DaemonConfig {
-            workspaces: Vec::new(),
-            workspace: WorkspaceSettings {
-                lock_to_default: false,
-                default_path: None,
-                allowed_roots: vec![root.path().to_string_lossy().into_owned()],
-                artifact_paths: Vec::new(),
-                exclude_paths: Vec::new(),
-            },
-            skills: SkillsConfig::default(),
-            policy: PolicyConfig {
-                max_file_bytes: 1_000_000,
-                max_context_chars: 50_000,
-                max_search_results: 100,
-                bash: test_bash_config(),
-            },
-            cache_root: cache.to_string_lossy().into_owned(),
-        })
-        .unwrap();
+        let config = daemon_config(root.path(), cache.path(), 1_000_000);
         manager
             .dispatch(SessionKey::stdio(), "initialize", &config)
             .await
             .unwrap();
-        let running_session = SessionKey::new("running");
-        manager
-            .dispatch(
-                running_session.clone(),
-                "workspace",
-                &json!({"action": "open", "path": workspaces[0]}),
-            )
-            .await
-            .unwrap();
+        let session_a = SessionKey::new("http:a");
+        let session_b = SessionKey::new("http:b");
+
         let started = manager
             .dispatch(
-                running_session.clone(),
+                session_a.clone(),
                 "bash",
                 &json!({"command": sleep_command(), "background": true}),
             )
             .await
             .unwrap();
-        let running_key = std::fs::canonicalize(&workspaces[0])
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let running_actor = manager.active_actor(&running_session).unwrap();
-        manager.sessions.write().remove(&running_session);
-
-        for (index, workspace) in workspaces.iter().enumerate().skip(1) {
-            manager
-                .dispatch(
-                    SessionKey::new(format!("session-{index}")),
-                    "workspace",
-                    &json!({"action": "open", "path": workspace}),
-                )
-                .await
-                .unwrap();
-        }
-
-        assert!(manager.actors.read().contains_key(&running_key));
-        assert!(manager.actors.read().len() > MAX_CACHED_WORKSPACES);
-
         let run_id = started["run_id"].as_str().unwrap();
-        let _ = running_actor
-            .run(
-                running_session.as_str(),
-                &json!({"action": "cancel", "run_id": run_id}),
+
+        let retry_from_other_session = manager
+            .dispatch(
+                session_b.clone(),
+                "bash",
+                &json!({"command": sleep_command(), "background": true}),
             )
+            .await
+            .unwrap_err();
+        assert_eq!(retry_from_other_session.0.code, "RUN_BUSY");
+
+        let cross_session_cancel = manager
+            .dispatch(session_b, "bash_cancel", &json!({"run_id": run_id}))
+            .await
+            .unwrap_err();
+        assert_eq!(cross_session_cancel.0.code, "RUN_NOT_FOUND");
+
+        let _ = manager
+            .dispatch(session_a, "bash_cancel", &json!({"run_id": run_id}))
             .await;
-        for _ in 0..50 {
-            if running_actor.running_bash_count() == 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        manager.evict_idle_actors();
-        assert!(manager.actors.read().len() <= MAX_CACHED_WORKSPACES);
-    }
-
-    #[test]
-    fn reinitialize_closes_existing_actors() {
-        let root = tempdir().unwrap();
-        let cache = tempdir().unwrap();
-        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
-
-        manager
-            .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
-            .unwrap();
-        manager
-            .workspace(
-                &SessionKey::stdio(),
-                &json!({"action": "open", "workspace": "main"}),
-            )
-            .unwrap();
-        assert_eq!(manager.actors.read().len(), 1);
-
-        manager
-            .initialize(&daemon_config(root.path(), cache.path(), 512_000))
-            .unwrap();
-        assert_eq!(manager.actors.read().len(), 1);
-        assert!(manager
-            .sessions
-            .read()
-            .contains_key(&SessionKey::stateless()));
-    }
-
-    #[test]
-    fn initialize_prewarms_default_workspace_actor() {
-        let root = tempdir().unwrap();
-        let cache = tempdir().unwrap();
-        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
-
-        let result = manager
-            .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
-            .unwrap();
-
-        assert_eq!(result["default_workspace_prewarmed"], true);
-        assert!(result["prewarm"]["phase_ms"]["actor_open"].is_number());
-        assert_eq!(manager.actors.read().len(), 1);
-    }
-
-    #[test]
-    fn summary_ids_flag_uses_lightweight_summary() {
-        let root = tempdir().unwrap();
-        let cache = tempdir().unwrap();
-        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
-        manager
-            .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
-            .unwrap();
-
-        let summary = manager
-            .workspace(
-                &SessionKey::stdio(),
-                &json!({"action": "summary", "_summary_ids": true}),
-            )
-            .unwrap();
-
-        assert!(summary.get("workspace_id").is_some());
-        assert!(summary.get("snapshot_id").is_some());
-        assert!(summary.get("generation").is_some());
-        assert!(summary.get("root").is_none());
-        assert!(summary.get("mutations").is_none());
     }
 
     #[test]

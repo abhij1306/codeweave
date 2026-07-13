@@ -7,6 +7,7 @@ mod process_runtime;
 mod repository;
 mod security;
 mod symbols;
+mod tools;
 mod workspace;
 
 use anyhow::{Context, Result};
@@ -16,12 +17,15 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use manager::{SessionKey, WorkspaceManager};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::{
+    io::{self, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     sync::Arc,
 };
 use subtle::ConstantTimeEq;
@@ -39,14 +43,38 @@ enum Transport {
 #[derive(Parser, Debug)]
 #[command(version, about = "Rust-only CodeWeave MCP server")]
 struct Cli {
-    #[arg(long, default_value = "config.json")]
+    /// Subcommand to run. Omitting it runs the server (same as `serve`), so the
+    /// historical bare invocation (`--transport http --config config.json`) keeps
+    /// working unchanged.
+    #[command(subcommand)]
+    command: Option<Command>,
+    #[arg(long, global = true, default_value = "config.json")]
     config: PathBuf,
-    #[arg(long, value_enum, default_value_t = Transport::Http)]
+    #[arg(long, global = true, value_enum, default_value_t = Transport::Http)]
     transport: Transport,
-    #[arg(long)]
+    #[arg(long, global = true)]
     host: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     port: Option<u16>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the MCP server (the default when no subcommand is given).
+    Serve,
+    /// Create config.json and a bearer token for a project, then print the
+    /// connector URL and ChatGPT/Claude next steps.
+    Init {
+        /// Project directory to serve. Prompted for when omitted.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Overwrite an existing config.json instead of refusing.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Validate a config end-to-end (config, workspace, git, bash, port, token,
+    /// index). Exits non-zero if any check fails.
+    Doctor,
 }
 
 #[derive(Clone, Deserialize)]
@@ -75,12 +103,28 @@ struct ServerConfig {
     /// disables the bound (connections stay open until the peer closes them).
     #[serde(default = "default_idle_timeout_ms")]
     idle_timeout_ms: u64,
+    /// Named tool profile: `full` (default), `read-only`, `edit`, or `custom`.
+    /// `custom` selects tools via the `tools` include/exclude lists below.
+    #[serde(default = "default_tool_profile")]
+    tool_profile: String,
+    /// Custom tool selection, applied only when `toolProfile` is `custom`.
+    #[serde(default)]
+    tools: ToolsConfig,
+}
+
+#[derive(Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ToolsConfig {
+    #[serde(default)]
+    include: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
 }
 fn default_host() -> String {
     "127.0.0.1".into()
 }
 fn default_port() -> u16 {
-    8820
+    8813
 }
 fn default_auth() -> String {
     "bearer".into()
@@ -103,6 +147,9 @@ fn default_json_response() -> bool {
 fn default_idle_timeout_ms() -> u64 {
     5000
 }
+fn default_tool_profile() -> String {
+    "full".into()
+}
 
 fn validate_auth_mode(auth_mode: &str) -> Result<()> {
     match auth_mode {
@@ -119,6 +166,36 @@ struct AppState {
     config: Value,
     server: ServerConfig,
     token: Option<Arc<Vec<u8>>>,
+    /// Resolved tool set for the active `toolProfile`. Drives `tools/list`, the
+    /// transport callable-name gate, and edit-`validate` availability.
+    tool_access: Arc<tools::ToolAccess>,
+}
+
+/// Resolve the tool set from `server.toolProfile` (+ custom include/exclude) and
+/// `policy.bash.enabled`. Fails startup with an actionable error on an unknown
+/// profile or a custom list that references an unknown tool.
+fn resolve_tool_access(server: &ServerConfig, config: &Value) -> Result<tools::ToolAccess> {
+    let profile = if server.tool_profile == "custom" {
+        None
+    } else {
+        Some(tools::Profile::parse(&server.tool_profile).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown server.toolProfile '{}'; expected 'full', 'read-only', 'edit', or 'custom'",
+                server.tool_profile
+            )
+        })?)
+    };
+    let custom = tools::CustomSelection {
+        include: server.tools.include.clone(),
+        exclude: server.tools.exclude.clone(),
+    };
+    let policy_bash_enabled = config
+        .get("policy")
+        .and_then(|policy| policy.get("bash"))
+        .and_then(|bash| bash.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    tools::resolve_access(profile, &custom, policy_bash_enabled).map_err(|e| anyhow::anyhow!(e))
 }
 
 fn load_config(path: &Path) -> Result<(ServerConfig, Value)> {
@@ -164,28 +241,6 @@ fn is_loopback(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "localhost")
 }
 
-fn validate_http_workspace_mode(server: &ServerConfig, config: &Value) -> Result<()> {
-    if server.stateful_mode {
-        return Ok(());
-    }
-    let workspace = config.get("workspace").and_then(Value::as_object);
-    let default_path = workspace
-        .and_then(|workspace| workspace.get("defaultPath"))
-        .and_then(Value::as_str)
-        .is_some_and(|path| !path.trim().is_empty());
-    let locked = workspace
-        .and_then(|workspace| workspace.get("lockToDefault"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if default_path && locked {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "stateless HTTP requires workspace.defaultPath plus workspace.lockToDefault=true; \
-         enable server.statefulMode for multi-repository or independently switching sessions"
-    )
-}
-
 fn authorized(headers: &HeaderMap, state: &AppState) -> bool {
     let Some(expected) = &state.token else {
         return true;
@@ -197,556 +252,6 @@ fn authorized(headers: &HeaderMap, state: &AppState) -> bool {
         .unwrap_or("")
         .as_bytes();
     supplied.len() == expected.len() && bool::from(supplied.ct_eq(expected.as_slice()))
-}
-
-fn tools() -> Value {
-    // One annotation constant per risk level. The hosted-client safety classifier
-    // reads these per advertised tool, so every tool must map to exactly one level.
-    // READ: no side effects. WRITE_CLOSED: mutates local state only.
-    // DESTRUCTIVE_CLOSED: may discard local state. WRITE_OPEN reaches the network.
-    // DESTRUCTIVE_OPEN can run arbitrary commands as the CodeWeave OS user.
-    let read = json!({
-        "readOnlyHint": true,
-        "destructiveHint": false,
-        "idempotentHint": true,
-        "openWorldHint": false
-    });
-    let write_closed = json!({
-        "readOnlyHint": false,
-        "destructiveHint": false,
-        "idempotentHint": false,
-        "openWorldHint": false
-    });
-    let destructive_closed = json!({
-        "readOnlyHint": false,
-        "destructiveHint": true,
-        "idempotentHint": false,
-        "openWorldHint": false
-    });
-    let write_open = json!({
-        "readOnlyHint": false,
-        "destructiveHint": false,
-        "idempotentHint": false,
-        "openWorldHint": true
-    });
-    let destructive_open = json!({
-        "readOnlyHint": false,
-        "destructiveHint": true,
-        "idempotentHint": false,
-        "openWorldHint": true
-    });
-    let execution = json!({"taskSupport":"forbidden"});
-
-    // Keep the public schemas deliberately simple. Some hosted MCP clients reject or
-    // mishandle deeply nested oneOf/not/const schemas even though they are valid JSON Schema.
-    // These definitions mirror the TypeScript gateway that is known to work with Perplexity;
-    // the Rust request normalizer still accepts the richer compatibility forms internally.
-    let mut advertised = json!([
-      {
-        "name":"workspace",
-        "title":"Workspace",
-        "description":"Open or switch this MCP session's active repository, view its summary or changes, refresh it, or explicitly list/read configured skills. Pass path to switch repositories without restarting the server. Skills must only be used when the user explicitly asks.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "action":{"default":"open","type":"string","enum":["open","summary","refresh","changes","diagnostics","skills","skill"]},
-            "path":{"type":"string","description":"Absolute repository path to make active. Must be within configured allowed roots."},
-            "skill_name":{"type":"string","description":"Skill directory name. Use only after an explicit user request to use that skill."},
-            "force":{"type":"boolean"}
-          },
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"code_context",
-        "title":"Ranked Code Context",
-        "description":"Find relevant code for a task. Pass short identifiers or concepts using terms, required_terms, optional_terms, exclude_terms, and document_types.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "terms":{"minItems":1,"maxItems":12,"type":"array","items":{"type":"string","minLength":1,"maxLength":80}},
-            "paths":{"type":"array","items":{"type":"string"}},
-            "required_terms":{"type":"array","items":{"type":"string","minLength":1,"maxLength":80}},
-            "optional_terms":{"type":"array","items":{"type":"string","minLength":1,"maxLength":80}},
-            "exclude_terms":{"type":"array","items":{"type":"string","minLength":1,"maxLength":80}},
-            "document_types":{"type":"array","items":{"type":"string","enum":["source","test","instruction","artifact","runtime_evidence","log"]}},
-            "min_score":{"type":"number","minimum":0},
-            "include_bash_failures":{"type":"boolean","default":false,"description":"Include up to three recent Bash failures relevant to this query."}
-          },
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"code_capabilities",
-        "title":"CodeWeave Capabilities",
-        "description":"Return supported search modes, fetch kinds, edit capabilities, limits, workspace identity, and known limitations.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{},
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"code_fetch",
-        "title":"Fetch Exact Code or Logs",
-        "description":"Read a file, file range, symbol, Bash log, or previous continuation. For a single file, pass path directly; use items to batch reads.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "path":{"type":"string"},
-            "start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
-            "end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},
-            "items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["path","handle","symbol","metadata","bash_status","bash_log","continuation"]},"value":{"type":"string","minLength":1},"start_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},"end_line":{"type":"integer","minimum":1,"maximum":9007199254740991_i64},"context_lines":{"type":"integer","minimum":0,"maximum":200},"include_imports":{"type":"boolean"}},"required":["kind","value"],"additionalProperties":false}},
-            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"},
-            "max_chars":{"type":"integer","minimum":1,"maximum":200000}
-          },
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"code_search",
-        "title":"Deterministic Code Search",
-        "description":"Search the project by text, regex, filename, symbol, references, outline, or repository map. Filename mode accepts plain substrings or * and ? wildcards. repo_map paths are strict subtree scopes. Literal text search is the default.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "query":{"default":"","type":"string"},
-            "mode":{"type":"string","enum":["literal","regex","filename","symbol","references","outline","repo_map"]},
-            "paths":{"type":"array","items":{"type":"string"},"description":"Strict workspace-relative path scope. repo_map returns only directories under these paths."},
-            "max_results":{"type":"integer","minimum":1,"maximum":200},
-            "context_lines":{"type":"integer","minimum":0,"maximum":20},
-            "case_sensitive":{"type":"boolean"}
-          },
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"code_write",
-        "title":"Write One File",
-        "description":"Create or overwrite exactly one file. Use expected_hash when replacing an existing file.",
-        "annotations":write_closed.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "path":{"type":"string"},
-            "content":{"type":"string"},
-            "overwrite":{"type":"boolean","default":true},
-            "expected_hash":{"type":"string"},
-            "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"},
-            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"}
-          },
-          "required":["path","content"],
-          "additionalProperties":false,
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"code_replace",
-        "title":"Replace Text in One File",
-        "description":"Replace exact text in exactly one file. The replacement count is checked before writing.",
-        "annotations":write_closed.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "path":{"type":"string"},
-            "old_text":{"type":"string"},
-            "new_text":{"type":"string"},
-            "expected_replacements":{"type":"integer","minimum":1,"default":1},
-            "expected_hash":{"type":"string"},
-            "handle":{"type":"string"},
-            "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"},
-            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"}
-          },
-          "required":["path","old_text","new_text"],
-          "additionalProperties":false,
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"code_replace_range",
-        "title":"Replace Fetched Range in One File",
-        "description":"Replace the complete line range selected by a code_fetch handle in exactly one file.",
-        "annotations":write_closed.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "path":{"type":"string"},
-            "handle":{"type":"string"},
-            "new_text":{"type":"string"},
-            "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"},
-            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"}
-          },
-          "required":["path","handle","new_text"],
-          "additionalProperties":false,
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"code_insert",
-        "title":"Insert Text in One File",
-        "description":"Insert text before, after, or inside one named symbol in exactly one file.",
-        "annotations":write_closed.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "path":{"type":"string"},
-            "content":{"type":"string"},
-            "anchor_symbol":{"type":"string"},
-            "position":{"type":"string","enum":["before","after","inside_start","inside_end"]},
-            "expected_hash":{"type":"string"},
-            "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"},
-            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"}
-          },
-          "required":["path","content","anchor_symbol","position"],
-          "additionalProperties":false,
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"code_delete",
-        "title":"Delete One File",
-        "description":"Delete exactly one file with an optional content-hash precondition.",
-        "annotations":destructive_closed.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "path":{"type":"string"},
-            "expected_hash":{"type":"string"},
-            "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"},
-            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"}
-          },
-          "required":["path"],
-          "additionalProperties":false,
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"code_rename",
-        "title":"Rename One File",
-        "description":"Rename exactly one file with an optional content-hash precondition.",
-        "annotations":write_closed.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "path":{"type":"string"},
-            "to":{"type":"string"},
-            "expected_hash":{"type":"string"},
-            "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"},
-            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard"}
-          },
-          "required":["path","to"],
-          "additionalProperties":false,
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"code_preview",
-        "title":"Preview Code Transaction",
-        "description":"Preview a multi-file edit transaction and return the diff without writing files.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "changes":{"type":"array","items":{"type":"object"}},
-            "snapshot_id":{"type":"string"}
-          },
-          "required":["changes"],
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"code_transaction",
-        "title":"Apply Code Transaction",
-        "description":"Apply a multi-file edit transaction through the same precondition, validation, diff, and rollback engine as the narrow write tools.",
-        "annotations":write_closed.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "changes":{"type":"array","items":{"type":"object"}},
-            "snapshot_id":{"type":"string"},
-            "validate":{"type":"array","items":{"type":"string"}},
-            "rollback_on_failure":{"type":"boolean"},
-            "response_detail":{"type":"string","enum":["compact","standard","debug"],"default":"standard","description":"compact omits the unified diff and returns diff_stat only; standard caps the diff to bound payload size; debug returns the full diff."}
-          },
-          "required":["changes"],
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      }
-    ]);
-    let mut git_tools = json!([
-      {
-        "name":"git_status",
-        "title":"Git Status",
-        "description":"Show the working tree status: staged, unstaged, untracked, and partially staged files.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{},
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"git_diff",
-        "title":"Git Diff",
-        "description":"Show the diff for the working tree or, with staged=true, the staged index. Limit to specific paths when given.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "paths":{"type":"array","items":{"type":"string"}},
-            "staged":{"type":"boolean","default":false},
-            "max_chars":{"type":"integer","minimum":1,"maximum":200000}
-          },
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"git_log",
-        "title":"Git Log",
-        "description":"Show recent commit history.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "limit":{"type":"integer","minimum":1,"maximum":200,"default":20}
-          },
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"git_show",
-        "title":"Git Show",
-        "description":"Show the patch for one commit ref (default HEAD).",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "ref":{"type":"string","default":"HEAD"},
-            "max_chars":{"type":"integer","minimum":1,"maximum":200000}
-          },
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"git_blame",
-        "title":"Git Blame",
-        "description":"Show line-by-line authorship for one path, optionally bounded by start_line and end_line.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "paths":{"type":"array","items":{"type":"string"}},
-            "start_line":{"type":"integer","minimum":1},
-            "end_line":{"type":"integer","minimum":1},
-            "max_chars":{"type":"integer","minimum":1,"maximum":200000}
-          },
-          "required":["paths"],
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"git_preflight",
-        "title":"Git Preflight",
-        "description":"Return staged_files, partially_staged_files, and the cached staged diff without committing.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{},
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"git_stage",
-        "title":"Git Stage",
-        "description":"Stage the given paths into the index.",
-        "annotations":write_closed.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "paths":{"type":"array","items":{"type":"string"}}
-          },
-          "required":["paths"],
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"git_commit",
-        "title":"Git Commit",
-        "description":"Commit the currently staged changes with the given message.",
-        "annotations":write_closed.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "message":{"type":"string"}
-          },
-          "required":["message"],
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"git_restore",
-        "title":"Git Restore",
-        "description":"Discard changes for the given paths, restoring them from the index or HEAD. Requires confirm=true because it overwrites local changes.",
-        "annotations":destructive_closed.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "paths":{"type":"array","items":{"type":"string"}},
-            "staged":{"type":"boolean","default":false},
-            "confirm":{"type":"boolean"}
-          },
-          "required":["paths","confirm"],
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"git_push",
-        "title":"Git Push",
-        "description":"Push commits to a remote (default origin) and optional branch. This reaches the network.",
-        "annotations":write_open.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "remote":{"type":"string","description":"Push remote name (default: origin)"},
-            "branch":{"type":"string","description":"Branch to push (default: current branch)"}
-          },
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      }
-    ]);
-    let mut bash_tools = json!([
-      {
-        "name":"bash",
-        "title":"Run Bash Command",
-        "description":"Run a Bash command as the CodeWeave OS user. This is trusted-client functionality, not a sandbox. When the configured foreground budget is enabled (default about 20s), commands that exceed it automatically continue in the background: the call returns status \"running\" with a run_id and detached:true. When that happens, do NOT re-issue the command — poll bash_status(run_id) until the status is terminal. Re-sending an identical command while it is still running returns the same run_id (deduplicated), not a second run. Output is capped at maxOutputChars (default 30000) and each run's default timeout is defaultTimeoutMs (default 120000). Use background:true for known long-running commands.",
-        "annotations":destructive_open.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "command":{"type":"string","minLength":1,"description":"Command string passed to the configured Bash executable with -c."},
-            "cwd":{"type":"string","description":"Existing workspace-relative directory. Defaults to the workspace root."},
-            "background":{"type":"boolean","default":false,"description":"Run detached and return immediately with a run_id to poll."},
-            "timeout_ms":{"type":"integer","minimum":1,"description":"Per-run timeout in ms (<= maxTimeoutMs). The command is killed if it exceeds this; the foreground budget only detaches, it does not kill."}
-          },
-          "required":["command"],
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"bash_status",
-        "title":"Bash Run Status",
-        "description":"Return live or completed state and the retained output tail for a Bash run.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "run_id":{"type":"string","minLength":1}
-          },
-          "required":["run_id"],
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"bash_output",
-        "title":"Bash Run Output",
-        "description":"Page retained combined, stdout, or stderr output for a Bash run.",
-        "annotations":read.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "run_id":{"type":"string","minLength":1},
-            "stream":{"type":"string","enum":["combined","stdout","stderr"]},
-            "continuation":{"type":"string"}
-          },
-          "required":["run_id"],
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      },
-      {
-        "name":"bash_cancel",
-        "title":"Cancel Bash Run",
-        "description":"Cancel a running background Bash run. Partial output is retained.",
-        "annotations":write_closed.clone(),
-        "execution":execution.clone(),
-        "inputSchema":{
-          "type":"object",
-          "properties":{
-            "run_id":{"type":"string","minLength":1}
-          },
-          "required":["run_id"],
-          "$schema":"http://json-schema.org/draft-07/schema#"
-        }
-      }
-    ]);
-
-    for item in git_tools
-        .as_array_mut()
-        .expect("git tools must be an array")
-        .iter_mut()
-        .chain(
-            bash_tools
-                .as_array_mut()
-                .expect("Bash tools must be an array")
-                .iter_mut(),
-        )
-    {
-        item["inputSchema"]["additionalProperties"] = Value::Bool(false);
-    }
-
-    advertised
-        .as_array_mut()
-        .expect("core tools must be an array")
-        .append(
-            git_tools
-                .as_array_mut()
-                .expect("git tools must be an array"),
-        );
-    advertised
-        .as_array_mut()
-        .expect("core tools must be an array")
-        .append(
-            bash_tools
-                .as_array_mut()
-                .expect("Bash tools must be an array"),
-        );
-    advertised
 }
 
 fn object(value: Value) -> Map<String, Value> {
@@ -827,6 +332,7 @@ fn tool_action(method: &str) -> Option<&'static str> {
 async fn prepare(
     _manager: &Arc<WorkspaceManager>,
     _config: &Value,
+    tool_access: &tools::ToolAccess,
     method: &str,
     input: Value,
 ) -> Result<Value, model::AppError> {
@@ -839,6 +345,34 @@ async fn prepare(
             "Task profile tools were removed; use bash, bash_status, bash_output, or bash_cancel",
             json!({"method": method}),
         ));
+    }
+    // Edit tools carry `validate` shell commands that run through bash. When the
+    // active profile (or policy) makes bash unavailable, an edit that requests
+    // validation cannot be honored — reject it up front rather than silently
+    // dropping the validation step.
+    if !tool_access.bash_tools_available()
+        && matches!(
+            method,
+            "code_write"
+                | "code_replace"
+                | "code_replace_range"
+                | "code_insert"
+                | "code_delete"
+                | "code_rename"
+                | "code_transaction"
+        )
+    {
+        let has_validate = input
+            .get("validate")
+            .and_then(Value::as_array)
+            .is_some_and(|commands| !commands.is_empty());
+        if has_validate {
+            return Err(model::AppError::details(
+                "VALIDATE_UNAVAILABLE",
+                "Edit 'validate' commands require bash, which is unavailable under the active tool profile or policy",
+                json!({"method": method}),
+            ));
+        }
     }
     let mut params = object(input);
     if method == "code_context" {
@@ -855,8 +389,9 @@ async fn prepare(
             );
         }
     }
-    // A CodeWeave MCP session owns exactly one active repository. Legacy workspace_id
-    // arguments are accepted but ignored so they can never reopen or redirect a tool call.
+    // A CodeWeave server serves exactly one repository, fixed at startup. Legacy
+    // workspace_id/workspace arguments are accepted but stripped so they can never
+    // redirect a tool call.
     params.remove("workspace_id");
     params.remove("workspace");
     if method == "code_fetch" && !params.contains_key("items") {
@@ -1057,15 +592,213 @@ fn load_or_create_bearer_token(path: &Path) -> Result<String> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Check {
+    name: &'static str,
+    ok: bool,
+    detail: String,
+}
+
+impl Check {
+    fn ok(name: &'static str, detail: impl Into<String>) -> Self {
+        Self { name, ok: true, detail: detail.into() }
+    }
+
+    fn fail(name: &'static str, detail: impl Into<String>) -> Self {
+        Self { name, ok: false, detail: detail.into() }
+    }
+}
+
+/// Run the same preflight work as normal startup, retaining individual failures
+/// so `doctor` can explain every actionable problem in one invocation.
+async fn doctor_checks(cli: &Cli) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let (server, config) = match load_config(&cli.config) {
+        Ok(value) => {
+            checks.push(Check::ok("config", format!("parsed {}", cli.config.display())));
+            value
+        }
+        Err(error) => {
+            checks.push(Check::fail("config", format!("{error}; fix the JSON or pass --config <path>")));
+            return checks;
+        }
+    };
+
+    match validate_auth_mode(&server.auth_mode) {
+        Ok(()) => checks.push(Check::ok("auth", format!("{} authentication", server.auth_mode))),
+        Err(error) => checks.push(Check::fail("auth", format!("{error}; set server.authMode to bearer or none"))),
+    }
+    match resolve_tool_access(&server, &config) {
+        Ok(_) => checks.push(Check::ok("tool profile", format!("{} resolves", server.tool_profile))),
+        Err(error) => checks.push(Check::fail("tool profile", format!("{error}; fix server.toolProfile or server.tools"))),
+    }
+
+    let workspace_path = config
+        .get("workspace")
+        .and_then(|workspace| workspace.get("path"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let workspace_ok = match workspace_path.as_deref() {
+        Some(path) => match security::canonical_root(path) {
+            Ok(root) => {
+                checks.push(Check::ok("workspace", root.display().to_string()));
+                true
+            }
+            Err(error) => {
+                checks.push(Check::fail("workspace", format!("{error}; set workspace.path to an existing directory")));
+                false
+            }
+        },
+        None => {
+            checks.push(Check::fail("workspace", "workspace.path is missing; set it to the project directory"));
+            false
+        }
+    };
+
+    match ProcessCommand::new("git").arg("--version").output() {
+        Ok(output) if output.status.success() => checks.push(Check::ok("git", String::from_utf8_lossy(&output.stdout).trim().to_owned())),
+        Ok(output) => checks.push(Check::fail("git", format!("git --version exited {}; install Git and add it to PATH", output.status))),
+        Err(error) => checks.push(Check::fail("git", format!("{error}; install Git and add it to PATH"))),
+    }
+
+    if matches!(cli.transport, Transport::Stdio) {
+        checks.push(Check::ok("port", "skipped for stdio transport"));
+    } else {
+        let host = cli.host.as_deref().unwrap_or(&server.host);
+        let port = cli.port.unwrap_or(server.port);
+        match TcpListener::bind((host, port)) {
+            Ok(listener) => {
+                drop(listener);
+                checks.push(Check::ok("port", format!("{host}:{port} is available")));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => checks.push(Check::fail("port", format!("{host}:{port} is already in use; stop the other instance or change server.port"))),
+            Err(error) => checks.push(Check::fail("port", format!("cannot bind {host}:{port}: {error}; verify server.host and server.port"))),
+        }
+    }
+
+    if matches!(cli.transport, Transport::Http) && server.auth_mode == "bearer" {
+        let token_path = config_relative_path(&cli.config, &server.token_file);
+        match std::fs::read_to_string(&token_path) {
+            Ok(value) if !value.trim().is_empty() => checks.push(Check::ok("token", format!("{} is present", token_path.display()))),
+            Ok(_) => checks.push(Check::fail("token", format!("{} is empty; delete it and run serve, or write a token", token_path.display()))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(Check::fail("token", format!("{} is missing; run serve once or run init", token_path.display()))),
+            Err(error) => checks.push(Check::fail("token", format!("cannot read {}: {error}", token_path.display()))),
+        }
+    } else {
+        checks.push(Check::ok("token", "not required for this transport/auth mode"));
+    }
+
+    if workspace_ok {
+        let manager = Arc::new(WorkspaceManager::default());
+        match manager.dispatch(SessionKey::stdio(), "initialize", &config).await {
+            Ok(init) => {
+                let indexed = init["index_ready"].as_bool().unwrap_or(false);
+                let files = init["file_count"].as_u64().unwrap_or_default();
+                if indexed {
+                    checks.push(Check::ok("index", format!("ready; {files} files indexed")));
+                } else {
+                    checks.push(Check::fail("index", "initialization returned index_ready=false"));
+                }
+                let bash_enabled = config["policy"]["bash"]["enabled"].as_bool().unwrap_or(false);
+                let bash_available = init["bash_available"].as_bool().unwrap_or(false);
+                if !bash_enabled {
+                    checks.push(Check::ok("bash", "disabled by policy"));
+                } else if bash_available {
+                    checks.push(Check::ok("bash", "available (pre-probed during initialization)"));
+                } else {
+                    checks.push(Check::fail("bash", "configured bash is unavailable; install it or update policy.bash.executable"));
+                }
+            }
+            Err(error) => {
+                checks.push(Check::fail("index", format!("{error}; fix the workspace or index configuration")));
+                checks.push(Check::fail("bash", "not checked because initialization failed"));
+            }
+        }
+    } else {
+        checks.push(Check::fail("index", "not checked until workspace.path is fixed"));
+        checks.push(Check::fail("bash", "not checked until workspace.path is fixed"));
+    }
+    checks
+}
+
+async fn run_doctor(cli: &Cli) -> Result<()> {
+    let checks = doctor_checks(cli).await;
+    let failed = checks.iter().any(|check| !check.ok);
+    for check in checks {
+        let status = if check.ok { "ok" } else { "FAIL" };
+        println!("[{status}] {} — {}", check.name, check.detail);
+    }
+    if failed {
+        anyhow::bail!("doctor found configuration problems")
+    }
+    Ok(())
+}
+
+fn run_init(cli: &Cli, requested_path: Option<PathBuf>, force: bool) -> Result<()> {
+    let project = match requested_path {
+        Some(path) => path,
+        None => {
+            let cwd = std::env::current_dir().context("reading current directory")?;
+            print!("Project directory [{}]: ", cwd.display());
+            io::stdout().flush().context("flushing prompt")?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).context("reading project directory")?;
+            let trimmed = input.trim();
+            if trimmed.is_empty() { cwd } else { PathBuf::from(trimmed) }
+        }
+    };
+    let project = security::canonical_root(&project).map_err(|error| anyhow::anyhow!(error))?;
+    if cli.config.exists() && !force {
+        anyhow::bail!("{} already exists; rerun with --force to replace it", cli.config.display());
+    }
+
+    let mut template: Value = serde_json::from_str(include_str!("../config.example.json"))
+        .context("parsing embedded config.example.json")?;
+    template["workspace"]["path"] = Value::String(project.to_string_lossy().into_owned());
+    let rendered = serde_json::to_string_pretty(&template).context("serializing config template")?;
+    if let Some(parent) = cli.config.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&cli.config, format!("{rendered}\n"))
+        .with_context(|| format!("writing {}", cli.config.display()))?;
+
+    let (server, _) = load_config(&cli.config)?;
+    let token_path = config_relative_path(&cli.config, &server.token_file);
+    if server.auth_mode == "bearer" {
+        load_or_create_bearer_token(&token_path)?;
+    }
+    println!("Created {} for {}.", cli.config.display(), project.display());
+    println!("Local MCP URL: http://{}:{}/mcp", server.host, server.port);
+    if server.auth_mode == "bearer" {
+        println!("Origin bearer token: {}", token_path.display());
+    }
+    println!("Next: codeweave serve --config {}", cli.config.display());
+    println!("Then follow docs/connect-chatgpt.md or docs/connect-claude.md to expose the local URL over HTTPS.");
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    init_tracing();
     let cli = Cli::parse();
+    match &cli.command {
+        None | Some(Command::Serve) => {
+            init_tracing();
+            run_serve(cli).await
+        }
+        Some(Command::Init { path, force }) => {
+            let (path, force) = (path.clone(), *force);
+            run_init(&cli, path, force)
+        }
+        Some(Command::Doctor) => run_doctor(&cli).await,
+    }
+}
+
+/// Load the config, initialize the single repository eagerly, and start the
+/// selected transport. This is the historical `main` body; the bare invocation
+/// (no subcommand) routes here.
+async fn run_serve(cli: Cli) -> Result<()> {
     let (server, config) = load_config(&cli.config)?;
     validate_auth_mode(&server.auth_mode)?;
-    if matches!(cli.transport, Transport::Http) {
-        validate_http_workspace_mode(&server, &config)?;
-    }
     let token = if matches!(cli.transport, Transport::Http) && server.auth_mode == "bearer" {
         let token_path = config_relative_path(&cli.config, &server.token_file);
         let token_value = load_or_create_bearer_token(&token_path)?;
@@ -1074,15 +807,29 @@ async fn main() -> Result<()> {
         None
     };
     let manager = Arc::new(WorkspaceManager::default());
-    manager
+    let init = manager
         .dispatch(SessionKey::stdio(), "initialize", &config)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
+    tracing::info!(
+        workspace = %init["workspace"]["path"].as_str().unwrap_or_default(),
+        file_count = init["file_count"].as_u64().unwrap_or_default(),
+        index_ready = init["index_ready"].as_bool().unwrap_or(false),
+        bash_available = init["bash_available"].as_bool().unwrap_or(false),
+        "repository ready before transport bind"
+    );
+    let tool_access = Arc::new(resolve_tool_access(&server, &config)?);
+    tracing::info!(
+        profile = %server.tool_profile,
+        bash_tools_available = tool_access.bash_tools_available(),
+        "tool profile resolved"
+    );
     let state = AppState {
         manager,
         config,
         server,
         token,
+        tool_access,
     };
     match cli.transport {
         Transport::Http => mcp_transport::run_http(state, &cli).await,
@@ -1093,6 +840,95 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cli_for(config: PathBuf) -> Cli {
+        Cli {
+            command: Some(Command::Doctor),
+            config,
+            transport: Transport::Http,
+            host: None,
+            port: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_checks_initialize_the_configured_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        let init_cli = Cli {
+            command: Some(Command::Init {
+                path: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+                force: false,
+            }),
+            config: config_path.clone(),
+            transport: Transport::Http,
+            host: None,
+            port: None,
+        };
+        run_init(&init_cli, Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))), false).unwrap();
+
+        let checks = doctor_checks(&cli_for(config_path)).await;
+        assert!(checks.iter().find(|check| check.name == "workspace").unwrap().ok);
+        let index = checks.iter().find(|check| check.name == "index").unwrap();
+        assert!(index.ok, "{}", index.detail);
+        assert!(index.detail.contains("files indexed"));
+    }
+
+    #[tokio::test]
+    async fn doctor_checks_reports_missing_workspace_without_panicking() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        let mut template: Value = serde_json::from_str(include_str!("../config.example.json")).unwrap();
+        template["workspace"]["path"] = json!(temp.path().join("does-not-exist").to_string_lossy());
+        std::fs::write(&config_path, serde_json::to_vec(&template).unwrap()).unwrap();
+
+        let checks = doctor_checks(&cli_for(config_path)).await;
+        let workspace = checks.iter().find(|check| check.name == "workspace").unwrap();
+        assert!(!workspace.ok);
+        assert!(workspace.detail.contains("WORKSPACE_NOT_FOUND"));
+    }
+
+    #[test]
+    fn init_writes_a_real_config_and_refuses_accidental_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let config_path = temp.path().join("config.json");
+        let cli = Cli {
+            command: Some(Command::Init {
+                path: Some(project.path().to_path_buf()),
+                force: false,
+            }),
+            config: config_path.clone(),
+            transport: Transport::Http,
+            host: None,
+            port: None,
+        };
+
+        run_init(&cli, Some(project.path().to_path_buf()), false).unwrap();
+        let (_, root) = load_config(&config_path).unwrap();
+        let daemon: crate::model::DaemonConfig = serde_json::from_value(root).unwrap();
+        assert_eq!(PathBuf::from(daemon.workspace.path), project.path().canonicalize().unwrap());
+        assert!(config_relative_path(&config_path, ".mcp-token").is_file());
+        assert!(run_init(&cli, Some(project.path().to_path_buf()), false).is_err());
+    }
+
+    #[test]
+    fn bare_cli_keeps_the_historical_serve_defaults() {
+        let cli = Cli::parse_from(["codeweave"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.config, PathBuf::from("config.json"));
+        assert!(matches!(cli.transport, Transport::Http));
+        assert!(cli.host.is_none());
+        assert!(cli.port.is_none());
+    }
+
+    /// Full-profile tool access with bash available — the default context for
+    /// `prepare` tests that are not specifically exercising profile gating.
+    fn full_access() -> tools::ToolAccess {
+        tools::resolve_access(Some(tools::Profile::Full), &tools::CustomSelection::default(), true)
+            .unwrap()
+    }
 
     fn tool<'a>(all: &'a Value, name: &str) -> &'a Value {
         all.as_array()
@@ -1110,8 +946,7 @@ mod tests {
             manager: Arc::new(WorkspaceManager::default()),
             config: json!({
                 "workspace": {
-                    "defaultPath": "C:\\private\\repository",
-                    "lockToDefault": true
+                    "path": "C:\\private\\repository"
                 }
             }),
             server: serde_json::from_value(json!({
@@ -1122,6 +957,14 @@ mod tests {
             }))
             .unwrap(),
             token: Some(Arc::new(b"secret".to_vec())),
+            tool_access: Arc::new(
+                tools::resolve_access(
+                    Some(tools::Profile::Full),
+                    &tools::CustomSelection::default(),
+                    false,
+                )
+                .unwrap(),
+            ),
         };
 
         let Json(payload) = live(State(state)).await;
@@ -1136,39 +979,8 @@ mod tests {
     }
 
     #[test]
-    fn stateless_http_requires_a_pinned_default_workspace() {
-        let server: ServerConfig = serde_json::from_value(json!({
-            "statefulMode": false,
-            "jsonResponse": true
-        }))
-        .unwrap();
-        let pinned = json!({
-            "workspace": {
-                "defaultPath": "C:\\Projects\\crawlerai",
-                "lockToDefault": true
-            }
-        });
-        assert!(validate_http_workspace_mode(&server, &pinned).is_ok());
-
-        let dynamic = json!({
-            "workspace": {
-                "allowedRoots": ["C:\\Projects"]
-            }
-        });
-        let error = validate_http_workspace_mode(&server, &dynamic).unwrap_err();
-        assert!(error.to_string().contains("stateless HTTP requires"));
-
-        let stateful: ServerConfig = serde_json::from_value(json!({
-            "statefulMode": true,
-            "jsonResponse": false
-        }))
-        .unwrap();
-        assert!(validate_http_workspace_mode(&stateful, &dynamic).is_ok());
-    }
-
-    #[test]
     fn public_tool_schemas_are_hosted_client_compatible() {
-        let all = tools();
+        let all = crate::tools::full_list_payload();
         let items = all.as_array().expect("tools array");
         let expected_annotations = [
             ("workspace", true, false, true, false),
@@ -1303,16 +1115,22 @@ mod tests {
             tool(&all, "git_restore")["inputSchema"]["required"],
             json!(["paths", "confirm"])
         );
+        // D2: git_push is gated on confirm=true exactly like git_restore.
+        assert_eq!(
+            tool(&all, "git_push")["inputSchema"]["required"],
+            json!(["confirm"])
+        );
     }
 
     #[tokio::test]
     async fn prepare_normalizes_compatibility_inputs() {
         let manager = Arc::new(WorkspaceManager::default());
-        let config = json!({"workspaces": []});
+        let config = json!({"workspace": {"path": "/repo"}});
 
         let context = prepare(
             &manager,
             &config,
+            &full_access(),
             "code_context",
             json!({"query": "WorkspaceActor"}),
         )
@@ -1323,6 +1141,7 @@ mod tests {
         let fetch = prepare(
             &manager,
             &config,
+            &full_access(),
             "code_fetch",
             json!({"ranges": [{"path": "src/main.rs", "start": 2, "end": 4}]}),
         )
@@ -1335,6 +1154,7 @@ mod tests {
         let replace = prepare(
             &manager,
             &config,
+            &full_access(),
             "code_replace",
             json!({
                 "snapshot_id": "snap_test",
@@ -1353,6 +1173,7 @@ mod tests {
         let replace_range = prepare(
             &manager,
             &config,
+            &full_access(),
             "code_replace_range",
             json!({
                 "path": "src/main.rs",
@@ -1377,13 +1198,13 @@ mod tests {
             ("git_restore", "restore"),
             ("git_push", "push"),
         ] {
-            let prepared = prepare(&manager, &config, method, json!({"action": "spoofed"}))
+            let prepared = prepare(&manager, &config, &full_access(), method, json!({"action": "spoofed"}))
                 .await
                 .unwrap();
             assert_eq!(prepared["action"], action, "{method}");
         }
 
-        let bash = prepare(&manager, &config, "bash", json!({"command": "printf test"}))
+        let bash = prepare(&manager, &config, &full_access(), "bash", json!({"command": "printf test"}))
             .await
             .unwrap();
         assert!(bash.get("action").is_none());
@@ -1395,15 +1216,16 @@ mod tests {
             ),
             ("bash_cancel", json!({"run_id": "run_test"})),
         ] {
-            let prepared = prepare(&manager, &config, method, input).await.unwrap();
+            let prepared = prepare(&manager, &config, &full_access(), method, input).await.unwrap();
             assert!(prepared.get("action").is_none(), "{method}");
         }
-        assert!(prepare(&manager, &config, "bash", json!({"command": "  "}))
+        assert!(prepare(&manager, &config, &full_access(), "bash", json!({"command": "  "}))
             .await
             .is_err());
         assert!(prepare(
             &manager,
             &config,
+            &full_access(),
             "bash",
             json!({"command": "printf test", "unknown": true})
         )
@@ -1412,12 +1234,13 @@ mod tests {
         assert!(prepare(
             &manager,
             &config,
+            &full_access(),
             "bash_status",
             json!({"run_id": "run_test", "action": "cancel"})
         )
         .await
         .is_err());
-        let removed = prepare(&manager, &config, "task_run", json!({"profile": "test"}))
+        let removed = prepare(&manager, &config, &full_access(), "task_run", json!({"profile": "test"}))
             .await
             .unwrap_err();
         assert_eq!(removed.0.code, "METHOD_NOT_FOUND");
@@ -1429,13 +1252,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let manager = Arc::new(WorkspaceManager::default());
         let config = json!({
-            "workspaces": [{
-                "id": "main",
-                "name": "Main",
-                "path": root.path(),
-                "artifactPaths": []
-            }],
-            "workspace": {"allowedRoots": [root.path()]},
+            "workspace": {"path": root.path(), "artifactPaths": []},
             "skills": {"enabled": false, "roots": [], "explicitOnly": true},
             "policy": {
                 "maxFileBytes": 1000000,
@@ -1461,7 +1278,7 @@ mod tests {
             json!({"command": "printf command-only"}),
             json!({"command": "printf command-with-timeout", "timeout_ms": 5000}),
         ] {
-            let prepared = prepare(&manager, &config, "bash", input).await.unwrap();
+            let prepared = prepare(&manager, &config, &full_access(), "bash", input).await.unwrap();
             let result = manager
                 .dispatch(SessionKey::stdio(), "bash", &prepared)
                 .await
@@ -1478,13 +1295,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let manager = Arc::new(WorkspaceManager::default());
         let config = json!({
-            "workspaces": [{
-                "id": "main",
-                "name": "Main",
-                "path": root.path(),
-                "artifactPaths": []
-            }],
-            "workspace": {"allowedRoots": [root.path()]},
+            "workspace": {"path": root.path(), "artifactPaths": []},
             "skills": {"enabled": false, "roots": [], "explicitOnly": true},
             "policy": {
                 "maxFileBytes": 1000000,
@@ -1502,6 +1313,7 @@ mod tests {
         let prepared = prepare(
             &manager,
             &config,
+            &full_access(),
             "code_write",
             json!({
                 "workspace_id": "main",
@@ -1526,6 +1338,7 @@ mod tests {
         let preview = prepare(
             &manager,
             &config,
+            &full_access(),
             "code_preview",
             json!({
                 "changes": [{
@@ -1548,6 +1361,7 @@ mod tests {
         let syntax_error = prepare(
             &manager,
             &config,
+            &full_access(),
             "code_preview",
             json!({
                 "changes": [{
@@ -1569,6 +1383,7 @@ mod tests {
         let transaction = prepare(
             &manager,
             &config,
+            &full_access(),
             "code_transaction",
             json!({
                 "changes": [
@@ -1603,20 +1418,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_does_not_reopen_legacy_default_after_dynamic_switch() {
+    async fn prepare_strips_legacy_routing_args_for_the_fixed_repository() {
         let configured = tempfile::tempdir().unwrap();
-        let dynamic = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         std::fs::write(
             configured.path().join("configured.rs"),
             "fn configured() {}\n",
         )
         .unwrap();
-        std::fs::write(dynamic.path().join("dynamic.rs"), "fn dynamic() {}\n").unwrap();
         let manager = Arc::new(WorkspaceManager::default());
         let daemon_config = json!({
-            "workspaces": [{"id": "main", "name": "Configured", "path": configured.path(), "artifactPaths": []}],
-            "workspace": {"allowedRoots": [configured.path().parent().unwrap()]},
+            "workspace": {"path": configured.path(), "artifactPaths": []},
             "skills": {"enabled": false, "roots": [], "explicitOnly": true},
             "policy": {"maxFileBytes": 1000000, "maxContextChars": 50000, "maxSearchResults": 100, "bash": {"enabled": false}},
             "cache_root": cache.path()
@@ -1625,35 +1437,32 @@ mod tests {
             .dispatch(SessionKey::stdio(), "initialize", &daemon_config)
             .await
             .unwrap();
-        manager
-            .dispatch(
-                SessionKey::stdio(),
-                "workspace",
-                &json!({"action": "open", "path": dynamic.path()}),
-            )
-            .await
-            .unwrap();
-        let public_config = json!({"workspaces": [{"id": "main", "name": "Configured", "path": configured.path()}]});
+
+        // Legacy workspace_id/path routing args are stripped before dispatch so a
+        // client can never redirect a tool call off the single configured repo.
+        let public_config = json!({"workspace": {"path": configured.path()}});
         let prepared = prepare(
             &manager,
             &public_config,
+            &full_access(),
             "code_search",
-            json!({"workspace_id": "main", "mode": "filename", "query": "dynamic.rs"}),
+            json!({"workspace_id": "main", "mode": "filename", "query": "configured.rs"}),
         )
         .await
         .unwrap();
         assert!(prepared.get("workspace_id").is_none());
+
         let summary = manager
             .dispatch(
                 SessionKey::stdio(),
                 "workspace",
-                &json!({"action": "summary", "workspace_id": "main"}),
+                &json!({"action": "summary"}),
             )
             .await
             .unwrap();
         assert_eq!(
             std::path::PathBuf::from(summary["root"].as_str().unwrap()),
-            std::fs::canonicalize(dynamic.path()).unwrap()
+            std::fs::canonicalize(configured.path()).unwrap()
         );
     }
 
@@ -1662,5 +1471,88 @@ mod tests {
         let config = Path::new("C:/path/to/codeweave/config.json");
         let resolved = config_relative_path(config, ".mcp-token");
         assert_eq!(resolved, PathBuf::from("C:/path/to/codeweave/.mcp-token"));
+    }
+
+    /// D1: `config.example.json` must deserialize through the *real* config path
+    /// (`load_config` + `DaemonConfig`) and its advertised defaults must match the
+    /// code defaults, so the shipped example can never silently drift from what the
+    /// server actually does. Regression guard for the historical `8813` vs `8820` skew.
+    #[test]
+    fn shipped_config_example_deserializes_and_matches_code_defaults() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
+        let (server, root) = load_config(&path).expect("config.example.json must load");
+
+        // Port advertised in the example must equal the code default so a copy-paste
+        // start hits the port the README and connectors expect.
+        assert_eq!(server.port, default_port());
+        assert_eq!(server.port, 8813);
+
+        // The remainder must deserialize as the daemon config the server actually
+        // uses at startup (load_config injects cache_root).
+        let daemon: crate::model::DaemonConfig =
+            serde_json::from_value(root).expect("example must deserialize as DaemonConfig");
+
+        // foregroundBudgetMs is present and non-zero (auto-promotion enabled), and
+        // the example's bash budget matches the documented code default.
+        assert_eq!(daemon.policy.bash.foreground_budget_ms, 20_000);
+    }
+
+    /// The shipped example must resolve a valid, non-empty tool profile so a
+    /// copy-paste start exposes the tools the docs advertise.
+    #[test]
+    fn shipped_config_example_resolves_full_tool_profile() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
+        let (server, root) = load_config(&path).expect("config.example.json must load");
+        assert_eq!(server.tool_profile, "full");
+        let access = resolve_tool_access(&server, &root).expect("example profile must resolve");
+        assert!(access.is_allowed("bash"));
+        assert!(access.bash_tools_available());
+        assert_eq!(access.list_payload().as_array().unwrap().len(), 27);
+    }
+
+    #[test]
+    fn unknown_tool_profile_fails_startup_resolution() {
+        let server: ServerConfig =
+            serde_json::from_value(json!({"toolProfile": "nonsense"})).unwrap();
+        let error = resolve_tool_access(&server, &json!({})).unwrap_err();
+        assert!(error.to_string().contains("nonsense"));
+    }
+
+    /// An edit that carries `validate` commands is rejected up front when bash is
+    /// unavailable under the active profile — the validation could not run.
+    #[tokio::test]
+    async fn prepare_rejects_validate_when_bash_unavailable() {
+        let manager = Arc::new(WorkspaceManager::default());
+        let config = json!({"workspace": {"path": "/repo"}});
+        // read-only profile has no bash tools, so validate cannot be honored.
+        let read_only = tools::resolve_access(
+            Some(tools::Profile::ReadOnly),
+            &tools::CustomSelection::default(),
+            true,
+        )
+        .unwrap();
+
+        let error = prepare(
+            &manager,
+            &config,
+            &read_only,
+            "code_write",
+            json!({"path": "a.rs", "content": "x", "validate": ["cargo check"]}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0.code, "VALIDATE_UNAVAILABLE");
+
+        // The same edit without validate is accepted.
+        let ok = prepare(
+            &manager,
+            &config,
+            &read_only,
+            "code_write",
+            json!({"path": "a.rs", "content": "x"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok["changes"][0]["kind"], "create");
     }
 }

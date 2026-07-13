@@ -7,17 +7,14 @@
     "statefulMode": false,
     "jsonResponse": true,
     "idleTimeoutMs": 5000,
+    "toolProfile": "full",
     "allowedHosts": [
       "*"
     ],
     "allowedOrigins": []
   },
   "workspace": {
-    "defaultPath": "/path/to/projects/example",
-    "lockToDefault": true,
-    "allowedRoots": [
-      "/path/to/projects"
-    ],
+    "path": "/path/to/projects/example",
     "artifactPaths": [
       "artifacts"
     ],
@@ -34,6 +31,9 @@
     "enabled": false,
     "roots": [],
     "explicitOnly": true
+  },
+  "index": {
+    "ranking": "v1"
   },
   "policy": {
     "maxFileBytes": 2000000,
