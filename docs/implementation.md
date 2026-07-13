@@ -67,7 +67,7 @@ CodeWeave exposes narrow write tools:
 
 For coordinated changes, `code_preview` accepts a `changes` array and returns the planned diff without writing files. `code_transaction` accepts the same `changes` array and applies it through the same edit engine.
 
-The internal edit pipeline plans changes, checks preconditions, runs syntax preflight, writes atomically, records mutations, runs optional Bash validation commands sequentially from the workspace root, and restores the prior state when validation fails.
+The internal edit pipeline plans changes, checks preconditions, runs syntax preflight, writes atomically, records mutations, and runs optional Bash validation commands sequentially from the workspace root. Validation failures are reported while preserving the applied edit. Reverse recovery is reserved for internal commit failures such as a partial file write, index refresh failure, or mutation-journal failure.
 
 Existing-file changes require a current snapshot, expected content hash, or provenance handle.
 

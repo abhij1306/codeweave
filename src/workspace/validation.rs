@@ -8,7 +8,6 @@ pub(super) struct ValidationOutcome {
     pub(super) failed: bool,
     pub(super) pending_run_id: Option<String>,
     pub(super) deferred_run_id: Option<String>,
-    pub(super) cancellation_error: Option<Value>,
 }
 
 impl WorkspaceActor {
@@ -16,7 +15,6 @@ impl WorkspaceActor {
         &self,
         session_id: &str,
         commands: &[String],
-        rollback_on_failure: bool,
     ) -> ValidationOutcome {
         let budget_ms = self.policy.bash.foreground_budget_ms;
         let validation_started = Instant::now();
@@ -24,7 +22,6 @@ impl WorkspaceActor {
         let mut failed = false;
         let mut pending_run_id = None;
         let mut deferred_run_id = None;
-        let mut cancellation_error = None;
         let mut remaining = commands.iter().peekable();
 
         while let Some(command) = remaining.next() {
@@ -33,25 +30,12 @@ impl WorkspaceActor {
             if over_budget {
                 let mut deferred = vec![command.clone()];
                 deferred.extend(remaining.map(String::clone));
-                if rollback_on_failure {
-                    failed = true;
-                    validation.extend(deferred.into_iter().map(|command| {
-                        json!({
-                            "command": command,
-                            "result": {
-                                "status": "not_run",
-                                "reason": "rollback_requires_synchronous_validation"
-                            }
-                        })
-                    }));
-                } else {
-                    match self
-                        .spawn_pending_validation(session_id, &deferred, &mut validation)
-                        .await
-                    {
-                        Some(run_id) => pending_run_id = Some(run_id),
-                        None => failed = true,
-                    }
+                match self
+                    .spawn_pending_validation(session_id, &deferred, &mut validation)
+                    .await
+                {
+                    Some(run_id) => pending_run_id = Some(run_id),
+                    None => failed = true,
                 }
                 break;
             }
@@ -80,35 +64,7 @@ impl WorkspaceActor {
                             .and_then(Value::as_str)
                             .map(str::to_owned);
                         validation.push(json!({"command": command, "result": result}));
-                        if rollback_on_failure {
-                            failed = true;
-                            if let Some(run_id) = run_id {
-                                match self
-                                    .bash
-                                    .cancel_and_wait_for_session(
-                                        session_id,
-                                        &run_id,
-                                        tokio::time::Duration::from_secs(5),
-                                    )
-                                    .await
-                                {
-                                    Ok(cancellation) => validation.push(json!({
-                                        "run_id": run_id,
-                                        "cancellation": cancellation,
-                                        "reason": "rollback_requires_synchronous_validation"
-                                    })),
-                                    Err(error) => {
-                                        let error = json!(error.0);
-                                        validation.push(json!({
-                                            "run_id": run_id,
-                                            "error": error,
-                                            "reason": "validation_cancellation_unconfirmed"
-                                        }));
-                                        cancellation_error = Some(error);
-                                    }
-                                }
-                            }
-                        } else if let Some(run_id) = run_id {
+                        if let Some(run_id) = run_id {
                             pending_run_id = Some(run_id);
                             let deferred = remaining.map(String::clone).collect::<Vec<_>>();
                             if !deferred.is_empty() {
@@ -152,7 +108,6 @@ impl WorkspaceActor {
             failed,
             pending_run_id,
             deferred_run_id,
-            cancellation_error,
         }
     }
 

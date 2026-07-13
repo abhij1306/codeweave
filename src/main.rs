@@ -1211,6 +1211,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(action_multiplexers, ["workspace"]);
         assert_eq!(tool(&all, "workspace")["annotations"]["readOnlyHint"], true);
+        let workspace_properties = &tool(&all, "workspace")["inputSchema"]["properties"];
+        assert_eq!(workspace_properties["since_generation"]["type"], "integer");
+        assert_eq!(workspace_properties["since_generation"]["minimum"], 0);
+        assert_eq!(workspace_properties["source"]["type"], "string");
+        assert_eq!(workspace_properties["limit"]["minimum"], 1);
+        assert_eq!(workspace_properties["limit"]["maximum"], 2_000);
+        assert_eq!(workspace_properties["limit"]["default"], 200);
         let retrieval_operation =
             &tool(&all, "code_retrieve")["inputSchema"]["properties"]["operations"]["items"];
         assert_eq!(retrieval_operation["required"], json!(["operation"]));

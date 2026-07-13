@@ -208,7 +208,7 @@ pub fn registry() -> &'static [ToolDefinition] {
         ToolDefinition {
             name: "code_transaction",
             title: "Apply Code Transaction",
-            description: "Apply a multi-file edit transaction through the same precondition, validation, diff, and rollback engine as the narrow write tools.",
+            description: "Apply a multi-file edit transaction through the same precondition, non-destructive validation reporting, diff, and internal atomic-recovery engine as the narrow write tools.",
             safety: ToolSafety::WriteClosed,
             profiles: &[Edit],
             input_schema: edits::code_transaction,

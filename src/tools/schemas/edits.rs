@@ -10,8 +10,8 @@ const REPLACEMENT_TEXT_DESCRIPTION: &str = "Replacement text. When replacing tex
 fn rollback_on_failure_schema() -> Value {
     json!({
         "type": "boolean",
-        "default": true,
-        "description": "When true (default), validation must finish synchronously and CodeWeave attempts to roll the edit back if validation fails or exceeds the foreground budget. If a running validator cannot be cancelled and confirmed stopped, the edit may remain applied to avoid racing rollback against validation. Set false to allow detached validation."
+        "default": false,
+        "description": "Deprecated compatibility field; its value is ignored. Validation failures are reported and edits are never rolled back. Long-running validation may continue in the background."
     })
 }
 
@@ -181,8 +181,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn edit_schemas_share_the_rollback_contract() {
+    fn edit_schemas_share_the_non_destructive_validation_contract() {
         let expected = rollback_on_failure_schema();
+        assert_eq!(expected["default"], false);
+        let description = expected["description"].as_str().unwrap();
+        assert!(description.contains("Deprecated compatibility field"));
+        assert!(description.contains("never rolled back"));
         for schema in [
             code_write(),
             code_replace(),

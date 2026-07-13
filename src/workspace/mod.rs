@@ -588,8 +588,9 @@ impl WorkspaceActor {
                 "handle_edits_must_be_only_change_for_file": true,
                 "full_line_replacements_preserve_terminal_line_ending": true,
                 "supports_bash_validation_commands": bash_available,
-                "supports_rollback_on_failure": true,
-                "detached_validation_requires_rollback_disabled": true
+                "supports_rollback_on_failure": false,
+                "validation_failures_preserve_edits": true,
+                "validation_may_run_detached": true
             },
             "change_contracts": {
                 "create": {"required": ["kind", "path", "content"], "optional": ["overwrite", "expected_hash"]},

@@ -12,7 +12,7 @@ CodeWeave is a fast, local-first Model Context Protocol (MCP) server for AI-assi
 - **Single Rust process** — no Node.js gateway or companion daemon.
 - **Repository-aware retrieval** — ranked context, symbols, references, outlines, regex, filename search, and repository maps.
 - **Optional semantic intelligence** — persistent Python and TypeScript language servers for definitions, references, diagnostics, and safe rename previews, with tree-sitter/lexical fallback.
-- **Safe edits** — narrow single-operation tools with snapshot and content-hash preconditions, validation, and rollback.
+- **Safe edits** — narrow single-operation tools with snapshot and content-hash preconditions, non-destructive validation reporting, and atomic recovery for internal write failures.
 - **Supervised Bash execution** — focused commands, timeouts, cancellation, retained logs, and process-tree cleanup.
 - **Git integration** — status, diff, log, show, blame, staging, commits, and confirmed restores.
 - **Single-repository focus** — one instance serves exactly one repository, configured through `workspace.path` and fixed for the process lifetime. The index and file watcher are eager (ready before the transport binds). Run two projects as two instances on two ports.
@@ -274,7 +274,7 @@ Never commit `config.json`, `.mcp-token`, tunnel credentials, generated caches, 
 | `code_retrieve` | Discover and read repository evidence with explicit batched operations |
 | `code_capabilities` | Inspect retrieval, intelligence, editing, execution, and limit contracts |
 | `code_preview` | Preview a multi-file edit transaction and return the diff without writing files |
-| `code_transaction` | Apply a multi-file edit transaction with preconditions, validation, diff output, and rollback |
+| `code_transaction` | Apply a multi-file edit transaction with preconditions, non-destructive validation reporting, diff output, and atomic internal recovery |
 | `code_write` | Create or overwrite exactly one file |
 | `code_replace` | Replace exact text in exactly one file |
 | `code_replace_range` | Replace the complete line range selected by a retrieval handle |

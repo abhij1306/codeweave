@@ -90,7 +90,7 @@ The example configuration keeps language-server adapters disabled. Enable the re
 
 CodeWeave exposes one-operation write tools so each approval request has a small explicit scope. Existing files use the current workspace snapshot automatically and may also include an expected hash or retrieval handle.
 
-Use `code_preview` to preview a multi-file transaction without writing files. Use `code_transaction` to apply the same `changes` array through precondition checks, syntax preflight, diff generation, validation, and rollback.
+Use `code_preview` to preview a multi-file transaction without writing files. Use `code_transaction` to apply the same `changes` array through precondition checks, syntax preflight, diff generation, non-destructive validation reporting, and atomic recovery for internal commit failures.
 
 ### `code_write`
 
@@ -140,7 +140,7 @@ Deletes exactly one file.
 
 Renames exactly one file. The destination must not already exist.
 
-All write tools use the same internal transactional pipeline for precondition checks, atomic writes, mutation recording, optional validation, and rollback.
+All write tools use the same internal transactional pipeline for precondition checks, atomic writes, mutation recording, optional non-destructive validation, and recovery from internal partial-commit failures.
 
 ## Git tools
 
@@ -166,8 +166,8 @@ These tools remain narrower than unrestricted shell access. A scoped `git_diff` 
 
 `bash_status` reads live or completed state by `run_id`. `bash_output` pages retained `combined`, `stdout`, or `stderr` logs using the returned continuation token. `bash_cancel` terminates a background run while retaining partial output. Only one run is active per workspace actor at a time, and timeouts use the same process-tree cleanup as cancellation.
 
-Write-tool `validate` arrays contain Bash command strings. Commands run sequentially from the workspace root through the same supervisor. With the default `rollback_on_failure: true`, the write lock is retained until validation completes; a command failure, auto-promotion, or foreground-budget exhaustion cancels pending validation, waits for the Bash run to reach a terminal state, and then restores the original files. If cancellation cannot be confirmed, CodeWeave leaves the edit applied and reports `validation_cancellation_unconfirmed` rather than risking rollback while validation may still be running. Validation entries report `command` and `result`.
+Write-tool `validate` arrays contain Bash command strings. Commands run sequentially from the workspace root through the same supervisor. Validation is non-destructive: a failed test, build, lint command, timeout, or Bash error is reported without restoring the edited files. A terminal failure returns `applied: true`, `rolled_back: false`, `validation_failed: true`, the validation output, and guidance for a follow-up edit.
 
-**Detached validation is explicit.** Set `rollback_on_failure: false` to allow a long validation command to continue in the background. The response returns `validation_pending: true` with a `validation_run_id`, and the edit stays applied while the caller polls `bash_status`. CodeWeave never silently weakens a requested rollback guarantee.
+A validation command that exceeds the foreground budget continues in the background. The response returns `validation_pending: true` with `validation_run_id` and, when needed, `validation_run_ids` for queued commands; the edit remains applied while the caller polls `bash_status`. The `rollback_on_failure` input remains temporarily available for compatibility, but it is deprecated and ignored regardless of value. Rollback is reserved for internal transaction recovery such as a partial file commit or mutation-journal failure.
 
 Bash is trusted-client functionality and is not sandboxed. The configured `workspace.path` constrains file tools and Bash `cwd`, but commands can access anything available to the CodeWeave operating-system user. CodeWeave reports Bash available only after a readiness probe passes. On Windows, an explicit absolute `policy.bash.executable` wins; otherwise CodeWeave probes the configured executable, discovers Git for Windows Bash from `PATH`, common Git install locations, and the Git executable location, and only uses WSL when that configured/probed executable actually passes readiness.

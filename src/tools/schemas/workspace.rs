@@ -10,7 +10,10 @@ pub fn workspace() -> Value {
         "properties": {
             "action": {"default": "summary", "type": "string", "enum": ["summary", "refresh", "changes", "diagnostics", "skills", "skill"]},
             "skill_name": {"type": "string", "pattern": "^[A-Za-z0-9_-]+$", "description": "Skill directory name. Use only after an explicit user request to use that skill."},
-            "force": {"type": "boolean"}
+            "force": {"type": "boolean"},
+            "since_generation": {"type": "integer", "minimum": 0, "description": "For action=changes, return only mutations with a generation greater than this value."},
+            "source": {"type": "string", "description": "For action=changes, return only mutations from this source."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 200, "description": "Maximum number of mutations returned by action=changes."}
         },
         "$schema": "http://json-schema.org/draft-07/schema#"
     })

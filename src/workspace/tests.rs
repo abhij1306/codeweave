@@ -643,6 +643,15 @@ fn code_capabilities_reports_public_contracts() {
         capabilities["editing"]["supports_handle_range_replace"],
         true
     );
+    assert_eq!(
+        capabilities["editing"]["supports_rollback_on_failure"],
+        false
+    );
+    assert_eq!(
+        capabilities["editing"]["validation_failures_preserve_edits"],
+        true
+    );
+    assert_eq!(capabilities["editing"]["validation_may_run_detached"], true);
 }
 
 #[test]
@@ -1182,21 +1191,6 @@ fn handle_fetch_continuation_preserves_the_handle_range() {
 }
 
 #[test]
-fn rollback_recheck_rejects_concurrent_changes() {
-    let root = tempdir().unwrap();
-    fs::write(root.path().join("value.rs"), "after\n").unwrap();
-    let actor = test_actor(root.path());
-    let plan = vec![PlannedFile {
-        path: "value.rs".to_owned(),
-        before: Some("before\n".to_owned()),
-        after: Some("after\n".to_owned()),
-    }];
-    fs::write(root.path().join("value.rs"), "concurrent\n").unwrap();
-    let error = actor.recheck_applied_state(&plan).unwrap_err();
-    assert_eq!(error.0.code, "ROLLBACK_CONFLICT");
-}
-
-#[test]
 fn failed_write_does_not_leave_an_internal_write_marker() {
     let root = tempdir().unwrap();
     fs::create_dir(root.path().join("blocked")).unwrap();
@@ -1425,7 +1419,7 @@ async fn standard_response_detail_caps_oversized_edit_diff() {
 }
 
 #[tokio::test]
-async fn failed_bash_validation_rolls_back_mutation() {
+async fn failed_bash_validation_preserves_mutation() {
     let root = tempdir().unwrap();
     let original = "fn value() -> i32 { 1 }\n";
     fs::write(root.path().join("value.rs"), original).unwrap();
@@ -1447,13 +1441,15 @@ async fn failed_bash_validation_rolls_back_mutation() {
                 "validate": [
                     "printf validation-started",
                     "printf validation-failed >&2; exit 1"
-                ]
+                ],
+                "rollback_on_failure": true
             }),
         )
         .await
         .unwrap();
-    assert_eq!(result["applied"], false);
-    assert_eq!(result["rolled_back"], true);
+    assert_eq!(result["applied"], true);
+    assert_eq!(result["rolled_back"], false);
+    assert_eq!(result["validation_failed"], true);
     assert_eq!(result["reason"], "validation_failed");
     assert_eq!(result["validation"].as_array().unwrap().len(), 2);
     assert_eq!(
@@ -1462,8 +1458,16 @@ async fn failed_bash_validation_rolls_back_mutation() {
     );
     assert_eq!(
         fs::read_to_string(root.path().join("value.rs")).unwrap(),
-        original
+        "fn value() -> i32 { 2 }\n"
     );
+    let changes = actor
+        .changes("test-session", &json!({"since_generation": 0}))
+        .unwrap();
+    assert!(changes["mutations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|mutation| mutation["source"] == "mcp_edit"));
 }
 
 #[tokio::test]
@@ -1567,8 +1571,7 @@ async fn slow_bash_validation_queues_remaining_commands() {
                 "validate": [
                     "echo checking; sleep 1",
                     "printf later > validation-later.txt"
-                ],
-                "rollback_on_failure": false
+                ]
             }),
         )
         .await
@@ -1656,8 +1659,7 @@ async fn detached_validation_keeps_leading_failure_as_primary_run() {
                 "validate": [
                     "sleep 0.2; exit 7",
                     "printf later > validation-after-failure.txt"
-                ],
-                "rollback_on_failure": false
+                ]
             }),
         )
         .await
@@ -2266,15 +2268,12 @@ async fn same_file_multi_change_accumulates_on_the_in_progress_plan() {
 }
 
 #[tokio::test]
-async fn deferred_validation_rolls_back_when_requested() {
+async fn deprecated_rollback_flag_does_not_cancel_or_revert_validation() {
     let root = tempdir().unwrap();
     let original = "fn value() -> i32 { 1 }\n";
     fs::write(root.path().join("value.rs"), original).unwrap();
-    let actor = test_actor_with_budget(root.path(), 200);
+    let actor = test_actor_with_budget(root.path(), 20);
 
-    // A rollback-protected edit must never be left applied with validation still
-    // running in the background. The promoted validation is cancelled and the
-    // original content is restored.
     let result = actor
         .code_edit(
             "test-session",
@@ -2286,26 +2285,36 @@ async fn deferred_validation_rolls_back_when_requested() {
                     "new_text": "{ 2 }",
                     "expected_hash": content_hash(original)
                 }],
-                "validate": ["echo checking; sleep 30"],
+                "validate": ["echo checking; sleep 0.2"],
                 "rollback_on_failure": true
             }),
         )
         .await
         .unwrap();
 
-    assert_eq!(result["applied"], false);
-    assert_eq!(result["rolled_back"], true);
-    assert_eq!(result["reason"], "validation_failed");
-    assert!(result["validation"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|entry| {
-            entry["reason"] == "rollback_requires_synchronous_validation"
-                && entry["cancellation"]["terminal"]["status"] == "cancelled"
-        }));
+    assert_eq!(result["applied"], true);
+    assert_eq!(result["rolled_back"], false);
+    assert_eq!(result["validation_failed"], false);
+    assert_eq!(result["validation_pending"], true);
     assert_eq!(
         fs::read_to_string(root.path().join("value.rs")).unwrap(),
-        original
+        "fn value() -> i32 { 2 }\n"
     );
+
+    let run_id = result["validation_run_id"].as_str().unwrap();
+    let mut status = actor
+        .bash
+        .status_for_session("test-session", run_id)
+        .unwrap();
+    for _ in 0..100 {
+        if status["ended_at"].is_string() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        status = actor
+            .bash
+            .status_for_session("test-session", run_id)
+            .unwrap();
+    }
+    assert_eq!(status["status"], "succeeded");
 }

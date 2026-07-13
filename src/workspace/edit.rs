@@ -34,7 +34,6 @@ pub(super) struct PlannedFile {
 struct AppliedEdit {
     write_guard: tokio::sync::OwnedMutexGuard<()>,
     planned: Vec<PlannedFile>,
-    request_id: String,
     apply_result: Vec<MutationRecord>,
     diff: String,
     snapshot_rebased_from: Option<String>,
@@ -133,7 +132,6 @@ impl WorkspaceActor {
         let AppliedEdit {
             write_guard,
             planned,
-            request_id,
             apply_result,
             diff,
             snapshot_rebased_from,
@@ -141,11 +139,10 @@ impl WorkspaceActor {
             syntax_checks,
         } = applied;
         let mut write_guard = Some(write_guard);
-        let rollback_on_failure = bool_value(params, "rollback_on_failure", true);
 
-        // Shape the diff payload by response_detail before `planned` is moved into any
-        // rollback closure below. `standard` (default) caps the unified diff so a large
-        // edit cannot balloon the response; the per-file stat is always returned.
+        // Shape the diff payload by response_detail. `standard` (default) caps the
+        // unified diff so a large edit cannot balloon the response; the per-file stat
+        // is always returned.
         let detail = params
             .get("response_detail")
             .and_then(Value::as_str)
@@ -163,53 +160,24 @@ impl WorkspaceActor {
             failed: validation_failed,
             pending_run_id: validation_pending,
             deferred_run_id: deferred_validation_pending,
-            cancellation_error: validation_cancellation_error,
-        } = self
-            .run_edit_validation(session_id, &validate, rollback_on_failure)
-            .await;
-
-        if let Some(error) = validation_cancellation_error {
-            drop(write_guard.take());
-            self.reconcile_pending_async().await?;
-            return Ok(json!({
-                "applied": true,
-                "rolled_back": false,
-                "reason": "validation_cancellation_unconfirmed",
-                "validation_cancellation_error": error,
-                "guidance": "Validation cancellation could not be confirmed, so CodeWeave left the edit applied instead of risking rollback while the validator might still be running.",
-                "snapshot_rebased_from": snapshot_rebased_from,
-                "diff": diff_value,
-                "diff_stat": diff_stat_value,
-                "diff_truncated": diff_truncated,
-                "diff_omitted": diff_omitted,
-                "syntax_checks": syntax_checks,
-                "validation": validation,
-                "generation": self.generation(),
-                "snapshot_id": self.snapshot(),
-                "mutations": apply_result,
-                "phase_ms": {
-                    "prepare_and_commit": prepare_ms,
-                    "commit": commit_ms
-                }
-            }));
-        }
+        } = self.run_edit_validation(session_id, &validate).await;
 
         if let Some(run_id) = validation_pending {
-            debug_assert!(!rollback_on_failure);
             let mut validation_run_ids = vec![run_id.clone()];
             if let Some(deferred_run_id) = deferred_validation_pending.as_ref() {
                 validation_run_ids.push(deferred_run_id.clone());
             }
             let guidance = if deferred_validation_pending.is_some() {
-                "Validation is running detached because rollback_on_failure is false. Poll bash_status for every ID in validation_run_ids; validation_run_id is the leading validator and deferred_validation_run_id is queued behind it."
+                "Validation is running in the background. The edit remains applied. Poll bash_status for every ID in validation_run_ids; validation_run_id is the leading validator and deferred_validation_run_id is queued behind it."
             } else {
-                "Validation is running detached because rollback_on_failure is false. Poll bash_status with validation_run_id."
+                "Validation is running in the background. The edit remains applied. Poll bash_status with validation_run_id."
             };
             drop(write_guard.take());
             self.reconcile_pending_async().await?;
             let mut response = json!({
                 "applied": true,
                 "rolled_back": false,
+                "validation_failed": validation_failed,
                 "validation_pending": true,
                 "validation_run_id": run_id,
                 "validation_run_ids": validation_run_ids,
@@ -232,72 +200,18 @@ impl WorkspaceActor {
             if let Some(deferred_run_id) = deferred_validation_pending {
                 response["deferred_validation_run_id"] = Value::String(deferred_run_id);
             }
-            return Ok(response);
-        }
-
-        if validation_failed && rollback_on_failure {
-            let write_guard = write_guard
-                .take()
-                .expect("applied edit must retain its write guard");
-            let actor = Arc::clone(self);
-            let rollback_request_id = request_id.clone();
-            let rollback_session_id = session_id.to_owned();
-            let rollback_result = tokio::task::spawn_blocking(move || {
-                let _write_guard = write_guard;
-                let _reconcile_guard = actor.reconcile_lock.lock();
-                actor.recheck_applied_state(&planned)?;
-                actor.restore_plan(&rollback_session_id, &planned, &rollback_request_id)
-            })
-            .await
-            .map_err(AppError::internal)?;
-            if let Err(error) = rollback_result {
-                return Ok(json!({
-                    "applied": true,
-                    "rolled_back": false,
-                    "reason": "validation_failed_rollback_conflict",
-                    "rollback_error": error.0,
-                    "snapshot_rebased_from": snapshot_rebased_from,
-                    "diff": diff_value,
-                    "diff_stat": diff_stat_value,
-                    "diff_truncated": diff_truncated,
-                    "diff_omitted": diff_omitted,
-                    "syntax_checks": syntax_checks,
-                    "validation": validation,
-                    "generation": self.generation(),
-                    "snapshot_id": self.snapshot(),
-                    "mutations": apply_result,
-                    "phase_ms": {
-                        "prepare_and_commit": prepare_ms,
-                        "commit": commit_ms
-                    }
-                }));
+            if validation_failed {
+                response["reason"] = Value::String("validation_failed".to_owned());
             }
-            return Ok(json!({
-                "applied": false,
-                "rolled_back": true,
-                "reason": "validation_failed",
-                "snapshot_rebased_from": snapshot_rebased_from,
-                "diff": diff_value,
-                "diff_stat": diff_stat_value,
-                "diff_truncated": diff_truncated,
-                "diff_omitted": diff_omitted,
-                "syntax_checks": syntax_checks,
-                "validation": validation,
-                "generation": self.generation(),
-                "snapshot_id": self.snapshot(),
-                "mutations": apply_result,
-                "phase_ms": {
-                    "prepare_and_commit": prepare_ms,
-                    "commit": commit_ms
-                }
-            }));
+            return Ok(response);
         }
 
         drop(write_guard.take());
         self.reconcile_pending_async().await?;
-        Ok(json!({
+        let mut response = json!({
             "applied": true,
             "rolled_back": false,
+            "validation_failed": validation_failed,
             "snapshot_rebased_from": snapshot_rebased_from,
             "diff": diff_value,
             "diff_stat": diff_stat_value,
@@ -312,7 +226,15 @@ impl WorkspaceActor {
                 "prepare_and_commit": prepare_ms,
                 "commit": commit_ms
             }
-        }))
+        });
+        if validation_failed {
+            response["reason"] = Value::String("validation_failed".to_owned());
+            response["guidance"] = Value::String(
+                "Validation failed, but the edit remains applied so the reported failure can be fixed in a follow-up edit."
+                    .to_owned(),
+            );
+        }
+        Ok(response)
     }
 
     fn prepare_edit(
@@ -411,7 +333,6 @@ impl WorkspaceActor {
         Ok(PreparedEdit::Applied(AppliedEdit {
             write_guard,
             planned,
-            request_id,
             apply_result,
             diff,
             snapshot_rebased_from,
@@ -1007,66 +928,6 @@ impl WorkspaceActor {
         let mut journal = self.mutations.lock();
         journal.extend(records.iter().cloned());
         trim_journal(&mut journal);
-    }
-
-    pub(super) fn recheck_applied_state(&self, plan: &[PlannedFile]) -> AppResult<()> {
-        for item in plan {
-            let actual = read_optional(&self.root, &item.path).map_err(|error| {
-                AppError::details("READ_FAILED", error.to_string(), json!({"path": item.path}))
-            })?;
-            let actual_hash = actual.as_ref().map(|value| content_hash(value));
-            let expected_hash = item.after.as_ref().map(|value| content_hash(value));
-            if actual_hash != expected_hash {
-                return Err(AppError::details(
-                    "ROLLBACK_CONFLICT",
-                    "Validation failed, but rollback was skipped because a file changed after the edit",
-                    json!({"path": item.path, "expected_hash": expected_hash, "actual_hash": actual_hash}),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn restore_plan(
-        &self,
-        session_id: &str,
-        plan: &[PlannedFile],
-        request_id: &str,
-    ) -> AppResult<()> {
-        for item in plan.iter().rev() {
-            self.internal_writes
-                .lock()
-                .insert(self.root.join(&item.path), Instant::now());
-            restore_one(&self.root, item)?;
-        }
-        let paths: HashSet<PathBuf> = plan.iter().map(|item| self.root.join(&item.path)).collect();
-        self.index.write().refresh_paths(
-            &self.root,
-            &paths,
-            self.policy.max_file_bytes,
-            &self.exclusions,
-        )?;
-        let generation = self.generation() + 1;
-        let records: Vec<_> = plan
-            .iter()
-            .map(|item| MutationRecord {
-                mutation_id: MutationRecord::new_id(),
-                session_id: session_id.to_owned(),
-                path: item.path.clone(),
-                before_hash: item.after.as_ref().map(|value| content_hash(value)),
-                after_hash: item.before.as_ref().map(|value| content_hash(value)),
-                source: "rollback".to_owned(),
-                request_id: request_id.to_owned(),
-                timestamp: Utc::now(),
-                generation,
-            })
-            .collect();
-        self.persist_mutations(&records)?;
-        self.refresh_repo_status();
-        self.generation.store(generation, Ordering::Release);
-        self.recompute_snapshot();
-        self.publish_mutations(&records);
-        Ok(())
     }
 
     pub(super) fn record_mutations(&self, records: &[MutationRecord]) -> AppResult<()> {
