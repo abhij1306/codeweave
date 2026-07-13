@@ -17,9 +17,6 @@ pub struct RangeHandle {
     pub end_line: usize,
     #[serde(rename = "h", alias = "content_hash")]
     pub content_hash: String,
-    #[allow(dead_code)]
-    #[serde(default, skip_serializing)]
-    pub symbol: Option<String>,
 }
 
 pub fn encode_handle(handle: &RangeHandle) -> AppResult<String> {

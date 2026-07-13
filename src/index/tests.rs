@@ -32,7 +32,6 @@ fn handles_round_trip() {
         start_line: 1,
         end_line: 2,
         content_hash: "h".into(),
-        symbol: Some("x".into()),
     };
     let encoded = encode_handle(&original).unwrap();
     let decoded = decode_handle(&encoded).unwrap();

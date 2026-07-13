@@ -878,6 +878,37 @@ impl BashSupervisor {
         self.cancel_for_owner(run_id, Some(session_id))
     }
 
+    pub async fn cancel_and_wait_for_session(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        wait_timeout: Duration,
+    ) -> AppResult<serde_json::Value> {
+        let cancellation = self.cancel_for_session(session_id, run_id)?;
+        let deadline = tokio::time::Instant::now() + wait_timeout;
+        loop {
+            let terminal = self.status_for_session(session_id, run_id)?;
+            let status = terminal
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !matches!(status, "queued" | "running" | "cancelling") {
+                return Ok(json!({
+                    "cancellation": cancellation,
+                    "terminal": terminal
+                }));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AppError::details(
+                    "RUN_CANCELLATION_TIMEOUT",
+                    "Bash run did not reach a terminal state after cancellation",
+                    json!({"run_id": run_id, "status": status}),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     fn cancel_for_owner(
         &self,
         run_id: &str,

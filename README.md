@@ -199,7 +199,7 @@ Detailed guides:
     "jsonResponse": true,
     "idleTimeoutMs": 5000,
     "toolProfile": "full",
-    "allowedHosts": ["*"]
+    "allowedHosts": []
   },
   "workspace": {
     "path": "/path/to/projects/example",
@@ -210,9 +210,6 @@ Detailed guides:
     "enabled": false,
     "roots": [],
     "explicitOnly": true
-  },
-  "index": {
-    "ranking": "v1"
   },
   "intelligence": {
     "python": {"enabled": false, "command": "basedpyright-langserver", "args": ["--stdio"], "timeoutMs": 10000},

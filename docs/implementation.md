@@ -32,7 +32,7 @@ CodeWeave serves exactly one repository, configured through `workspace.path` and
 
 There is no runtime repository switching and no cached-actor map. `server.statefulMode` controls only transport session isolation (per-chat Bash runs and `changes` attribution); it never changes which repository is served. Run two projects as two instances on two ports.
 
-## Retrieval and ranking
+## Retrieval
 
 The calling coding agent owns intent interpretation. CodeWeave exposes deterministic retrieval primitives and does not contain a second agent or infer architecture from prose.
 

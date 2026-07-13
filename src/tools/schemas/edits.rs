@@ -12,7 +12,7 @@ pub fn code_write() -> Value {
             "overwrite": {"type": "boolean", "default": true},
             "expected_hash": {"type": "string"},
             "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": {"type": "boolean"},
+            "rollback_on_failure": {"type": "boolean", "default": true, "description": "When true, validation must complete synchronously and any failure or foreground-budget exhaustion rolls the edit back. Set false to allow detached validation."},
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard"}
         },
         "required": ["path", "content"],
@@ -32,7 +32,7 @@ pub fn code_replace() -> Value {
             "expected_hash": {"type": "string"},
             "handle": {"type": "string"},
             "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": {"type": "boolean"},
+            "rollback_on_failure": {"type": "boolean", "default": true, "description": "When true, validation must complete synchronously and any failure or foreground-budget exhaustion rolls the edit back. Set false to allow detached validation."},
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard"}
         },
         "required": ["path", "old_text", "new_text"],
@@ -46,10 +46,10 @@ pub fn code_replace_range() -> Value {
         "type": "object",
         "properties": {
             "path": {"type": "string"},
-            "handle": {"type": "string"},
-            "new_text": {"type": "string"},
+            "handle": {"type": "string", "description": "Range handle returned by code_retrieve. A handle-based change must be the only change for its file in one transaction."},
+            "new_text": {"type": "string", "description": "Replacement text. When replacing complete lines, an omitted terminal newline is preserved from the selected range."},
             "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": {"type": "boolean"},
+            "rollback_on_failure": {"type": "boolean", "default": true, "description": "When true, validation must complete synchronously and any failure or foreground-budget exhaustion rolls the edit back. Set false to allow detached validation."},
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard"}
         },
         "required": ["path", "handle", "new_text"],
@@ -68,7 +68,7 @@ pub fn code_insert() -> Value {
             "position": {"type": "string", "enum": ["before", "after", "inside_start", "inside_end"]},
             "expected_hash": {"type": "string"},
             "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": {"type": "boolean"},
+            "rollback_on_failure": {"type": "boolean", "default": true, "description": "When true, validation must complete synchronously and any failure or foreground-budget exhaustion rolls the edit back. Set false to allow detached validation."},
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard"}
         },
         "required": ["path", "content", "anchor_symbol", "position"],
@@ -84,7 +84,7 @@ pub fn code_delete() -> Value {
             "path": {"type": "string"},
             "expected_hash": {"type": "string"},
             "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": {"type": "boolean"},
+            "rollback_on_failure": {"type": "boolean", "default": true, "description": "When true, validation must complete synchronously and any failure or foreground-budget exhaustion rolls the edit back. Set false to allow detached validation."},
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard"}
         },
         "required": ["path"],
@@ -101,7 +101,7 @@ pub fn code_rename() -> Value {
             "to": {"type": "string"},
             "expected_hash": {"type": "string"},
             "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": {"type": "boolean"},
+            "rollback_on_failure": {"type": "boolean", "default": true, "description": "When true, validation must complete synchronously and any failure or foreground-budget exhaustion rolls the edit back. Set false to allow detached validation."},
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard"}
         },
         "required": ["path", "to"],
@@ -130,7 +130,7 @@ pub fn code_transaction() -> Value {
             "changes": {"type": "array", "items": change_schema()},
             "snapshot_id": {"type": "string"},
             "validate": {"type": "array", "items": {"type": "string"}},
-            "rollback_on_failure": {"type": "boolean"},
+            "rollback_on_failure": {"type": "boolean", "default": true, "description": "When true, validation must complete synchronously and any failure or foreground-budget exhaustion rolls the edit back. Set false to allow detached validation."},
             "response_detail": {"type": "string", "enum": ["compact", "standard", "debug"], "default": "standard", "description": "compact omits the unified diff and returns diff_stat only; standard caps the diff to bound payload size; debug returns the full diff."}
         },
         "required": ["changes"],
@@ -152,7 +152,7 @@ fn change_schema() -> Value {
             "content": {"type": "string"},
             "old_text": {"type": "string"},
             "new_text": {"type": "string"},
-            "handle": {"type": "string"},
+            "handle": {"type": "string", "description": "A handle-based change must be the only change for its file in one transaction."},
             "anchor_symbol": {"type": "string"},
             "position": {"type": "string", "enum": ["before", "after", "inside_start", "inside_end"]},
             "overwrite": {"type": "boolean"},

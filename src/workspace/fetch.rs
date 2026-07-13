@@ -1,4 +1,4 @@
-use super::util::{line_ending_label, stale_snapshot};
+use super::util::line_ending_label;
 use super::WorkspaceActor;
 use crate::index::{decode_handle, encode_handle, slice_lines, FileEntry, RangeHandle};
 use crate::model::{bool_value, required_str, usize_value, AppError, AppResult};
@@ -38,18 +38,23 @@ struct FetchPrecondition<'a> {
 }
 
 impl WorkspaceActor {
-    #[allow(dead_code)]
-    pub fn code_fetch(&self, params: &Value) -> AppResult<Value> {
-        self.code_fetch_for_session("default", params)
+    #[cfg(test)]
+    pub(super) fn read_targets(&self, params: &Value) -> AppResult<Value> {
+        self.read_targets_for_session("default", params)
     }
 
-    pub fn code_fetch_for_session(&self, session_id: &str, params: &Value) -> AppResult<Value> {
+    #[cfg(test)]
+    pub(super) fn read_targets_for_session(
+        &self,
+        session_id: &str,
+        params: &Value,
+    ) -> AppResult<Value> {
         let started = std::time::Instant::now();
         let reconcile_pending = self.read_reconcile_pending();
         if let Some(expected) = params.get("snapshot_id").and_then(Value::as_str) {
             let current = self.snapshot();
             if expected != current {
-                return Err(stale_snapshot(expected, &current));
+                return Err(super::util::stale_snapshot(expected, &current));
             }
         }
         let items: Vec<Value> = if let Some(path) = params.get("path").and_then(Value::as_str) {
@@ -79,7 +84,7 @@ impl WorkspaceActor {
             if remaining == 0 {
                 break;
             }
-            match self.fetch_item(session_id, item, remaining) {
+            match self.read_target(session_id, item, remaining) {
                 Ok(result) => {
                     remaining = remaining.saturating_sub(result_text_len(&result));
                     results.push(result);
@@ -142,7 +147,12 @@ impl WorkspaceActor {
         Ok(result)
     }
 
-    fn fetch_item(&self, session_id: &str, item: &Value, remaining: usize) -> AppResult<Value> {
+    pub(super) fn read_target(
+        &self,
+        session_id: &str,
+        item: &Value,
+        remaining: usize,
+    ) -> AppResult<Value> {
         let kind = required_str(item, "kind")?;
         let value = required_str(item, "value")?;
         match kind {
@@ -274,7 +284,6 @@ impl WorkspaceActor {
                         start_line: symbol.start_line,
                         end_line: symbol.end_line,
                         content_hash: hash,
-                        symbol: Some(symbol.name.clone()),
                     })
                     .ok();
                     json!({
@@ -421,7 +430,6 @@ impl WorkspaceActor {
             start_line,
             end_line,
             content_hash: file.hash.clone(),
-            symbol: None,
         })?;
         let base = json!({
             "path": file.path,
@@ -452,6 +460,7 @@ impl WorkspaceActor {
     }
 }
 
+#[cfg(test)]
 fn result_text_len(result: &Value) -> usize {
     ["content", "output"]
         .into_iter()
@@ -460,7 +469,7 @@ fn result_text_len(result: &Value) -> usize {
         .sum()
 }
 
-fn compact_fetch_result(result: &Value) -> Value {
+pub(super) fn compact_fetch_result(result: &Value) -> Value {
     let mut compact = serde_json::Map::new();
     for field in [
         "kind",

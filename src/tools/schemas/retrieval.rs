@@ -41,7 +41,8 @@ pub fn code_retrieve() -> Value {
                     "additionalProperties": false
                 }
             },
-            "fail_fast": {"type": "boolean", "default": false}
+            "fail_fast": {"type": "boolean", "default": false},
+            "snapshot_id": {"type": "string", "description": "Optional workspace snapshot precondition for the complete retrieval batch."}
         },
         "required": ["operations"],
         "additionalProperties": false,

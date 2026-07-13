@@ -608,8 +608,7 @@ fn add_latency_metrics(value: &mut Value, metrics: Value) {
 mod tests {
     use super::*;
     use crate::model::{
-        test_bash_executable, BashConfig, IndexSettings, PolicyConfig, SkillsConfig,
-        WorkspaceSettings,
+        test_bash_executable, BashConfig, PolicyConfig, SkillsConfig, WorkspaceSettings,
     };
     use tempfile::tempdir;
 
@@ -637,7 +636,6 @@ mod tests {
                 exclude_paths: Vec::new(),
             },
             skills: SkillsConfig::default(),
-            index: IndexSettings::default(),
             intelligence: crate::model::IntelligenceSettings::default(),
             policy: PolicyConfig {
                 max_file_bytes,

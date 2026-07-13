@@ -1,3 +1,4 @@
+use super::util::stale_snapshot;
 use super::*;
 
 const MAX_RETRIEVAL_OPERATIONS: usize = 12;
@@ -36,31 +37,71 @@ impl WorkspaceActor {
             ));
         }
 
+        let snapshot = self.snapshot();
+        if let Some(expected) = params.get("snapshot_id").and_then(Value::as_str) {
+            if expected != snapshot {
+                return Err(stale_snapshot(expected, &snapshot));
+            }
+        }
+
         let fail_fast = bool_value(params, "fail_fast", false);
         let mut seen_ids = HashSet::new();
         let mut results = Vec::new();
         let mut errors = Vec::new();
 
-        for (index, operation) in operations.iter().enumerate() {
-            let operation = operation
-                .as_object()
-                .ok_or_else(|| AppError::invalid("retrieval operations must be objects"))?;
-            let kind = operation
-                .get("operation")
-                .and_then(Value::as_str)
-                .ok_or_else(|| AppError::invalid("retrieval operation requires operation"))?;
+        for (index, operation_value) in operations.iter().enumerate() {
+            let fallback_id = format!("op_{}", index + 1);
+            let Some(operation) = operation_value.as_object() else {
+                let error = AppError::invalid("retrieval operations must be objects");
+                errors.push(json!({
+                    "id": fallback_id,
+                    "operation": Value::Null,
+                    "error": error.0
+                }));
+                if fail_fast {
+                    break;
+                }
+                continue;
+            };
             let id = operation
                 .get("id")
                 .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
                 .map(str::to_owned)
-                .unwrap_or_else(|| format!("op_{}", index + 1));
+                .unwrap_or(fallback_id);
+            let operation_name = operation.get("operation").cloned().unwrap_or(Value::Null);
             if !seen_ids.insert(id.clone()) {
-                return Err(AppError::details(
+                let error = AppError::details(
                     "DUPLICATE_RETRIEVAL_OPERATION_ID",
                     format!("duplicate retrieval operation id '{id}'"),
                     json!({"id": id}),
-                ));
+                );
+                errors.push(json!({
+                    "id": id,
+                    "operation": operation_name,
+                    "error": error.0
+                }));
+                if fail_fast {
+                    break;
+                }
+                continue;
             }
+            let Some(kind) = operation
+                .get("operation")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            else {
+                let error = AppError::invalid("retrieval operation requires operation");
+                errors.push(json!({
+                    "id": id,
+                    "operation": Value::Null,
+                    "error": error.0
+                }));
+                if fail_fast {
+                    break;
+                }
+                continue;
+            };
 
             match self.execute_retrieval_operation(session_id, kind, operation) {
                 Ok(result) => results.push(json!({
@@ -83,7 +124,7 @@ impl WorkspaceActor {
 
         Ok(json!({
             "retrieval_contract_version": 2,
-            "snapshot_id": self.snapshot(),
+            "snapshot_id": snapshot,
             "operation_count": operations.len(),
             "executed_count": results.len() + errors.len(),
             "result_count": results.len(),
@@ -111,11 +152,11 @@ impl WorkspaceActor {
         match kind {
             "find_file" => {
                 let name = operation_required_str(operation, "name")?;
-                self.code_search(&search_params(operation, "filename", name))
+                self.search_index(&search_params(operation, "filename", name))
             }
             "find_symbol" => {
                 let symbol = operation_required_str(operation, "symbol")?;
-                self.code_search(&search_params(operation, "symbol", symbol))
+                self.search_index(&search_params(operation, "symbol", symbol))
             }
             "search_text" => {
                 let pattern = operation_required_str(operation, "pattern")?;
@@ -128,11 +169,11 @@ impl WorkspaceActor {
                         "search_text syntax must be literal or regex",
                     ));
                 }
-                self.code_search(&search_params(operation, syntax, pattern))
+                self.search_index(&search_params(operation, syntax, pattern))
             }
             "find_references" => {
                 let symbol = operation_required_str(operation, "symbol")?;
-                self.code_search(&search_params(operation, "references", symbol))
+                self.search_index(&search_params(operation, "references", symbol))
             }
             "symbols_overview" => {
                 let paths = operation_paths(operation);
@@ -141,9 +182,9 @@ impl WorkspaceActor {
                 }
                 let mut params = search_params(operation, "outline", "");
                 params["paths"] = json!(paths);
-                self.code_search(&params)
+                self.search_index(&params)
             }
-            "repo_map" => self.code_search(&search_params(operation, "repo_map", "")),
+            "repo_map" => self.search_index(&search_params(operation, "repo_map", "")),
             "read" => {
                 let target = operation_required_str(operation, "target")?;
                 if !READ_TARGETS.contains(&target) {
@@ -161,10 +202,18 @@ impl WorkspaceActor {
                 if let Some(value) = operation.get("surrounding_lines") {
                     item["context_lines"] = value.clone();
                 }
-                let mut params = json!({"items": [item]});
-                copy_field(operation, &mut params, "max_chars");
-                copy_field(operation, &mut params, "response_detail");
-                self.code_fetch_for_session(session_id, &params)
+                let max_chars = operation
+                    .get("max_chars")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(30_000)
+                    .min(200_000);
+                let result = self.read_target(session_id, &item, max_chars)?;
+                if operation.get("response_detail").and_then(Value::as_str) == Some("compact") {
+                    Ok(super::fetch::compact_fetch_result(&result))
+                } else {
+                    Ok(result)
+                }
             }
             unsupported => Err(AppError::details(
                 "UNSUPPORTED_RETRIEVAL_OPERATION",

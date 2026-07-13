@@ -92,7 +92,7 @@ No architecture changes. Fixes D1–D9 from §1.2. All items below implemented a
 1. **D1** ✅: standardized the port across `config.example.json`, `default_port()`, and README; added `foregroundBudgetMs`; added `shipped_config_example_deserializes_and_matches_code_defaults` which deserializes `config.example.json` through the real config path so the example can never drift again. **Port is `8813`** — the operator overrode the plan's proposed `8820` during implementation; the drift test now pins `8813` and asserts `server.port == default_port()`.
 2. **D2** ✅: `git_push` now requires `confirm: true` (schema `required` + runtime check mirroring `git_restore`). Breaking change for safety parity; noted in README and `docs/tools.md`.
 3. **D3** ✅: all git invocations route through a timeout-bounded runner with a default 30s bound (push keeps 120s). `GIT_TERMINAL_PROMPT=0` and `GIT_ASKPASS=echo` are set on every git command so credential prompts fail fast instead of hanging.
-4. **D4** ✅: deferred (async-promoted) validation returns `rollback_on_failure_not_applied: true`, echoes `rollback_on_failure_requested`, and includes explicit guidance text; documented in `docs/tools.md`. (No automatic post-hoc rollback — the workspace may have legitimately moved on.)
+4. **D4** ✅: rollback-protected validation retains the write lock, cancels any auto-promoted Bash run, waits for terminal cancellation, and restores the original files. Detached validation is available only when `rollback_on_failure: false`; cancellation that cannot be confirmed leaves the edit applied with an explicit `validation_cancellation_unconfirmed` result.
 5. **D5** ✅: added `tree-sitter-json` (JSON edits are now syntax-checked); for formats without a bundled grammar (YAML/TOML/Markdown/HTML/text) each planned file emits `syntax_check: "skipped"` so the bypass is visible.
 6. **D8** ✅: the `unwrap_or_default()` git-status swallows were replaced with a logged `tracing::warn!` + `repo_status_stale: true` marker on the git response; cleared on preflight.
 7. **D9** ✅: removed the dead `snapshot_id` field from `RangeHandle`. It was `skip_serializing`, so no wire change and no handle-version bump was required.
@@ -273,12 +273,12 @@ Original spec (for reference):
 
 The original plan proposed a chunk-level **BM25F** scorer. That was built and measured against the P3 harness, and it *regressed* natural-language recall: chunk-granular BM25 splits a file's relevant terms across many short chunks, and file-level BM25 length-normalization over-penalized the large, information-dense files that the exact-match constants in v1 handle well (chunk-BM25F Recall@1 60% / MRR 0.699; file-BM25F Recall@1 33% / MRR 0.563 — both worse than v1). Per the project objective — *fast, efficient, accurate, no added complexity* — BM25F was **dropped from the hot path**.
 
-What actually shipped as `index.ranking: "v2"` is **v1's exact-scoring loop plus two additions**:
+What the offline evaluator labels `v2` adds two behaviors to the baseline ranker:
 
 1. **Filename affinity boost** — the fix for v1's one real weakness (filename/config lookups ranked poorly). Per file, `path_hits = candidate terms present in the file's path`; `affinity = path_hits / candidate_len`; `score += affinity * 22`, and a full path-name match adds a further `+18`. This moved `config.example.json` from rank 10 (miss) to rank 1 without touching any other query. df reuses the existing `token_index` (`df = token_index[term].len()`, `N = files.len()`), so **no separate df map or corpus-stat bookkeeping was added**.
 2. **Symbol-bounded rendering** — each file is split at index time into `Chunk`s (one per top-level symbol, `SymbolPart`s for symbols > 150 lines, `Remainder` chunks for the gaps). A result renders the *whole enclosing symbol* when it fits `MAX_RENDER_LINES` (28); a larger symbol renders a window **centered on the match** (never the first-N-lines truncation v1 used). Results carry additive `chunk_kind` and `complete_symbol` fields; v1 omits both. Chunks are `#[serde(skip)]`, rebuilt in `normalize_entry`, so a per-file incremental refresh replaces a file's chunks as a unit — no global stat to maintain.
 
-Index cache schema bumped `codeweave-index-v6` → `codeweave-index-v7`; old caches rebuild transparently. Default stays `v1`; `v2` is opt-in via config.
+Index cache schema bumped `codeweave-index-v6` → `codeweave-index-v7`; old caches rebuild transparently. The server no longer exposes a ranking configuration; v1/v2 selection remains internal to the offline evaluator.
 
 **Measured on this repo (P3 harness, 15 queries), v2 vs committed v1:**
 
@@ -339,7 +339,7 @@ Verification: `cargo test --bin codeweave-rust` (163 pass, incl. new chunk-build
 **Compatibility:**
 - `code_retrieve` modes (literal/regex/filename/symbol/references/outline/repo_map) unchanged.
 - `code_retrieve` request/response schema unchanged (additive fields only).
-- Config flag `index.ranking: "v1" | "v2"` (default `v2` once gates pass; `v1` kept one release, then deleted).
+- The offline evaluator may select `Ranking::V1` or `Ranking::V2`; neither is a public MCP or server-configuration option.
 
 **Acceptance (hard gates via P3 harness, measured on crawlerai + OSS fixtures):**
 - Natural-language-intent Recall@5 and MRR@10 improve over committed v1 baseline.

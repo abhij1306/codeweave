@@ -1652,6 +1652,7 @@ mod tests {
         // start hits the port the README and connectors expect.
         assert_eq!(server.port, default_port());
         assert_eq!(server.port, 8813);
+        assert!(server.allowed_hosts.is_empty());
 
         // The remainder must deserialize as the daemon config the server actually
         // uses at startup (load_config injects cache_root).

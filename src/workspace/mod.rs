@@ -778,15 +778,20 @@ impl WorkspaceActor {
                 "reference_scopes": ["all", "production", "tests"],
                 "reference_kinds": ["declaration", "call", "import", "type", "read", "write", "other"],
                 "supports_qualified_symbols": true,
-                "ambiguous_symbols_return_candidates": true
+                "ambiguous_symbols_return_candidates": true,
+                "supports_snapshot_precondition": true,
+                "malformed_operations_return_item_errors": true
             },
             "editing": {
                 "supports_preview": true,
                 "supports_transaction": true,
                 "supports_single_file_wrappers": true,
                 "supports_handle_range_replace": true,
+                "handle_edits_must_be_only_change_for_file": true,
+                "full_line_replacements_preserve_terminal_line_ending": true,
                 "supports_bash_validation_commands": bash_available,
-                "supports_rollback_on_failure": true
+                "supports_rollback_on_failure": true,
+                "detached_validation_requires_rollback_disabled": true
             },
             "change_contracts": {
                 "create": {"required": ["kind", "path", "content"], "optional": ["overwrite", "expected_hash"]},
@@ -979,7 +984,7 @@ impl WorkspaceActor {
         self.summary(session_id, stateless_session)
     }
 
-    pub fn code_search(&self, params: &Value) -> AppResult<Value> {
+    pub(super) fn search_index(&self, params: &Value) -> AppResult<Value> {
         let started = Instant::now();
         let reconcile_pending = self.read_reconcile_pending();
         let mode = params

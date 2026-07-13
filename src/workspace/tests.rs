@@ -191,7 +191,7 @@ fn fetch_batches_return_successes_and_item_errors() {
     fs::write(root.path().join("valid.rs"), "fn valid() {}\n").unwrap();
     let actor = test_actor(root.path());
     let result = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "items": [
                 {"kind": "path", "value": "valid.rs"},
                 {"kind": "path", "value": "missing.rs"}
@@ -214,7 +214,7 @@ fn fetch_resolves_qualified_python_method_names() {
     let actor = test_actor(root.path());
 
     let result = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "items": [{
                 "kind": "symbol",
                 "path": "runner.py",
@@ -246,7 +246,7 @@ fn fetch_disambiguates_path_and_rust_qualified_method() {
     let actor = test_actor(root.path());
 
     let result = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "items": [{
                 "kind": "symbol",
                 "value": "src/runner.rs::BrowserAttemptRunner::run"
@@ -272,7 +272,7 @@ fn fetch_accepts_direct_path_parameters() {
     let actor = test_actor(root.path());
 
     let result = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "path": "direct.rs",
             "start_line": 2,
             "end_line": 3,
@@ -295,7 +295,7 @@ async fn fetched_windows_text_can_be_previewed_and_applied_exactly() {
     let actor = test_actor(root.path());
 
     let fetched = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "path": "windows.txt",
             "start_line": 1,
             "end_line": 2,
@@ -345,7 +345,7 @@ async fn exact_replace_prefers_normalized_crlf_match_over_raw_lf_suffix() {
     fs::write(&path, b"before\r\nold value\r\nafter\r\n").unwrap();
     let actor = test_actor(root.path());
     let fetched = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "path": "windows.txt",
             "start_line": 1,
             "end_line": 2,
@@ -384,7 +384,7 @@ async fn handle_range_replace_preserves_windows_line_endings() {
     let actor = test_actor(root.path());
 
     let fetched = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "path": "windows.txt",
             "start_line": 2,
             "end_line": 2,
@@ -422,6 +422,66 @@ async fn handle_range_replace_preserves_windows_line_endings() {
     );
 }
 
+#[tokio::test]
+async fn replace_range_preserves_boundary_when_new_text_omits_newline() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("value.txt");
+    fs::write(&path, "first\nsecond\nthird\n").unwrap();
+    let actor = test_actor(root.path());
+    let fetched = actor
+        .read_targets(&json!({
+            "path": "value.txt",
+            "start_line": 2,
+            "end_line": 2
+        }))
+        .unwrap();
+    let handle = fetched["results"][0]["handle"].as_str().unwrap();
+
+    actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [{
+                    "kind": "replace_range",
+                    "path": "value.txt",
+                    "handle": handle,
+                    "new_text": "updated"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(path).unwrap(), "first\nupdated\nthird\n");
+}
+
+#[tokio::test]
+async fn exact_full_line_replace_preserves_boundary() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("value.txt");
+    let original = "first\nsecond\nthird\n";
+    fs::write(&path, original).unwrap();
+    let actor = test_actor(root.path());
+
+    actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [{
+                    "kind": "replace",
+                    "path": "value.txt",
+                    "old_text": "first\nsecond\n",
+                    "new_text": "updated",
+                    "expected_hash": content_hash(original)
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(path).unwrap(), "updated\nthird\n");
+}
+
 #[test]
 fn outline_accepts_multiple_paths_and_reports_partial_errors() {
     let root = tempdir().unwrap();
@@ -430,13 +490,13 @@ fn outline_accepts_multiple_paths_and_reports_partial_errors() {
     let actor = test_actor(root.path());
 
     let single = actor
-        .code_search(&json!({"mode": "outline", "paths": ["one.rs"]}))
+        .search_index(&json!({"mode": "outline", "paths": ["one.rs"]}))
         .unwrap();
     assert_eq!(single["path"], "one.rs");
     assert!(single["symbols"].is_array());
 
     let batch = actor
-        .code_search(&json!({
+        .search_index(&json!({
             "mode": "outline",
             "paths": ["one.rs", "missing.rs", "two.rs"]
         }))
@@ -459,7 +519,7 @@ fn fetch_supports_compact_metadata_and_symbol_import_context() {
     let actor = test_actor(root.path());
 
     let metadata = actor
-        .code_fetch(&json!({"items": [{"kind": "metadata", "value": "lib.rs"}]}))
+        .read_targets(&json!({"items": [{"kind": "metadata", "value": "lib.rs"}]}))
         .unwrap();
     assert_eq!(metadata["results"][0]["kind"], "metadata");
     assert_eq!(metadata["results"][0]["language"], "rust");
@@ -467,7 +527,7 @@ fn fetch_supports_compact_metadata_and_symbol_import_context() {
     assert!(metadata["results"][0].get("content").is_none());
 
     let symbol = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "items": [{
                 "kind": "symbol",
                 "value": "render",
@@ -481,7 +541,7 @@ fn fetch_supports_compact_metadata_and_symbol_import_context() {
     assert_eq!(symbol["results"][0]["imports"][0]["text"], "use std::fmt;");
 
     let compact = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "path": "lib.rs",
             "response_detail": "compact"
         }))
@@ -590,7 +650,11 @@ fn code_retrieve_batches_explicit_primitives_in_one_round_trip() {
         .as_str()
         .unwrap()
         .contains("runtime failed"));
-    assert_eq!(result["results"][4]["result"]["result_count"], 1);
+    assert_eq!(result["results"][4]["result"]["path"], "engine.rs");
+    assert!(result["results"][4]["result"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("pub fn extract"));
 }
 
 #[test]
@@ -616,6 +680,59 @@ fn code_retrieve_preserves_success_when_an_operation_fails() {
     assert_eq!(result["partial_success"], true);
     assert_eq!(result["results"][0]["id"], "file");
     assert_eq!(result["errors"][0]["id"], "invalid");
+}
+
+#[test]
+fn code_retrieve_reports_malformed_entries_without_losing_successes() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("engine.rs"), "pub fn extract() {}\n").unwrap();
+    let actor = test_actor(root.path());
+
+    let result = actor
+        .code_retrieve_for_session(
+            "session",
+            &json!({
+                "operations": [
+                    {"id": "file", "operation": "find_file", "name": "engine.rs"},
+                    "not-an-object",
+                    {"id": "missing-operation"},
+                    {"id": "file", "operation": "find_symbol", "symbol": "extract"}
+                ]
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(result["result_count"], 1);
+    assert_eq!(result["error_count"], 3);
+    assert_eq!(result["partial_success"], true);
+    assert_eq!(result["results"][0]["id"], "file");
+    assert_eq!(result["errors"][0]["id"], "op_2");
+    assert_eq!(result["errors"][1]["id"], "missing-operation");
+    assert_eq!(
+        result["errors"][2]["error"]["code"],
+        "DUPLICATE_RETRIEVAL_OPERATION_ID"
+    );
+}
+
+#[test]
+fn code_retrieve_rejects_a_stale_snapshot() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("engine.rs"), "pub fn extract() {}\n").unwrap();
+    let actor = test_actor(root.path());
+
+    let error = actor
+        .code_retrieve_for_session(
+            "session",
+            &json!({
+                "snapshot_id": "snap_stale",
+                "operations": [
+                    {"operation": "find_file", "name": "engine.rs"}
+                ]
+            }),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.0.code, "STALE_SNAPSHOT");
 }
 
 #[tokio::test]
@@ -650,7 +767,7 @@ async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
     assert_eq!(started["status_fetch"]["value"], run_id);
 
     let fetched = actor
-        .code_fetch_for_session(
+        .read_targets_for_session(
             "session",
             &json!({
                 "items": [{"kind": "bash_status", "value": run_id}]
@@ -664,7 +781,7 @@ async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
     assert_eq!(fetched["results"][0]["status"], "succeeded");
 
     let bounded = actor
-        .code_fetch_for_session(
+        .read_targets_for_session(
             "session",
             &json!({
                 "items": [
@@ -786,7 +903,7 @@ fn search_accepts_multiple_queries() {
     fs::write(root.path().join("beta.rs"), "fn beta() {}\n").unwrap();
     let actor = test_actor(root.path());
     let result = actor
-        .code_search(&json!({
+        .search_index(&json!({
             "mode": "literal",
             "queries": ["alpha", "beta"]
         }))
@@ -811,13 +928,13 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
         .store(true, std::sync::atomic::Ordering::Release);
 
     let fetch = actor
-        .code_fetch(&json!({"path": "existing.rs", "max_chars": 5_000}))
+        .read_targets(&json!({"path": "existing.rs", "max_chars": 5_000}))
         .unwrap();
     assert_eq!(fetch["reconcile_pending"], true);
     assert!(fetch["phase_ms"]["fetch_items"].is_number());
 
     let search = actor
-        .code_search(&json!({"mode": "literal", "query": "pending_symbol"}))
+        .search_index(&json!({"mode": "literal", "query": "pending_symbol"}))
         .unwrap();
     assert_eq!(search["reconcile_pending"], true);
     assert_eq!(search["result_count"], 0);
@@ -876,7 +993,7 @@ fn fetch_rejects_a_stale_snapshot() {
     fs::write(root.path().join("valid.rs"), "fn valid() {}\n").unwrap();
     let actor = test_actor(root.path());
     let error = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "snapshot_id": "snap_stale",
             "items": [{"kind": "path", "value": "valid.rs"}]
         }))
@@ -890,7 +1007,7 @@ fn fetch_reports_character_truncation_separately() {
     fs::write(root.path().join("large.txt"), "abcdefghijklmnopqrstuvwxyz").unwrap();
     let actor = test_actor(root.path());
     let result = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "items": [{"kind": "path", "value": "large.txt"}],
             "max_chars": 5
         }))
@@ -907,7 +1024,7 @@ fn open_ended_line_fetch_reports_clamped_end_line() {
     let actor = test_actor(root.path());
 
     let result = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "path": "short.txt",
             "start_line": 2,
             "max_chars": 5_000
@@ -926,7 +1043,7 @@ fn out_of_bounds_line_fetch_clamps_start_before_end() {
     let actor = test_actor(root.path());
 
     let result = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "path": "short.txt",
             "start_line": 999,
             "max_chars": 5_000
@@ -949,7 +1066,7 @@ fn ranged_fetch_continuation_stays_within_the_original_range() {
     let actor = test_actor(root.path());
 
     let first = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "path": "range.txt",
             "start_line": 2,
             "end_line": 4,
@@ -960,7 +1077,7 @@ fn ranged_fetch_continuation_stays_within_the_original_range() {
     let continuation = first["results"][0]["continuation"].as_str().unwrap();
 
     let second = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "items": [{"kind": "continuation", "value": continuation}],
             "max_chars": 100
         }))
@@ -984,7 +1101,7 @@ fn handle_fetch_continuation_preserves_the_handle_range() {
     .unwrap();
     let actor = test_actor(root.path());
     let direct = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "path": "handle.txt",
             "start_line": 2,
             "end_line": 4,
@@ -994,14 +1111,14 @@ fn handle_fetch_continuation_preserves_the_handle_range() {
     let handle = direct["results"][0]["handle"].as_str().unwrap();
 
     let first = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "items": [{"kind": "handle", "value": handle}],
             "max_chars": 7
         }))
         .unwrap();
     let continuation = first["results"][0]["continuation"].as_str().unwrap();
     let second = actor
-        .code_fetch(&json!({
+        .read_targets(&json!({
             "items": [{"kind": "continuation", "value": continuation}],
             "max_chars": 100
         }))
@@ -1084,7 +1201,7 @@ fn journal_failure_rolls_back_applied_files_before_returning_error() {
         original
     );
     let fetched = actor
-        .code_fetch(&json!({"path": "value.txt", "max_chars": 5_000}))
+        .read_targets(&json!({"path": "value.txt", "max_chars": 5_000}))
         .unwrap();
     assert_eq!(fetched["results"][0]["content"], original);
     assert_eq!(actor.generation(), generation);
@@ -1398,7 +1515,8 @@ async fn slow_bash_validation_detaches_and_reports_pending() {
                     "new_text": "{ 2 }",
                     "expected_hash": content_hash(original)
                 }],
-                "validate": ["echo checking; sleep 30", "echo later"]
+                "validate": ["echo checking; sleep 30", "echo later"],
+                "rollback_on_failure": false
             }),
         )
         .await
@@ -1734,6 +1852,50 @@ async fn overlapping_exact_edits_in_one_transaction_are_rejected() {
 }
 
 #[tokio::test]
+async fn handle_edit_cannot_share_a_file_with_another_change() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("value.txt");
+    let original = "one\ntwo\nthree\n";
+    fs::write(&path, original).unwrap();
+    let actor = test_actor(root.path());
+    let fetched = actor
+        .read_targets(&json!({
+            "path": "value.txt",
+            "start_line": 2,
+            "end_line": 2
+        }))
+        .unwrap();
+    let handle = fetched["results"][0]["handle"].as_str().unwrap();
+
+    let error = actor
+        .code_edit(
+            "test-session",
+            &json!({
+                "changes": [
+                    {
+                        "kind": "replace_range",
+                        "path": "value.txt",
+                        "handle": handle,
+                        "new_text": "TWO"
+                    },
+                    {
+                        "kind": "replace",
+                        "path": "value.txt",
+                        "old_text": "three",
+                        "new_text": "THREE",
+                        "expected_hash": content_hash(original)
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.0.code, "AMBIGUOUS_HANDLE_EDIT_ORDER");
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
+}
+
+#[tokio::test]
 async fn syntax_error_gate_blocks_broken_rust_and_leaves_file_untouched() {
     let root = tempdir().unwrap();
     let original = "fn value() -> i32 { 1 }\n";
@@ -1934,15 +2096,15 @@ async fn same_file_multi_change_accumulates_on_the_in_progress_plan() {
 }
 
 #[tokio::test]
-async fn deferred_validation_does_not_roll_back_even_when_rollback_requested() {
+async fn deferred_validation_rolls_back_when_requested() {
     let root = tempdir().unwrap();
     let original = "fn value() -> i32 { 1 }\n";
     fs::write(root.path().join("value.rs"), original).unwrap();
     let actor = test_actor_with_budget(root.path(), 200);
 
-    // rollback_on_failure is explicitly requested, but the validation is promoted
-    // to a detached run: the edit must stay applied and the response must make the
-    // no-rollback semantics explicit (D4).
+    // A rollback-protected edit must never be left applied with validation still
+    // running in the background. The promoted validation is cancelled and the
+    // original content is restored.
     let result = actor
         .code_edit(
             "test-session",
@@ -1961,16 +2123,19 @@ async fn deferred_validation_does_not_roll_back_even_when_rollback_requested() {
         .await
         .unwrap();
 
-    assert_eq!(result["applied"], true);
-    assert_eq!(result["validation_pending"], true);
-    assert_eq!(result["rollback_on_failure_requested"], true);
-    assert_eq!(result["rollback_on_failure_not_applied"], true);
-    assert!(result["guidance"].is_string());
+    assert_eq!(result["applied"], false);
+    assert_eq!(result["rolled_back"], true);
+    assert_eq!(result["reason"], "validation_failed");
+    assert!(result["validation"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| {
+            entry["reason"] == "rollback_requires_synchronous_validation"
+                && entry["cancellation"]["terminal"]["status"] == "cancelled"
+        }));
     assert_eq!(
         fs::read_to_string(root.path().join("value.rs")).unwrap(),
-        "fn value() -> i32 { 2 }\n"
+        original
     );
-
-    let run_id = result["validation_run_id"].as_str().unwrap();
-    let _ = actor.bash.cancel_for_session("test-session", run_id);
 }

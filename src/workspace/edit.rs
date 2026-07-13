@@ -32,6 +32,7 @@ pub(super) struct PlannedFile {
 }
 
 struct AppliedEdit {
+    write_guard: tokio::sync::OwnedMutexGuard<()>,
     planned: Vec<PlannedFile>,
     request_id: String,
     apply_result: Vec<MutationRecord>,
@@ -130,6 +131,7 @@ impl WorkspaceActor {
             PreparedEdit::Applied(applied) => applied,
         };
         let AppliedEdit {
+            write_guard,
             planned,
             request_id,
             apply_result,
@@ -138,6 +140,8 @@ impl WorkspaceActor {
             commit_ms,
             syntax_checks,
         } = applied;
+        let mut write_guard = Some(write_guard);
+        let rollback_on_failure = bool_value(params, "rollback_on_failure", true);
 
         // Shape the diff payload by response_detail before `planned` is moved into any
         // rollback closure below. `standard` (default) caps the unified diff so a large
@@ -154,31 +158,42 @@ impl WorkspaceActor {
             omitted: diff_omitted,
         } = diff_view;
 
-        // Validation must not push the edit call past the client's tool
-        // budget. Each command already auto-promotes to the background if it
-        // exceeds policy.bash.foregroundBudgetMs; we additionally bound the
-        // *cumulative* validation wall time. When the budget is spent (or a
-        // command auto-promotes), the remaining validation runs detached and
-        // the edit returns validation_pending for the caller to poll.
+        // Validation stays inside the write transaction when rollback was requested.
+        // If the foreground budget is exhausted, a rollback-protected edit is
+        // reverted instead of being left applied without a validation result.
+        // Callers that explicitly disable rollback may opt into detached validation.
         let budget_ms = self.policy.bash.foreground_budget_ms;
         let validation_started = Instant::now();
         let mut validation = Vec::new();
         let mut validation_failed = false;
         let mut validation_pending: Option<String> = None;
+        let mut validation_cancellation_error: Option<Value> = None;
         let mut remaining = validate.iter().peekable();
         while let Some(command) = remaining.next() {
             let over_budget =
                 budget_ms != 0 && validation_started.elapsed().as_millis() as u64 >= budget_ms;
             if over_budget {
-                // Fold this command and any that follow into one detached run.
                 let mut deferred = vec![command.clone()];
                 deferred.extend(remaining.map(String::clone));
-                match self
-                    .spawn_pending_validation(session_id, &deferred, &mut validation)
-                    .await
-                {
-                    Some(run_id) => validation_pending = Some(run_id),
-                    None => validation_failed = true,
+                if rollback_on_failure {
+                    validation_failed = true;
+                    validation.extend(deferred.into_iter().map(|command| {
+                        json!({
+                            "command": command,
+                            "result": {
+                                "status": "not_run",
+                                "reason": "rollback_requires_synchronous_validation"
+                            }
+                        })
+                    }));
+                } else {
+                    match self
+                        .spawn_pending_validation(session_id, &deferred, &mut validation)
+                        .await
+                    {
+                        Some(run_id) => validation_pending = Some(run_id),
+                        None => validation_failed = true,
+                    }
                 }
                 break;
             }
@@ -196,42 +211,67 @@ impl WorkspaceActor {
                 )
                 .await
             {
-                Ok(result) => {
-                    match result.get("status").and_then(Value::as_str) {
-                        Some("succeeded") => {
-                            validation.push(json!({"command": command, "result": result}));
-                        }
-                        Some("running") => {
-                            // Auto-promoted mid-validation: it is still running,
-                            // so its pass/fail is unknown. Defer to polling.
-                            validation_pending = result
-                                .get("run_id")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned);
-                            validation.push(json!({"command": command, "result": result}));
-                            if let Some(run_id) = &validation_pending {
-                                for deferred in remaining {
-                                    validation.push(json!({
-                                        "command": deferred,
-                                        "deferred": true,
-                                        "result": {
-                                            "status": "pending",
-                                            "reason": "blocked_by_pending_validation",
-                                            "run_id": run_id
-                                        }
-                                    }));
-                                }
-                            } else {
-                                validation_failed = true;
-                            }
-                            break;
-                        }
-                        _ => {
-                            validation_failed = true;
-                            validation.push(json!({"command": command, "result": result}));
-                        }
+                Ok(result) => match result.get("status").and_then(Value::as_str) {
+                    Some("succeeded") => {
+                        validation.push(json!({"command": command, "result": result}));
                     }
-                }
+                    Some("running") => {
+                        let run_id = result
+                            .get("run_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        validation.push(json!({"command": command, "result": result}));
+                        if rollback_on_failure {
+                            validation_failed = true;
+                            if let Some(run_id) = run_id {
+                                match self
+                                    .bash
+                                    .cancel_and_wait_for_session(
+                                        session_id,
+                                        &run_id,
+                                        tokio::time::Duration::from_secs(5),
+                                    )
+                                    .await
+                                {
+                                    Ok(cancellation) => validation.push(json!({
+                                        "run_id": run_id,
+                                        "cancellation": cancellation,
+                                        "reason": "rollback_requires_synchronous_validation"
+                                    })),
+                                    Err(error) => {
+                                        let error = json!(error.0);
+                                        validation.push(json!({
+                                            "run_id": run_id,
+                                            "error": error,
+                                            "reason": "validation_cancellation_unconfirmed"
+                                        }));
+                                        validation_cancellation_error = Some(error);
+                                    }
+                                }
+                            }
+                        } else if let Some(run_id) = run_id {
+                            validation_pending = Some(run_id.clone());
+                            for deferred in remaining {
+                                validation.push(json!({
+                                    "command": deferred,
+                                    "deferred": true,
+                                    "result": {
+                                        "status": "pending",
+                                        "reason": "blocked_by_pending_validation",
+                                        "run_id": run_id
+                                    }
+                                }));
+                            }
+                        } else {
+                            validation_failed = true;
+                        }
+                        break;
+                    }
+                    _ => {
+                        validation_failed = true;
+                        validation.push(json!({"command": command, "result": result}));
+                    }
+                },
                 Err(error) => {
                     validation_failed = true;
                     validation.push(json!({
@@ -245,23 +285,15 @@ impl WorkspaceActor {
             }
         }
 
-        // A pending (detached) validation cannot drive a synchronous rollback;
-        // the edit stays applied and the caller decides after polling. When the
-        // caller asked for rollback_on_failure, it does NOT apply on this path:
-        // the workspace may have legitimately moved on by the time validation
-        // finishes, so we surface the gap explicitly rather than silently
-        // reverting later. See docs/tools.md (deferred validation).
-        if let Some(run_id) = validation_pending {
-            let rollback_requested = bool_value(params, "rollback_on_failure", true);
+        if let Some(error) = validation_cancellation_error {
+            drop(write_guard.take());
             self.reconcile_pending_async().await?;
             return Ok(json!({
                 "applied": true,
                 "rolled_back": false,
-                "validation_pending": true,
-                "validation_run_id": run_id,
-                "rollback_on_failure_requested": rollback_requested,
-                "rollback_on_failure_not_applied": true,
-                "guidance": "Validation exceeded the foreground budget and is running detached; the edit is already applied. rollback_on_failure does NOT apply to detached validation — poll bash_status with validation_run_id and, if it fails, revert explicitly (e.g. code_transaction/git_restore).",
+                "reason": "validation_cancellation_unconfirmed",
+                "validation_cancellation_error": error,
+                "guidance": "Validation cancellation could not be confirmed, so CodeWeave left the edit applied instead of risking rollback while the validator might still be running.",
                 "snapshot_rebased_from": snapshot_rebased_from,
                 "diff": diff_value,
                 "diff_stat": diff_stat_value,
@@ -279,9 +311,37 @@ impl WorkspaceActor {
             }));
         }
 
-        let rollback_on_failure = bool_value(params, "rollback_on_failure", true);
+        if let Some(run_id) = validation_pending {
+            debug_assert!(!rollback_on_failure);
+            drop(write_guard.take());
+            self.reconcile_pending_async().await?;
+            return Ok(json!({
+                "applied": true,
+                "rolled_back": false,
+                "validation_pending": true,
+                "validation_run_id": run_id,
+                "guidance": "Validation is running detached because rollback_on_failure is false. Poll bash_status with validation_run_id.",
+                "snapshot_rebased_from": snapshot_rebased_from,
+                "diff": diff_value,
+                "diff_stat": diff_stat_value,
+                "diff_truncated": diff_truncated,
+                "diff_omitted": diff_omitted,
+                "syntax_checks": syntax_checks,
+                "validation": validation,
+                "generation": self.generation(),
+                "snapshot_id": self.snapshot(),
+                "mutations": apply_result,
+                "phase_ms": {
+                    "prepare_and_commit": prepare_ms,
+                    "commit": commit_ms
+                }
+            }));
+        }
+
         if validation_failed && rollback_on_failure {
-            let write_guard = self.write_lock.clone().lock_owned().await;
+            let write_guard = write_guard
+                .take()
+                .expect("applied edit must retain its write guard");
             let actor = Arc::clone(self);
             let rollback_request_id = request_id.clone();
             let rollback_session_id = session_id.to_owned();
@@ -336,6 +396,7 @@ impl WorkspaceActor {
             }));
         }
 
+        drop(write_guard.take());
         self.reconcile_pending_async().await?;
         Ok(json!({
             "applied": true,
@@ -493,8 +554,8 @@ impl WorkspaceActor {
         let commit_started = Instant::now();
         let apply_result = self.commit_plan(session_id, &planned, &request_id)?;
         let commit_ms = commit_started.elapsed().as_millis();
-        drop(write_guard);
         Ok(PreparedEdit::Applied(AppliedEdit {
+            write_guard,
             planned,
             request_id,
             apply_result,
@@ -506,6 +567,31 @@ impl WorkspaceActor {
     }
 
     fn preflight_overlaps(&self, changes: &[Value], index: &CodeIndex) -> AppResult<()> {
+        let mut change_counts = HashMap::<String, usize>::new();
+        let mut handle_paths = HashSet::new();
+        for change in changes {
+            if let Some(path) = change.get("path").and_then(Value::as_str) {
+                let path = path.replace('\\', "/");
+                *change_counts.entry(path.clone()).or_default() += 1;
+                if change.get("handle").and_then(Value::as_str).is_some() {
+                    handle_paths.insert(path);
+                }
+            }
+        }
+        if let Some(path) = handle_paths
+            .into_iter()
+            .find(|path| change_counts.get(path).copied().unwrap_or_default() > 1)
+        {
+            return Err(AppError::details(
+                "AMBIGUOUS_HANDLE_EDIT_ORDER",
+                "A handle-based edit must be the only change for its file in one transaction",
+                json!({
+                    "path": path,
+                    "guidance": "Use one replace_range for the complete fetched range, or use exact replacements without handles."
+                }),
+            ));
+        }
+
         let mut ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
         for change in changes {
             let kind = change
@@ -670,10 +756,11 @@ impl WorkspaceActor {
                             json!({"path": path, "expected": expected, "actual": count, "start_line": handle.start_line, "end_line": handle.end_line}),
                         ));
                     }
+                    let replacement = preserve_terminal_line_ending(old.as_str(), &new);
                     let mut value = current.clone();
                     value.replace_range(
                         start..end,
-                        &selected.replacen(old.as_str(), &new, expected),
+                        &selected.replacen(old.as_str(), &replacement, expected),
                     );
                     value
                 } else {
@@ -685,7 +772,8 @@ impl WorkspaceActor {
                             json!({"path": path, "expected": expected, "actual": count}),
                         ));
                     }
-                    current.replacen(old.as_str(), &new, expected)
+                    let replacement = preserve_terminal_line_ending(old.as_str(), &new);
+                    current.replacen(old.as_str(), &replacement, expected)
                 };
                 put_plan(plan, path, Some(current), Some(after));
             }
@@ -706,8 +794,9 @@ impl WorkspaceActor {
                 })?;
                 let new = normalize_line_endings_for_content(&current, new_input);
                 let (start, end) = line_range_bytes(&current, handle.start_line, handle.end_line)?;
+                let replacement = preserve_terminal_line_ending(&current[start..end], &new);
                 let mut after = current.clone();
-                after.replace_range(start..end, &new);
+                after.replace_range(start..end, &replacement);
                 put_plan(plan, path, Some(current), Some(after));
             }
             "insert" => {
@@ -1159,6 +1248,19 @@ fn char_boundary_at_or_before(value: &str, mut index: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+fn preserve_terminal_line_ending(selected: &str, replacement: &str) -> String {
+    if replacement.is_empty() || replacement.ends_with('\n') || !selected.ends_with('\n') {
+        return replacement.to_owned();
+    }
+    let mut value = replacement.to_owned();
+    if selected.ends_with("\r\n") {
+        value.push_str("\r\n");
+    } else {
+        value.push('\n');
+    }
+    value
 }
 
 fn matching_old_text(content: &str, selected: &str, old: &str, expected: usize) -> (String, usize) {

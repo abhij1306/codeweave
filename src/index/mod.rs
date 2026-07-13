@@ -240,7 +240,7 @@ pub enum SymbolDetail {
     None,
 }
 
-/// Retrieval ranking algorithm selector (config `index.ranking`).
+/// Evaluation-only retrieval ranking selector. The MCP server does not expose a ranking configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Ranking {
     #[default]
@@ -902,7 +902,6 @@ impl CodeIndex {
                     start_line: start,
                     end_line: end,
                     content_hash: file.hash.clone(),
-                    symbol: None,
                 })?;
                 file_results.push(json!({
                     "path": file.path,
@@ -1128,7 +1127,6 @@ impl CodeIndex {
                         start_line,
                         end_line,
                         content_hash: file.hash.clone(),
-                        symbol: Some(symbol.name.clone()),
                     })?;
                     let mut symbol_reasons = reasons.clone();
                     symbol_reasons.push("multi_symbol_match".to_owned());
@@ -1184,7 +1182,6 @@ impl CodeIndex {
                 start_line,
                 end_line,
                 content_hash: file.hash.clone(),
-                symbol: symbol.map(|symbol| symbol.name),
             })?;
             let group = context_group(&file.document_type, &reasons);
             *groups.entry(group.clone()).or_default() += 1;
@@ -1218,7 +1215,7 @@ impl CodeIndex {
         }))
     }
 
-    /// Chunk-granular BM25F ranking (`index.ranking: "v2"`).
+    /// Chunk-granular BM25F ranking used by the offline evaluation harness as `v2`.
     ///
     /// Ranks *files* by aggregate BM25F over the content/symbol/path fields (so a
     /// file whose relevant terms are spread across several symbols still ranks),
@@ -1362,7 +1359,6 @@ impl CodeIndex {
                         start_line,
                         end_line,
                         content_hash: hit.file.hash.clone(),
-                        symbol: Some(symbol.name.clone()),
                     })?;
                     let mut symbol_reasons = reasons.clone();
                     symbol_reasons.push("multi_symbol_match".to_owned());
@@ -1442,9 +1438,6 @@ impl CodeIndex {
                 start_line,
                 end_line,
                 content_hash: hit.file.hash.clone(),
-                symbol: exact_declaration
-                    .map(|symbol| symbol.name.clone())
-                    .or_else(|| chunk.symbol.clone()),
             })?;
             let group = context_group(&hit.file.document_type, &reasons);
             *groups.entry(group.clone()).or_default() += 1;
@@ -1581,7 +1574,6 @@ impl CodeIndex {
                     start_line,
                     end_line,
                     content_hash: file.hash.clone(),
-                    symbol: Some(symbol_name.to_owned()),
                 })?;
                 declarations.push_back(json!({
                     "path": path,
@@ -1665,7 +1657,6 @@ impl CodeIndex {
                     start_line: start,
                     end_line: end,
                     content_hash: file.hash.clone(),
-                    symbol: Some(symbol_name.to_owned()),
                 })?;
                 file_results.push_back(json!({
                     "path": file.path,
@@ -1766,7 +1757,6 @@ impl CodeIndex {
                     start_line: symbol.start_line,
                     end_line: symbol.end_line,
                     content_hash: file.hash.clone(),
-                    symbol: Some(symbol.name.clone()),
                 })
                 .unwrap_or_default();
                 results.push((
@@ -1855,7 +1845,7 @@ fn normalized_terms(values: &[String]) -> Vec<String> {
 
 /// Render a ranked result without changing its range/handle contract. `complete`
 /// intentionally omits a partial body when the declaration cannot fit; callers
-/// can follow the handle with `code_fetch`.
+/// can follow the handle with a `code_retrieve` read operation.
 fn exact_symbol_matches<'a>(file: &'a FileEntry, relevance: &[String]) -> Vec<&'a Symbol> {
     let mut matches = Vec::new();
     for term in relevance {

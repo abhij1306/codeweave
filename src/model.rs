@@ -147,15 +147,6 @@ fn default_explicit_only() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IndexSettings {
-    /// Retrieval ranking algorithm: `"v1"` (legacy additive file scorer) or
-    /// `"v2"` (chunk-granular BM25F). Unknown values fall back to `v1`.
-    #[serde(default = "default_ranking")]
-    pub ranking: String,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LanguageServerSettings {
@@ -182,25 +173,11 @@ pub struct IntelligenceSettings {
     pub typescript: LanguageServerSettings,
 }
 
-fn default_ranking() -> String {
-    "v1".to_owned()
-}
-
-impl Default for IndexSettings {
-    fn default() -> Self {
-        Self {
-            ranking: default_ranking(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
     pub workspace: WorkspaceSettings,
     #[serde(default)]
     pub skills: SkillsConfig,
-    #[serde(default)]
-    pub index: IndexSettings,
     #[serde(default)]
     pub intelligence: IntelligenceSettings,
     pub policy: PolicyConfig,

@@ -9,8 +9,11 @@
     "idleTimeoutMs": 5000,
     "toolProfile": "full",
     "allowedHosts": [
-      "*"
-    ],
+      "localhost",
+      "127.0.0.1",
+      "::1",
+      "codeweave.example.com"
+     ],
     "allowedOrigins": []
   },
   "workspace": {
@@ -31,9 +34,6 @@
     "enabled": false,
     "roots": [],
     "explicitOnly": true
-  },
-  "index": {
-    "ranking": "v1"
   },
   "intelligence": {
     "python": {
