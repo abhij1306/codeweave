@@ -1,5 +1,6 @@
 use crate::model::PolicyConfig;
 use serde::Serialize;
+#[cfg(windows)]
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
