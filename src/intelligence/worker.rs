@@ -6,7 +6,9 @@ use super::sync::{
     plan_sync, verify_current, DocumentSnapshot, DocumentState, SynchronizedDocument,
 };
 use crate::model::{AppError, AppResult, LanguageServerSettings};
-use crate::process_runtime::{terminate_process_tree, WindowsJob};
+use crate::process_runtime::terminate_process_tree;
+#[cfg(windows)]
+use crate::process_runtime::WindowsJob;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};

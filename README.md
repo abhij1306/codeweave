@@ -1,7 +1,25 @@
 # CodeWeave
 
+[![CI](https://github.com/abhij1306/codeweave/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/abhij1306/codeweave/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org/)
+[![Model Context Protocol](https://img.shields.io/badge/Model_Context_Protocol-MCP-7c3aed.svg)](https://modelcontextprotocol.io/)
+
 CodeWeave is a local-first MCP server for deterministic code retrieval, safe
 editing, Git operations, and Bash execution against one repository.
+
+`mcp` `rust` `local-first` `developer-tools` `code-search` `safe-editing`
+`chatgpt` `claude`
+
+## Highlights
+
+- Serves one fixed Git worktree with snapshot, hash, and range-handle guards.
+- Provides retrieval, semantic intelligence, previewed transactions, Bash, and
+  scoped Git operations through a fixed 25-tool MCP surface.
+- Keeps edits local and reports partial validation or transaction recovery
+  truthfully rather than silently rolling back changes.
+- Supports stdio for local clients and authenticated streamable HTTP for a
+  trusted tunnel or reverse proxy.
 
 ## Requirements
 
