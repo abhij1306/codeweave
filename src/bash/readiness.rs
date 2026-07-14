@@ -48,14 +48,6 @@ fn bash_readiness(
 
 pub(super) fn resolve_bash(policy: &PolicyConfig) -> BashReadiness {
     let configured = policy.bash.executable.trim();
-    if !policy.bash.enabled {
-        return bash_readiness(
-            configured,
-            "disabled",
-            None,
-            Some("Bash execution is disabled by policy".to_owned()),
-        );
-    }
     if configured.is_empty() {
         return bash_readiness(
             configured,

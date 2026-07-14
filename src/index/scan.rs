@@ -1,7 +1,5 @@
 use super::lines::{hex, line_starts};
-use super::metadata::{
-    build_indexed_terms, classify_document, classify_lifecycle, normalize_entry,
-};
+use super::metadata::{build_indexed_terms, classify_document, normalize_entry};
 use super::path_filter::normalize;
 use super::{
     content_hash, qualified_symbol_parts, symbol_matches_qualified_name, CodeIndex, FileEntry,
@@ -20,7 +18,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const INDEX_SCHEMA: &str = "codeweave-index-v9";
+const INDEX_SCHEMA: &str = "codeweave-index";
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceExclusions {
@@ -388,8 +386,7 @@ impl CodeIndex {
                 + file.search_content.capacity()
                 + file.hash.capacity()
                 + file.language.capacity()
-                + file.document_type.capacity()
-                + file.lifecycle.capacity();
+                + file.document_type.capacity();
             estimated_heap_bytes_lower_bound +=
                 file.line_starts.capacity() * std::mem::size_of::<usize>();
             estimated_heap_bytes_lower_bound +=
@@ -671,7 +668,6 @@ pub(super) fn read_entry(
     let path_lower = relative.to_ascii_lowercase();
     let language = language_name(path).to_owned();
     let document_type = classify_document(&relative);
-    let lifecycle = classify_lifecycle(&relative, &content);
     let hash = content_hash(&content);
     if let Some(cached) = cached_files.get(&relative) {
         if cached.hash == hash {
@@ -697,7 +693,6 @@ pub(super) fn read_entry(
         hash,
         language,
         document_type,
-        lifecycle,
         symbols,
         size: metadata.len(),
         modified_ns,

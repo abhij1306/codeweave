@@ -1,5 +1,5 @@
 use super::util::line_ending_label;
-use super::WorkspaceActor;
+use super::Workspace;
 use crate::index::{decode_handle, encode_handle, slice_lines, FileEntry, RangeHandle};
 use crate::model::{bool_value, required_str, usize_value, AppError, AppResult};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -37,18 +37,14 @@ struct FetchPrecondition<'a> {
     stale_message: &'static str,
 }
 
-impl WorkspaceActor {
+impl Workspace {
     #[cfg(test)]
     pub(super) fn read_targets(&self, params: &Value) -> AppResult<Value> {
-        self.read_targets_for_session("default", params)
+        self.read_targets_batch(params)
     }
 
     #[cfg(test)]
-    pub(super) fn read_targets_for_session(
-        &self,
-        session_id: &str,
-        params: &Value,
-    ) -> AppResult<Value> {
+    pub(super) fn read_targets_batch(&self, params: &Value) -> AppResult<Value> {
         let started = std::time::Instant::now();
         let reconcile_pending = self.read_reconcile_pending();
         if let Some(expected) = params.get("snapshot_id").and_then(Value::as_str) {
@@ -84,7 +80,7 @@ impl WorkspaceActor {
             if remaining == 0 {
                 break;
             }
-            match self.read_target(session_id, item, remaining) {
+            match self.read_target(item, remaining) {
                 Ok(result) => {
                     remaining = remaining.saturating_sub(result_text_len(&result));
                     results.push(result);
@@ -147,12 +143,7 @@ impl WorkspaceActor {
         Ok(result)
     }
 
-    pub(super) fn read_target(
-        &self,
-        session_id: &str,
-        item: &Value,
-        remaining: usize,
-    ) -> AppResult<Value> {
+    pub(super) fn read_target(&self, item: &Value, remaining: usize) -> AppResult<Value> {
         let kind = required_str(item, "kind")?;
         let value = required_str(item, "value")?;
         match kind {
@@ -202,12 +193,11 @@ impl WorkspaceActor {
             "metadata" => self.fetch_metadata(value),
             "bash_status" => {
                 let run_id = value.strip_prefix("bash:").unwrap_or(value);
-                self.bash
-                    .status_with_limit_for_session(session_id, run_id, remaining)
+                self.bash.status_with_limit(run_id, remaining)
             }
             "bash_log" => {
                 let run_id = value.strip_prefix("bash-log:").unwrap_or(value);
-                let content = self.bash.read_log_for_session(session_id, run_id)?;
+                let content = self.bash.read_output(run_id)?;
                 Ok(bounded_content(
                     json!({"kind": "bash_log", "run_id": run_id}),
                     &content,
@@ -278,7 +268,6 @@ impl WorkspaceActor {
                 .take(20)
                 .map(|(path, symbol, hash)| {
                     let handle = encode_handle(&RangeHandle {
-                        version: 1,
                         workspace_id: self.id.clone(),
                         path: path.clone(),
                         start_line: symbol.start_line,
@@ -424,7 +413,6 @@ impl WorkspaceActor {
             }
         };
         let handle = encode_handle(&RangeHandle {
-            version: 1,
             workspace_id: self.id.clone(),
             path: file.path.clone(),
             start_line,
@@ -566,14 +554,14 @@ fn nearest_char_boundary(content: &str, mut index: usize) -> usize {
 
 fn encode_fetch_continuation(value: &FetchContinuation) -> AppResult<String> {
     Ok(format!(
-        "fetch:v1:{}",
+        "fetch:{}",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?)
     ))
 }
 
 fn decode_fetch_continuation(value: &str) -> AppResult<FetchContinuation> {
     let payload = value
-        .strip_prefix("fetch:v1:")
+        .strip_prefix("fetch:")
         .ok_or_else(|| AppError::new("INVALID_CONTINUATION", "Unsupported continuation"))?;
     let bytes = URL_SAFE_NO_PAD
         .decode(payload)

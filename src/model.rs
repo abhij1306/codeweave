@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
     pub id: String,
     pub name: String,
@@ -12,7 +13,7 @@ pub struct WorkspaceConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PolicyConfig {
     pub max_file_bytes: usize,
     pub max_context_chars: usize,
@@ -21,10 +22,8 @@ pub struct PolicyConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BashConfig {
-    #[serde(default)]
-    pub enabled: bool,
     #[serde(default = "default_bash_executable")]
     pub executable: String,
     #[serde(default = "default_bash_timeout_ms")]
@@ -40,37 +39,6 @@ pub struct BashConfig {
     pub max_timeout_ms: u64,
     #[serde(default = "default_bash_max_output_chars")]
     pub max_output_chars: usize,
-    #[serde(default = "default_bash_retention_hours")]
-    pub retention_hours: i64,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum OutputFilter {
-    #[default]
-    Raw,
-    FailedTail {
-        #[serde(default = "default_failed_tail_chars")]
-        chars: usize,
-    },
-    TailLines {
-        lines: usize,
-    },
-    CargoJson {
-        #[serde(default)]
-        include_warnings: bool,
-    },
-    JsonSummary {
-        marker: String,
-    },
-}
-
-fn default_failed_tail_chars() -> usize {
-    default_bash_max_output_chars()
 }
 
 fn default_bash_executable() -> String {
@@ -93,12 +61,8 @@ fn default_bash_max_output_chars() -> usize {
     30_000
 }
 
-fn default_bash_retention_hours() -> i64 {
-    1
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceSettings {
     /// The single repository this server serves for its entire lifetime.
     /// Canonicalized once at startup; there is no runtime switching.
@@ -110,22 +74,7 @@ pub struct WorkspaceSettings {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillsConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub roots: Vec<String>,
-    #[serde(default = "default_explicit_only")]
-    pub explicit_only: bool,
-}
-
-fn default_explicit_only() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LanguageServerSettings {
     #[serde(default)]
     pub enabled: bool,
@@ -142,7 +91,7 @@ fn default_lsp_timeout_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IntelligenceSettings {
     #[serde(default)]
     pub rust: LanguageServerSettings,
@@ -153,14 +102,27 @@ pub struct IntelligenceSettings {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DaemonConfig {
+    pub config_version: u32,
     pub workspace: WorkspaceSettings,
-    #[serde(default)]
-    pub skills: SkillsConfig,
     #[serde(default)]
     pub intelligence: IntelligenceSettings,
     pub policy: PolicyConfig,
     pub cache_root: String,
+}
+
+pub fn parse_daemon_config(value: &Value) -> AppResult<DaemonConfig> {
+    let encoded = serde_json::to_vec(value).map_err(AppError::internal)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&encoded);
+    serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
+        let path = error.path().to_string();
+        AppError::details(
+            "INVALID_CONFIG",
+            format!("invalid configuration at {path}: {}", error.inner()),
+            serde_json::json!({"path": path, "error": error.inner().to_string()}),
+        )
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -260,19 +222,15 @@ mod tests {
             "maxFileBytes": 1000000,
             "maxContextChars": 50000,
             "maxSearchResults": 100,
-            "bash": {
-                "enabled": true
-            }
+            "bash": {}
         }))
         .unwrap();
 
-        assert!(policy.bash.enabled);
         assert_eq!(policy.bash.executable, "bash");
         assert_eq!(policy.bash.default_timeout_ms, 120_000);
         assert_eq!(policy.bash.foreground_budget_ms, 20_000);
         assert_eq!(policy.bash.max_timeout_ms, 300_000);
         assert_eq!(policy.bash.max_output_chars, 30_000);
-        assert_eq!(policy.bash.retention_hours, 1);
     }
 
     #[test]

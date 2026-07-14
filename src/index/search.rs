@@ -236,7 +236,6 @@ impl CodeIndex {
             let mut file_results = Vec::new();
             for (line, start, end) in windows.into_iter().take(per_file_limit) {
                 let handle = encode_handle(&RangeHandle {
-                    version: 1,
                     workspace_id: workspace_id.to_owned(),
                     path: file.path.clone(),
                     start_line: start,
@@ -314,7 +313,6 @@ impl CodeIndex {
                     continue;
                 }
                 let handle = encode_handle(&RangeHandle {
-                    version: 1,
                     workspace_id: workspace_id.to_owned(),
                     path: file.path.clone(),
                     start_line: symbol.start_line,

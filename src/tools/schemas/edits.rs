@@ -147,7 +147,7 @@ pub fn code_transaction() -> Value {
 }
 
 /// A deliberately flat superset schema. Per-kind required fields are published
-/// by `code_capabilities`; conditional JSON Schema would make hosted clients
+/// by runtime validation; conditional JSON Schema would make hosted clients
 /// less reliable and is rejected by the registry's flat-schema checks.
 fn change_schema() -> Value {
     json!({
@@ -176,7 +176,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn edit_schemas_advertise_post_apply_validation_without_rollback_field() {
+    fn edit_schemas_advertise_post_apply_validation() {
         for schema in [
             code_write(),
             code_replace(),
@@ -187,7 +187,6 @@ mod tests {
             code_transaction(),
         ] {
             let properties = schema["properties"].as_object().expect("properties");
-            assert!(!properties.contains_key("rollback_on_failure"));
             let description = properties["validate"]["description"]
                 .as_str()
                 .expect("validation description");

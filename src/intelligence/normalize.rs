@@ -1,8 +1,6 @@
 use super::protocol::PositionEncoding;
 use crate::model::{AppError, AppResult};
-use codeweave_rust::reference_service::{
-    ReferencePosition, ReferenceRange, SemanticReferenceLocation,
-};
+use crate::reference_service::{ReferencePosition, ReferenceRange, SemanticReferenceLocation};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;

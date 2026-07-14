@@ -18,4 +18,4 @@ Describe any impact on authentication, workspace boundaries, file edits, command
 
 - [ ] The change is focused and includes relevant tests.
 - [ ] No credentials, personal information, private URLs, or machine-specific paths are included.
-- [ ] Backward compatibility and migration requirements are documented.
+- [ ] Public contract changes are documented.

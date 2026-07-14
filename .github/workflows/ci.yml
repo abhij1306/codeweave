@@ -33,13 +33,30 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --release
+        run: cargo test --workspace --all-targets --release
+
+      - name: Check Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --workspace --all-targets --release
+
+  security:
+    name: RustSec advisory check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2
+      - run: cargo audit

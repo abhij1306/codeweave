@@ -8,38 +8,26 @@ use axum::{
     routing::get,
     Router,
 };
-use futures_util::{stream, Stream, StreamExt};
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, Extensions, GetExtensions,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
-        ServerJsonRpcMessage,
+        CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
     transport::{
         stdio,
         streamable_http_server::{
-            session::{
-                local::{LocalSessionManager, LocalSessionManagerError},
-                RestoreOutcome, ServerSseMessage, SessionId, SessionManager,
-            },
-            StreamableHttpServerConfig, StreamableHttpService,
+            session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
         },
     },
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
 use serde_json::Value;
 
-use crate::manager::SessionKey;
 use crate::tools::ToolAccess;
-use crate::{
-    health, is_loopback, live, prepare, tool_failure, tool_result, AppState, Cli, SERVER_NAME,
-};
+use crate::{health, is_loopback, live, tool_failure, tool_result, AppState, Cli, SERVER_NAME};
 
-const INSTRUCTIONS: &str = "Use code_retrieve for all repository discovery and exact reads. Select explicit operations and selector fields rather than sending a natural-language task description. Use code_intelligence only for semantic definitions, references, diagnostics, or rename previews. Use code_capabilities to inspect contracts, code_preview/code_transaction for multi-file edits, and code_write/code_replace/code_replace_range/code_insert/code_delete/code_rename for narrow changes. Run commands with bash; inspect or stop retained runs with bash_status, bash_output, and bash_cancel. Bash executes as the CodeWeave OS user and is not sandboxed. Use the narrowly scoped git tools for repository operations. CodeWeave serves one repository fixed in config.json; use workspace for its summary, changes, diagnostics, or skills.";
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CodeWeaveSessionId(String);
+const INSTRUCTIONS: &str = "Use code_retrieve for repository discovery and exact reads, code_intelligence for semantic operations, the narrow edit tools for one-file changes, and code_preview/code_transaction for coordinated changes. Run commands with bash and use the narrowly scoped Git tools for repository operations. CodeWeave serves one shared repository fixed in config.json.";
 #[derive(Clone)]
 pub(crate) struct CodeWeaveMcp {
     state: AppState,
@@ -75,7 +63,7 @@ impl ServerHandler for CodeWeaveMcp {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let name = request.name.as_ref();
         let args = request
@@ -83,40 +71,14 @@ impl ServerHandler for CodeWeaveMcp {
             .map(Value::Object)
             .unwrap_or_else(|| serde_json::json!({}));
 
-        // The registry is the single source of truth for callable names. An
-        // unknown name is a hard MCP error; a real tool that the active profile
-        // does not expose is a structured TOOL_NOT_IN_PROFILE failure so the
-        // caller can tell "no such tool" from "not in this profile".
         if !ToolAccess::is_known_tool(name) {
             return Err(McpError::invalid_params(
                 format!("Unknown tool: {name}"),
                 None,
             ));
         }
-        if !self.state.tool_access.is_allowed(name) {
-            let value = tool_failure(crate::model::AppError::details(
-                "TOOL_NOT_IN_PROFILE",
-                format!(
-                    "Tool '{name}' is not available under the active tool profile '{}'",
-                    self.state.server.tool_profile
-                ),
-                serde_json::json!({"tool": name, "profile": self.state.server.tool_profile}),
-            ));
-            return serde_json::from_value(value)
-                .map_err(|error| McpError::internal_error(error.to_string(), None));
-        }
-
-        let session = session_key(&context);
-        let result = match prepare(
-            &self.state.manager,
-            &self.state.config,
-            &self.state.tool_access,
-            name,
-            args,
-        )
-        .await
-        {
-            Ok(prepared) => self.state.manager.dispatch(session, name, &prepared).await,
+        let result = match crate::manager::prepare_tool_request(name, args) {
+            Ok(prepared) => self.state.manager.dispatch(name, &prepared).await,
             Err(error) => Err(error),
         };
         let value = match result {
@@ -125,145 +87,6 @@ impl ServerHandler for CodeWeaveMcp {
         };
         serde_json::from_value(value)
             .map_err(|error| McpError::internal_error(error.to_string(), None))
-    }
-}
-
-fn session_key(context: &RequestContext<RoleServer>) -> SessionKey {
-    session_key_from_extensions(&context.extensions).unwrap_or_else(SessionKey::stateless)
-}
-
-fn session_key_from_extensions(extensions: &Extensions) -> Option<SessionKey> {
-    if let Some(session) = extensions.get::<CodeWeaveSessionId>() {
-        return Some(SessionKey::new(format!("http:{}", session.0)));
-    }
-
-    extensions
-        .get::<axum::http::request::Parts>()
-        .map(|parts| session_key_from_headers(&parts.headers))
-        .filter(|session| !session.is_stateless())
-}
-
-fn session_key_from_headers(headers: &axum::http::HeaderMap) -> SessionKey {
-    headers
-        .get("mcp-session-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .map(|value| SessionKey::new(format!("http:{value}")))
-        .unwrap_or_else(SessionKey::stateless)
-}
-
-struct CompatibleSessionManager {
-    inner: LocalSessionManager,
-    manager: Arc<crate::manager::WorkspaceManager>,
-}
-
-impl Default for CompatibleSessionManager {
-    fn default() -> Self {
-        Self::new(Arc::new(crate::manager::WorkspaceManager::default()))
-    }
-}
-
-impl CompatibleSessionManager {
-    fn new(manager: Arc<crate::manager::WorkspaceManager>) -> Self {
-        let mut inner = LocalSessionManager::default();
-        inner.session_config.sse_retry = None;
-        Self { inner, manager }
-    }
-}
-
-fn compatibility_ready_event() -> ServerSseMessage {
-    let message: ServerJsonRpcMessage = serde_json::from_value(serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/codeweave/ready",
-        "params": {
-            "transport": "streamable-http",
-            "stateful": true
-        }
-    }))
-    .expect("static compatibility notification must be valid JSON-RPC");
-    ServerSseMessage::from_message(message)
-}
-
-fn attach_codeweave_session_id(message: &mut ClientJsonRpcMessage, id: &SessionId) {
-    let session = CodeWeaveSessionId(id.to_string());
-    match message {
-        ClientJsonRpcMessage::Request(request) => {
-            request.request.extensions_mut().insert(session);
-        }
-        ClientJsonRpcMessage::Notification(notification) => {
-            notification.notification.extensions_mut().insert(session);
-        }
-        _ => {}
-    }
-}
-
-impl SessionManager for CompatibleSessionManager {
-    type Error = LocalSessionManagerError;
-    type Transport = <LocalSessionManager as SessionManager>::Transport;
-
-    async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
-        self.inner.create_session().await
-    }
-
-    async fn initialize_session(
-        &self,
-        id: &SessionId,
-        mut message: ClientJsonRpcMessage,
-    ) -> Result<ServerJsonRpcMessage, Self::Error> {
-        attach_codeweave_session_id(&mut message, id);
-        self.inner.initialize_session(id, message).await
-    }
-
-    async fn has_session(&self, id: &SessionId) -> Result<bool, Self::Error> {
-        self.inner.has_session(id).await
-    }
-
-    async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
-        let result = self.inner.close_session(id).await;
-        self.manager
-            .close_session(&SessionKey::new(format!("http:{id}")));
-        result
-    }
-
-    async fn create_stream(
-        &self,
-        id: &SessionId,
-        mut message: ClientJsonRpcMessage,
-    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        attach_codeweave_session_id(&mut message, id);
-        self.inner.create_stream(id, message).await
-    }
-
-    async fn accept_message(
-        &self,
-        id: &SessionId,
-        mut message: ClientJsonRpcMessage,
-    ) -> Result<(), Self::Error> {
-        attach_codeweave_session_id(&mut message, id);
-        self.inner.accept_message(id, message).await
-    }
-
-    async fn create_standalone_stream(
-        &self,
-        id: &SessionId,
-    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        let stream = self.inner.create_standalone_stream(id).await?;
-        Ok(stream::iter([compatibility_ready_event()]).chain(stream))
-    }
-
-    async fn resume(
-        &self,
-        id: &SessionId,
-        last_event_id: String,
-    ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        self.inner.resume(id, last_event_id).await
-    }
-
-    async fn restore_session(
-        &self,
-        id: SessionId,
-    ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
-        self.inner.restore_session(id).await
     }
 }
 
@@ -293,19 +116,19 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
     let allowed_hosts = configured_allowed_hosts(&state.server);
 
     let mut config = StreamableHttpServerConfig::default();
-    config.stateful_mode = state.server.stateful_mode;
-    config.json_response = state.server.json_response;
+    config.stateful_mode = false;
+    config.json_response = true;
     config.sse_retry = None;
     config.allowed_hosts = allowed_hosts;
     config.allowed_origins = state.server.allowed_origins.clone();
 
-    let service: StreamableHttpService<CodeWeaveMcp, CompatibleSessionManager> =
+    let service: StreamableHttpService<CodeWeaveMcp, LocalSessionManager> =
         StreamableHttpService::new(
             {
                 let state = state.clone();
                 move || Ok::<_, std::io::Error>(CodeWeaveMcp::new(state.clone()))
             },
-            Arc::new(CompatibleSessionManager::new(state.manager.clone())),
+            Arc::new(LocalSessionManager::default()),
             config,
         );
 
@@ -334,8 +157,7 @@ fn is_accept_resource_exhaustion(error: &std::io::Error) -> bool {
 /// Serves the app on a manual hyper accept loop so we can bound idle keep-alive
 /// connection lifetime — something `axum::serve` does not expose.
 ///
-/// Why this matters: `jsonResponse`/`statefulMode` only control how fast a
-/// *request body* returns. They do not close the underlying TCP connection.
+/// JSON responses do not close the underlying TCP connection.
 /// Hyper keeps an idle keep-alive socket open indefinitely, so a tunnel/proxy
 /// (ngrok, the OpenAI connector) holds it until its own ~90s deadline and
 /// reports that as the connection's p50/p90 lifetime — even though every
@@ -478,95 +300,6 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_event_contains_json_rpc_message() {
-        assert!(compatibility_ready_event().message.is_some());
-    }
-
-    #[test]
-    fn compatibility_manager_disables_empty_priming() {
-        let manager = CompatibleSessionManager::default();
-        assert!(manager.inner.session_config.sse_retry.is_none());
-    }
-
-    #[test]
-    fn session_key_uses_http_session_header_when_available() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("mcp-session-id", "abc123".parse().unwrap());
-
-        let session = session_key_from_headers(&headers);
-
-        assert_eq!(session.as_str(), "http:abc123");
-        assert!(!session.is_stateless());
-    }
-
-    #[test]
-    fn session_key_prefers_internal_session_marker_over_headers() {
-        let request = axum::http::Request::builder()
-            .header("mcp-session-id", "stale-header")
-            .body(())
-            .unwrap();
-        let (parts, _) = request.into_parts();
-        let mut extensions = Extensions::new();
-        extensions.insert(parts);
-        extensions.insert(CodeWeaveSessionId("actual-session".to_owned()));
-
-        let session = session_key_from_extensions(&extensions).unwrap();
-
-        assert_eq!(session.as_str(), "http:actual-session");
-        assert!(!session.is_stateless());
-    }
-
-    #[test]
-    fn attach_session_id_tags_tool_request_without_http_headers() {
-        let mut message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "code_capabilities",
-                "arguments": {}
-            }
-        }))
-        .unwrap();
-        let session_id: SessionId = "session-42".into();
-
-        attach_codeweave_session_id(&mut message, &session_id);
-
-        let ClientJsonRpcMessage::Request(request) = message else {
-            panic!("expected request");
-        };
-        assert_eq!(
-            request
-                .request
-                .extensions()
-                .get::<CodeWeaveSessionId>()
-                .unwrap(),
-            &CodeWeaveSessionId("session-42".to_owned())
-        );
-    }
-
-    #[test]
-    fn session_key_falls_back_to_stateless_without_header() {
-        let headers = axum::http::HeaderMap::new();
-
-        let session = session_key_from_headers(&headers);
-
-        assert_eq!(session.as_str(), "stateless");
-        assert!(session.is_stateless());
-    }
-
-    #[test]
-    fn session_key_falls_back_to_stateless_for_empty_header() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("mcp-session-id", "".parse().unwrap());
-
-        let session = session_key_from_headers(&headers);
-
-        assert_eq!(session.as_str(), "stateless");
-        assert!(session.is_stateless());
-    }
-
-    #[test]
     fn wildcard_allowed_host_disables_rmcp_host_guard_for_trusted_tunnels() {
         let server = crate::ServerConfig {
             host: "127.0.0.1".to_owned(),
@@ -575,11 +308,7 @@ mod tests {
             token_file: ".mcp-token".to_owned(),
             allowed_hosts: vec!["*".to_owned()],
             allowed_origins: Vec::new(),
-            stateful_mode: true,
-            json_response: false,
             idle_timeout_ms: 5000,
-            tool_profile: "full".to_owned(),
-            tools: Default::default(),
         };
 
         assert!(configured_allowed_hosts(&server).is_empty());
@@ -594,11 +323,7 @@ mod tests {
             token_file: ".mcp-token".to_owned(),
             allowed_hosts: vec!["example.ngrok-free.dev".to_owned()],
             allowed_origins: Vec::new(),
-            stateful_mode: true,
-            json_response: false,
             idle_timeout_ms: 5000,
-            tool_profile: "full".to_owned(),
-            tools: Default::default(),
         };
 
         let hosts = configured_allowed_hosts(&server);
@@ -616,11 +341,7 @@ mod tests {
             token_file: ".mcp-token".to_owned(),
             allowed_hosts: Vec::new(),
             allowed_origins: Vec::new(),
-            stateful_mode: true,
-            json_response: false,
             idle_timeout_ms: 5000,
-            tool_profile: "full".to_owned(),
-            tools: Default::default(),
         };
 
         let hosts = configured_allowed_hosts(&server);

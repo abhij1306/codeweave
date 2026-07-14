@@ -1,4 +1,4 @@
-use super::{add_phase_metrics, WorkspaceActor};
+use super::{add_phase_metrics, Workspace};
 use crate::index::content_hash;
 use crate::model::{bool_value, required_str, string_list, usize_value, AppError, AppResult};
 use crate::security::validate_relative;
@@ -42,7 +42,6 @@ impl GitDiffScope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GitDiffContinuation {
-    version: u8,
     snapshot_id: String,
     offset: usize,
     scope: GitDiffScope,
@@ -63,21 +62,18 @@ fn git_diff_scope_supplied(params: &Value) -> bool {
 
 fn encode_git_diff_continuation(value: &GitDiffContinuation) -> AppResult<String> {
     let json = serde_json::to_vec(value)?;
-    Ok(format!("git-diff:v1:{}", URL_SAFE_NO_PAD.encode(json)))
+    Ok(format!("git-diff:{}", URL_SAFE_NO_PAD.encode(json)))
 }
 
 fn decode_git_diff_continuation(value: &str) -> AppResult<GitDiffContinuation> {
     let payload = value
-        .strip_prefix("git-diff:v1:")
+        .strip_prefix("git-diff:")
         .ok_or_else(|| AppError::invalid("Invalid git diff continuation"))?;
     let bytes = URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| AppError::invalid("Invalid git diff continuation"))?;
     let continuation: GitDiffContinuation = serde_json::from_slice(&bytes)
         .map_err(|_| AppError::invalid("Invalid git diff continuation"))?;
-    if continuation.version != 1 {
-        return Err(AppError::invalid("Unsupported git diff continuation"));
-    }
     Ok(continuation)
 }
 
@@ -215,7 +211,7 @@ pub(super) fn validated_push_target(
     Ok((remote.to_owned(), branch.to_owned()))
 }
 
-impl WorkspaceActor {
+impl Workspace {
     pub fn git(&self, params: &Value) -> AppResult<Value> {
         let started = Instant::now();
         let reconcile_started = Instant::now();
@@ -325,7 +321,6 @@ impl WorkspaceActor {
             let continuation = next
                 .map(|index| {
                     encode_git_diff_continuation(&GitDiffContinuation {
-                        version: 1,
                         snapshot_id: snapshot.clone(),
                         offset: index,
                         scope: scope.clone(),
@@ -414,7 +409,7 @@ impl WorkspaceActor {
                     ));
                 }
                 let output = self.repository.restore(&self.root, &paths, staged)?;
-                let _ = self.refresh(true, "git", false)?;
+                let _ = self.refresh(true)?;
                 output
             }
             "push" => {

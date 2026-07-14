@@ -1,6 +1,6 @@
 //! Input schemas for the bash* tools. Closed schemas
 //! (`additionalProperties: false`) so a spoofed `action`/`run_id` is rejected at
-//! the schema boundary as well as in the compatibility layer.
+//! the schema boundary as well as in typed request validation.
 
 use serde_json::{json, Value};
 

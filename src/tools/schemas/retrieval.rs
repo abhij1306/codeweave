@@ -1,4 +1,4 @@
-//! Input schemas for the single public retrieval tool and capability discovery.
+//! Input schema for the public retrieval tool.
 
 use crate::contracts::retrieval_operation_names;
 use serde_json::{json, Value};
@@ -46,15 +46,6 @@ pub fn code_retrieve() -> Value {
             "snapshot_id": {"type": "string", "description": "Optional workspace snapshot precondition for the complete retrieval batch."}
         },
         "required": ["operations"],
-        "additionalProperties": false,
-        "$schema": "http://json-schema.org/draft-07/schema#"
-    })
-}
-
-pub fn code_capabilities() -> Value {
-    json!({
-        "type": "object",
-        "properties": {},
         "additionalProperties": false,
         "$schema": "http://json-schema.org/draft-07/schema#"
     })

@@ -20,7 +20,7 @@ use crate::symbols::{extract_symbols, language_name};
 #[cfg(test)]
 use lines::line_starts;
 #[cfg(test)]
-use metadata::{build_indexed_terms, classify_document, classify_lifecycle};
+use metadata::{build_indexed_terms, classify_document};
 #[cfg(test)]
 use scan::{read_entry, CachedIndex};
 #[cfg(test)]
@@ -42,8 +42,6 @@ pub struct FileEntry {
     pub hash: String,
     pub language: String,
     pub document_type: String,
-    #[serde(default = "default_lifecycle")]
-    pub lifecycle: String,
     pub symbols: Vec<Symbol>,
     #[serde(default)]
     pub size: u64,
@@ -65,10 +63,6 @@ pub struct IndexMetrics {
     pub token_posting_count: usize,
     pub symbol_name_count: usize,
     pub symbol_declaration_count: usize,
-}
-
-fn default_lifecycle() -> String {
-    "current".to_owned()
 }
 
 #[derive(Debug, Default)]

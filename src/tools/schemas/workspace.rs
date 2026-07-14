@@ -8,8 +8,7 @@ pub fn workspace() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "action": {"default": "summary", "type": "string", "enum": ["summary", "refresh", "changes", "diagnostics", "skills", "skill"]},
-            "skill_name": {"type": "string", "pattern": "^[A-Za-z0-9_-]+$", "description": "Skill directory name. Use only after an explicit user request to use that skill."},
+            "action": {"default": "summary", "type": "string", "enum": ["summary", "refresh", "changes", "diagnostics"]},
             "force": {"type": "boolean"},
             "since_generation": {"type": "integer", "minimum": 0, "description": "For action=changes, return only mutations with a generation greater than this value."},
             "source": {"type": "string", "description": "For action=changes, return only mutations from this source."},

@@ -4,7 +4,7 @@
 
 - Git
 - Rust 1.80 or newer, installed with `rustup`
-- A compatible MCP client
+- An MCP client
 - Optional: an HTTPS tunnel or reverse proxy for remote HTTP clients
 
 ## Install Rust
@@ -112,7 +112,8 @@ Do not commit `config.json` or `.mcp-token`.
 
 The token is an internal HTTP origin credential for the CodeWeave server. It is not an LLM API key and should not be entered into ChatGPT, Claude, or another AI client.
 
-`server.toolProfile` selects which tools the server advertises: `full` (default, all tools), `coding` (the evaluated 18-tool coding surface with Bash validation), `read-only` (seven inspection tools), `edit` (inspection plus file writes but no Bash), or `custom` (refine the full set with `server.tools.include`/`exclude`). Capability/admin tools and uncommon, staging, commit, restore, and push Git tools remain `full`-only. The profile is resolved once at startup; an unknown profile or custom tool name fails startup with an actionable error. See the configuration reference in the README and `docs/tools.md`.
+CodeWeave always advertises the fixed 25-tool surface. See the configuration
+reference in the README and `docs/tools.md`.
 
 ## Run
 
@@ -122,19 +123,11 @@ HTTP:
 cargo run --release -- --transport http --config config.json
 ```
 
-Explicit `serve` is equivalent:
-
-```bash
-cargo run --release -- serve --transport http --config config.json
-```
-
 Stdio:
 
 ```bash
 cargo run --release -- --transport stdio --config config.json
 ```
-
-Both bare invocations remain supported for compatibility.
 
 ## Update
 
@@ -144,4 +137,4 @@ cargo test --release
 cargo build --release
 ```
 
-Review configuration and release notes before replacing a running instance.
+Run `doctor` before replacing a running instance.

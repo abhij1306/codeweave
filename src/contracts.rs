@@ -499,81 +499,6 @@ pub fn normalize_bash_request(method: &str, input: &Value) -> AppResult<Value> {
     Ok(Value::Object(normalized))
 }
 
-pub fn public_contract_capabilities() -> Value {
-    json!({
-        "contract_version": 2,
-        "retrieval": {
-            "tool": "code_retrieve",
-            "max_operations": MAX_RETRIEVAL_OPERATIONS,
-            "operations": retrieval_operation_names(),
-            "contracts": contract_table_json(RETRIEVAL_CONTRACTS),
-            "read_targets": READ_TARGETS,
-            "text_syntax": ["literal", "regex"],
-            "reference_scopes": ["all", "production", "tests"],
-            "reference_kinds": ["declaration", "call", "import", "type", "read", "write", "other"],
-            "supports_qualified_symbols": true,
-            "ambiguous_symbols_return_candidates": true,
-            "supports_snapshot_precondition": true,
-            "malformed_operations_return_item_errors": true
-        },
-        "editing": {
-            "supports_preview": true,
-            "supports_transaction": true,
-            "supports_single_file_wrappers": true,
-            "supports_handle_range_replace": true,
-            "handle_edits_must_be_only_change_for_file": true,
-            "full_line_replacements_preserve_terminal_line_ending": true,
-            "atomic_file_replace": true,
-            "atomic_multi_file_commit": false,
-            "compensating_restore": "best_effort",
-            "manual_recovery_possible": true,
-            "validation_failures_preserve_edits": true,
-            "validation_may_run_detached": true,
-            "validation_statuses": ["passed", "failed", "pending", "unavailable"]
-        },
-        "change_contracts": contract_table_json(CHANGE_CONTRACTS),
-        "bash_contracts": contract_table_json(BASH_CONTRACTS),
-        "error_registry": error_registry_json(),
-        "known_limitations": [
-            "reference operations share one indexed fallback service; code_intelligence uses semantic locations when an LSP backend succeeds",
-            "include_imports returns lexical import prelude only, not inferred dependency usage",
-            "hosted connector lazy-loading behavior is outside the server-side MCP list_tools contract"
-        ]
-    })
-}
-
-fn contract_table_json(contracts: &[ContractSpec]) -> Value {
-    let mut table = Map::new();
-    for contract in contracts {
-        table.insert(
-            contract.name.to_owned(),
-            json!({
-                "required": contract.required,
-                "optional": contract.optional,
-                "allowed": contract.allowed_fields().collect::<Vec<_>>()
-            }),
-        );
-    }
-    Value::Object(table)
-}
-
-fn error_registry_json() -> Value {
-    Value::Array(
-        ErrorCode::ALL
-            .iter()
-            .map(|code| {
-                let policy = code.policy();
-                json!({
-                    "code": policy.code,
-                    "retryable": policy.retryable,
-                    "retry_kind": policy.retry_kind,
-                    "category": policy.category
-                })
-            })
-            .collect(),
-    )
-}
-
 fn validate_fields(
     contract: ContractSpec,
     object: &Map<String, Value>,
@@ -726,8 +651,8 @@ mod tests {
 
         let irrelevant = json!({
             "operation": "find_symbol",
-            "symbol": "WorkspaceActor",
-            "pattern": "WorkspaceActor"
+            "symbol": "Workspace",
+            "pattern": "Workspace"
         });
         let error = validate_retrieval_operation(
             "find_symbol",
@@ -754,21 +679,5 @@ mod tests {
         });
         let error = validate_change(&unknown).unwrap_err();
         assert_eq!(error.0.code, "UNKNOWN_CHANGE_FIELD");
-    }
-
-    #[test]
-    fn generated_capability_tables_match_contracts() {
-        let capabilities = public_contract_capabilities();
-        assert_eq!(
-            capabilities["retrieval"]["operations"],
-            json!(retrieval_operation_names())
-        );
-        assert_eq!(
-            capabilities["change_contracts"]["replace"]["required"],
-            json!(["kind", "path", "old_text", "new_text"])
-        );
-        assert!(capabilities["editing"]
-            .get("supports_rollback_on_failure")
-            .is_none());
     }
 }

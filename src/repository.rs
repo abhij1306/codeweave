@@ -60,11 +60,44 @@ pub trait RepositoryBackend: Send + Sync {
 pub struct CliGitBackend;
 
 impl CliGitBackend {
+    pub fn require_worktree(root: &Path) -> AppResult<()> {
+        Self::require_worktree_with(root, "git")
+    }
+
+    fn require_worktree_with(root: &Path, executable: &str) -> AppResult<()> {
+        let args = vec!["rev-parse".to_owned(), "--is-inside-work-tree".to_owned()];
+        let output = Self
+            .run_raw_with_timeout(root, &args, GIT_DEFAULT_TIMEOUT, executable)
+            .map_err(|error| {
+                if error.0.code == "GIT_UNAVAILABLE" {
+                    AppError::details(
+                        "GIT_UNAVAILABLE",
+                        error.0.message,
+                        json!({"command": "git rev-parse --is-inside-work-tree"}),
+                    )
+                } else {
+                    error
+                }
+            })?;
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true" {
+            Ok(())
+        } else {
+            Err(AppError::details(
+                "NOT_GIT_REPOSITORY",
+                "workspace.path must be a Git worktree",
+                json!({
+                    "path": root,
+                    "stderr": String::from_utf8_lossy(&output.stderr).trim()
+                }),
+            ))
+        }
+    }
+
     /// Build a git command with stdio piped, credential prompts disabled, and
     /// interactive askpass suppressed so a missing/expired credential fails fast
     /// instead of blocking on a hidden prompt until the timeout fires.
-    fn command(root: &Path, args: &[String]) -> Command {
-        let mut command = Command::new("git");
+    fn command(root: &Path, args: &[String], executable: &str) -> Command {
+        let mut command = Command::new(executable);
         command
             .current_dir(root)
             .arg("--no-pager")
@@ -90,15 +123,18 @@ impl CliGitBackend {
         root: &Path,
         args: &[String],
         timeout: Duration,
+        executable: &str,
     ) -> AppResult<Output> {
-        let child = Self::command(root, args).spawn().map_err(|error| {
-            AppError::details("GIT_UNAVAILABLE", error.to_string(), json!({"args": args}))
-        })?;
+        let child = Self::command(root, args, executable)
+            .spawn()
+            .map_err(|error| {
+                AppError::details("GIT_UNAVAILABLE", error.to_string(), json!({"args": args}))
+            })?;
         wait_for_output(child, args, timeout)
     }
 
     fn run_raw(&self, root: &Path, args: &[String]) -> AppResult<Output> {
-        self.run_raw_with_timeout(root, args, GIT_DEFAULT_TIMEOUT)
+        self.run_raw_with_timeout(root, args, GIT_DEFAULT_TIMEOUT, "git")
     }
 
     fn run(&self, root: &Path, args: &[String], max_chars: usize) -> AppResult<String> {
@@ -113,7 +149,7 @@ impl CliGitBackend {
         max_chars: usize,
         timeout: Duration,
     ) -> AppResult<String> {
-        let output = self.run_raw_with_timeout(root, args, timeout)?;
+        let output = self.run_raw_with_timeout(root, args, timeout, "git")?;
         checked_output(output, args, max_chars)
     }
 
@@ -560,6 +596,18 @@ impl RepositoryBackend for CliGitBackend {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn startup_distinguishes_missing_git_from_non_repository() {
+        let root = tempdir().unwrap();
+        let unavailable =
+            CliGitBackend::require_worktree_with(root.path(), "definitely-missing-codeweave-git")
+                .unwrap_err();
+        assert_eq!(unavailable.0.code, "GIT_UNAVAILABLE");
+
+        let not_repository = CliGitBackend::require_worktree(root.path()).unwrap_err();
+        assert_eq!(not_repository.0.code, "NOT_GIT_REPOSITORY");
+    }
 
     #[test]
     fn timed_process_is_terminated_and_reported() {

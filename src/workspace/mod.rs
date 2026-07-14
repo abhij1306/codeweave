@@ -1,29 +1,25 @@
 mod commit;
 mod edit;
+mod events;
 mod fetch;
 mod git;
 mod io_helpers;
-mod journal;
 mod retrieve;
-mod run_attribution;
 mod util;
 mod validation;
 
+pub use events::MutationRecord;
 #[cfg(test)]
 use git::validated_push_target;
-pub use journal::MutationRecord;
-use journal::{load_journal, open_journal, rotate_journal_if_needed};
-use run_attribution::{RunAttribution, RunBaseline};
 use util::{char_boundary_at_or_before, summarize_changed_paths, ChangedPathSummary};
 
 use crate::bash::{BashSupervisor, StartRequest};
-use crate::contracts;
 use crate::index::{content_hash, CodeIndex, WorkspaceExclusions};
 use crate::model::{
     bool_value, required_str, usize_value, AppError, AppResult, PolicyConfig, WorkspaceConfig,
 };
 use crate::repository::{CliGitBackend, RepoStatus, RepositoryBackend};
-use crate::retrieval::{execute_index_search, PROTOCOL_MAX_RESULTS};
+use crate::retrieval::execute_index_search;
 use crate::security::{canonical_root, relative_string};
 use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -45,10 +41,10 @@ const POLL_RECONCILE_DEBOUNCE: Duration = Duration::from_secs(2);
 /// response before it is truncated and the caller is pointed at a code_retrieve read.
 const INSTRUCTION_INLINE_CAP: usize = 4_096;
 
-pub struct WorkspaceActor {
+pub struct Workspace {
     // Lock ordering for code that needs more than one guard:
     // write_lock -> reconcile_lock -> pending_paths -> index -> repo_status -> snapshot_id.
-    // run_attribution, internal_writes, mutations, journal_file, and _watcher are
+    // internal_writes, mutations, and _watcher are
     // isolated owner locks. Capture their data and release the guard before
     // acquiring another workspace lock.
     pub id: String,
@@ -68,7 +64,6 @@ pub struct WorkspaceActor {
     /// successful refresh.
     repo_status_stale: AtomicBool,
     opened_dirty_summary: ChangedPathSummary,
-    opened_at: DateTime<Utc>,
     external_changed: Mutex<HashSet<String>>,
     pending_paths: Arc<Mutex<HashSet<PathBuf>>>,
     needs_reconcile: Arc<AtomicBool>,
@@ -76,16 +71,13 @@ pub struct WorkspaceActor {
     last_reconcile: Mutex<Instant>,
     internal_writes: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     mutations: Mutex<VecDeque<MutationRecord>>,
-    journal_file: Mutex<Option<fs::File>>,
-    journal_path: PathBuf,
     bash: BashSupervisor,
-    run_attribution: Arc<RunAttribution>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
     open_diagnostics: Value,
     _watcher: Mutex<RecommendedWatcher>,
 }
 
-impl WorkspaceActor {
+impl Workspace {
     #[cfg(test)]
     pub fn root_path(&self) -> &Path {
         &self.root
@@ -185,28 +177,10 @@ impl WorkspaceActor {
             .watch(&root, RecursiveMode::Recursive)
             .map_err(AppError::internal)?;
         let watcher_ms = watcher_started.elapsed().as_millis();
-        let journal_started = Instant::now();
-        let journal_path = workspace_cache.join("mutations.jsonl");
-        rotate_journal_if_needed(&journal_path)?;
-        let mutations = load_journal(&journal_path);
-        let persisted_generation = mutations
-            .iter()
-            .map(|mutation| mutation.generation)
-            .max()
-            .unwrap_or(1);
-        generation.store(persisted_generation.max(1), Ordering::Release);
-        let journal_file = open_journal(&journal_path)?;
-        let run_attribution = Arc::new(RunAttribution::new());
-        let completion_attribution = Arc::clone(&run_attribution);
-        let eviction_attribution = Arc::clone(&run_attribution);
+        let runtime_started = Instant::now();
+        let mutations = VecDeque::new();
         let bash = BashSupervisor::new(workspace_cache, policy.clone())?;
-        bash.set_completion_observer(Arc::new(move |run_id, ended_at| {
-            completion_attribution.record_completion(run_id, ended_at);
-        }));
-        bash.set_eviction_observer(Arc::new(move |run_ids| {
-            eviction_attribution.evict_runs(run_ids);
-        }));
-        let journal_ms = journal_started.elapsed().as_millis();
+        let runtime_ms = runtime_started.elapsed().as_millis();
         let open_diagnostics = json!({
             "cache_hit": index_cache_hit,
             "total_ms": opened_started.elapsed().as_millis(),
@@ -215,7 +189,7 @@ impl WorkspaceActor {
                 "git": git_ms,
                 "index": index_ms,
                 "watcher": watcher_ms,
-            "journal_and_bash": journal_ms
+            "runtime": runtime_ms
             }
         });
         Ok(Self {
@@ -232,7 +206,6 @@ impl WorkspaceActor {
             repo_status: RwLock::new(repo_status),
             repo_status_stale: AtomicBool::new(false),
             opened_dirty_summary: summarize_changed_paths(opened_dirty),
-            opened_at: Utc::now(),
             external_changed: Mutex::new(HashSet::new()),
             pending_paths,
             needs_reconcile,
@@ -240,10 +213,7 @@ impl WorkspaceActor {
             last_reconcile: Mutex::new(Instant::now()),
             internal_writes,
             mutations: Mutex::new(mutations),
-            journal_file: Mutex::new(Some(journal_file)),
-            journal_path,
             bash,
-            run_attribution,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             open_diagnostics,
             _watcher: Mutex::new(watcher),
@@ -394,7 +364,6 @@ impl WorkspaceActor {
                     .iter()
                     .map(|path| MutationRecord {
                         mutation_id: MutationRecord::new_id(),
-                        session_id: "external".to_owned(),
                         path: path.clone(),
                         before_hash: None,
                         after_hash: index.get(path).map(|file| file.hash.clone()),
@@ -493,35 +462,7 @@ impl WorkspaceActor {
         }))
     }
 
-    pub fn code_capabilities(&self) -> AppResult<Value> {
-        let bash = self.bash.readiness();
-        let bash_available = bash.is_ready();
-        let generation = self.generation();
-        let snapshot_id = self.snapshot();
-        let mut result = contracts::public_contract_capabilities();
-        result["workspace_id"] = Value::String(self.id.clone());
-        result["root"] = Value::String(self.root.to_string_lossy().into_owned());
-        result["generation"] = json!(generation);
-        result["snapshot_id"] = Value::String(snapshot_id.clone());
-        result["editing"]["supports_bash_validation_commands"] = Value::Bool(bash_available);
-        result["execution"] = json!({"bash": bash});
-        result["dynamic"] = json!({
-            "workspace_id": self.id,
-            "generation": generation,
-            "snapshot_id": snapshot_id,
-            "bash": self.bash.readiness()
-        });
-        result["limits"] = json!({
-            "max_file_bytes": self.policy.max_file_bytes,
-            "max_context_chars": self.policy.max_context_chars,
-            "max_search_results": self.policy.max_search_results,
-            "protocol_max_search_results": PROTOCOL_MAX_RESULTS,
-            "max_bash_output_chars": self.policy.bash.max_output_chars,
-            "max_bash_timeout_ms": self.policy.bash.max_timeout_ms
-        });
-        Ok(result)
-    }
-    pub fn summary(&self, session_id: &str, stateless_session: bool) -> AppResult<Value> {
+    pub fn summary(&self) -> AppResult<Value> {
         let started = Instant::now();
         let reconcile_started = Instant::now();
         self.reconcile_pending()?;
@@ -538,12 +479,7 @@ impl WorkspaceActor {
             .mutations
             .lock()
             .iter()
-            .filter(|item| {
-                item.session_id == session_id
-                    && item.source == "mcp_edit"
-                    && item.timestamp >= self.opened_at
-                    && dirty_set.contains(&item.path)
-            })
+            .filter(|item| item.source == "mcp_edit" && dirty_set.contains(&item.path))
             .map(|item| item.path.clone())
             .collect();
         let external: HashSet<String> = self
@@ -598,27 +534,19 @@ impl WorkspaceActor {
         let bash_available = bash.is_ready();
         let validation_guidance = if bash_available {
             "Write-tool validate fields accept Bash command strings. Use bash(command='<command>') for standalone execution."
-        } else if self.policy.bash.enabled {
-            "Bash execution is enabled but no usable Bash implementation passed readiness checks. Fix policy.bash.executable or install Git Bash/MSYS2/Cygwin Bash; WSL is used only when explicitly configured and ready."
         } else {
-            "Bash execution is disabled. Set policy.bash.enabled to true and restart CodeWeave to use bash and write-tool validation commands."
+            "No usable Bash implementation passed readiness checks. Fix policy.bash.executable or install Git Bash/MSYS2/Cygwin Bash."
         };
         let warnings = if bash_available {
             Vec::<String>::new()
-        } else if self.policy.bash.enabled {
+        } else {
             vec![format!(
                 "Bash execution and write-tool validation commands are unavailable: {}",
                 bash.failure_reason
                     .as_deref()
                     .unwrap_or("No usable Bash implementation found")
             )]
-        } else {
-            vec!["Bash execution and write-tool validation commands are unavailable until policy.bash.enabled is true and CodeWeave is restarted.".to_owned()]
         };
-        let mut warnings = warnings;
-        if stateless_session {
-            warnings.push("Stateless HTTP requests share one legacy workspace key; enable server.statefulMode for isolated chat sessions.".to_owned());
-        }
         let mut result = json!({
             "workspace_id": self.id, "name": self.name, "root": self.root, "generation": self.generation(), "snapshot_id": self.snapshot(),
             "file_count": index.file_count(), "languages": index.languages(), "repository": repository, "instructions": instructions,
@@ -649,7 +577,7 @@ impl WorkspaceActor {
                     "observed_external": external.groups
                 }
             },
-            "tool_guidance": format!("This MCP session has one active repository. Context and edits read cached state; call workspace refresh only after suspected missed external changes. {validation_guidance}")
+            "tool_guidance": format!("This runtime has one active repository. Context and edits read cached state; call workspace refresh only after suspected missed external changes. {validation_guidance}")
         });
         add_phase_metrics(
             &mut result,
@@ -661,12 +589,7 @@ impl WorkspaceActor {
         Ok(result)
     }
 
-    pub fn refresh(
-        &self,
-        force: bool,
-        session_id: &str,
-        stateless_session: bool,
-    ) -> AppResult<Value> {
+    pub fn refresh(&self, force: bool) -> AppResult<Value> {
         if force {
             let _guard = self.reconcile_lock.lock();
             self.pending_paths.lock().clear();
@@ -683,7 +606,7 @@ impl WorkspaceActor {
         } else {
             self.reconcile_pending()?;
         }
-        self.summary(session_id, stateless_session)
+        self.summary()
     }
 
     pub(super) fn search_index(&self, params: &Value) -> AppResult<Value> {
@@ -700,7 +623,7 @@ impl WorkspaceActor {
         )
     }
 
-    pub fn changes(&self, session_id: &str, params: &Value) -> AppResult<Value> {
+    pub fn changes(&self, params: &Value) -> AppResult<Value> {
         let started = Instant::now();
         let reconcile_started = Instant::now();
         self.reconcile_pending()?;
@@ -716,7 +639,6 @@ impl WorkspaceActor {
             .lock()
             .iter()
             .rev()
-            .filter(|item| item.session_id == session_id)
             .filter(|item| item.generation > since)
             .filter(|item| source.map(|value| item.source == value).unwrap_or(true))
             .take(limit)
@@ -738,7 +660,7 @@ impl WorkspaceActor {
         Ok(result)
     }
 
-    pub async fn run(self: &Arc<Self>, session_id: &str, params: &Value) -> AppResult<Value> {
+    pub async fn run(self: &Arc<Self>, params: &Value) -> AppResult<Value> {
         let started = Instant::now();
         let action = params
             .get("action")
@@ -769,9 +691,8 @@ impl WorkspaceActor {
                 let run_started = Instant::now();
                 let value = self
                     .bash
-                    .start_for_session(
+                    .start(
                         &self.root,
-                        session_id,
                         StartRequest {
                             command,
                             cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
@@ -782,23 +703,19 @@ impl WorkspaceActor {
                     .await?;
                 run_startup_ms = Some(run_started.elapsed().as_millis());
                 if let Some(run_id) = value.get("run_id").and_then(Value::as_str) {
-                    self.run_attribution.start_run(run_id, before, before_dirty);
+                    self.bash.set_change_baseline(run_id, before, before_dirty);
                 }
                 value
             }
             "status" => {
                 let actor = Arc::clone(self);
-                let session_id = session_id.to_owned();
                 let run_id = required_str(params, "run_id")?.to_owned();
-                tokio::task::spawn_blocking(move || {
-                    actor.bash.status_for_session(&session_id, &run_id)
-                })
-                .await
-                .map_err(AppError::internal)??
+                tokio::task::spawn_blocking(move || actor.bash.status(&run_id))
+                    .await
+                    .map_err(AppError::internal)??
             }
             "output" => {
                 let actor = Arc::clone(self);
-                let session_id = session_id.to_owned();
                 let run_id = required_str(params, "run_id")?.to_owned();
                 let continuation = params
                     .get("continuation")
@@ -809,25 +726,19 @@ impl WorkspaceActor {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 tokio::task::spawn_blocking(move || {
-                    actor.bash.output_stream_for_session(
-                        &session_id,
-                        &run_id,
-                        continuation.as_deref(),
-                        stream.as_deref(),
-                    )
+                    actor
+                        .bash
+                        .output_stream(&run_id, continuation.as_deref(), stream.as_deref())
                 })
                 .await
                 .map_err(AppError::internal)??
             }
             "cancel" => {
                 let actor = Arc::clone(self);
-                let session_id = session_id.to_owned();
                 let run_id = required_str(params, "run_id")?.to_owned();
-                tokio::task::spawn_blocking(move || {
-                    actor.bash.cancel_for_session(&session_id, &run_id)
-                })
-                .await
-                .map_err(AppError::internal)??
+                tokio::task::spawn_blocking(move || actor.bash.cancel(&run_id))
+                    .await
+                    .map_err(AppError::internal)??
             }
             other => {
                 return Err(AppError::details(
@@ -866,28 +777,26 @@ impl WorkspaceActor {
                 .and_then(Value::as_str)
                 .map(|status| !matches!(status, "queued" | "running" | "cancelling"))
                 .unwrap_or(true);
-            let result_ended_at = run_result_ended_at(&result);
             let current_generation = self.generation();
             let mutation_snapshot = self.mutations.lock().iter().cloned().collect::<Vec<_>>();
-            let attribution = self.run_attribution.observe(
-                &run_id,
-                current_generation,
-                current_dirty,
-                terminal,
-                result_ended_at,
-                |baseline, end_generation, ended_at, current_dirty| {
-                    self.observed_run_changed_paths(
-                        &mutation_snapshot,
-                        baseline,
-                        end_generation,
-                        ended_at,
-                        current_dirty,
-                    )
-                },
-            );
-            let start_generation = attribution.start_generation;
-            let attribution_generation = attribution.attribution_generation;
-            let changed = attribution.changed;
+            let (start_generation, attribution_generation, changed_paths) =
+                self.bash.observe_changes(
+                    &run_id,
+                    current_generation,
+                    current_dirty,
+                    terminal,
+                    |start_generation, baseline_dirty, ended_at, current_dirty| {
+                        self.observed_run_changed_paths(
+                            &mutation_snapshot,
+                            start_generation,
+                            baseline_dirty,
+                            current_generation,
+                            ended_at,
+                            current_dirty,
+                        )
+                    },
+                )?;
+            let changed = summarize_changed_paths(changed_paths);
             if let Some(object) = result.as_object_mut() {
                 object.insert(
                     "workspace_generation_before".to_owned(),
@@ -931,7 +840,8 @@ impl WorkspaceActor {
     fn observed_run_changed_paths(
         &self,
         mutations: &[MutationRecord],
-        baseline: &RunBaseline,
+        start_generation: u64,
+        baseline_dirty: &HashSet<String>,
         end_generation: u64,
         ended_at: Option<&DateTime<Utc>>,
         current_dirty: &HashSet<String>,
@@ -939,7 +849,7 @@ impl WorkspaceActor {
         let mutation_paths: HashSet<String> = mutations
             .iter()
             .filter(|mutation| {
-                mutation.generation > baseline.generation
+                mutation.generation > start_generation
                     && mutation.generation <= end_generation
                     && ended_at
                         .map(|ended| {
@@ -951,7 +861,7 @@ impl WorkspaceActor {
             .map(|mutation| mutation.path.clone())
             .collect();
         let mut paths: HashSet<String> = current_dirty
-            .symmetric_difference(&baseline.dirty_files)
+            .symmetric_difference(baseline_dirty)
             .filter(|path| {
                 ended_at.is_none()
                     || mutation_paths.contains(*path)
@@ -976,14 +886,6 @@ impl WorkspaceActor {
         let modified: DateTime<Utc> = modified.into();
         modified <= *ended_at
     }
-}
-
-fn run_result_ended_at(result: &Value) -> Option<DateTime<Utc>> {
-    result
-        .get("ended_at")
-        .and_then(Value::as_str)
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.with_timezone(&Utc))
 }
 
 #[allow(dead_code)]

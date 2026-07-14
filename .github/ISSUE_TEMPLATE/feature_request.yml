@@ -18,5 +18,5 @@ body:
   - type: textarea
     id: security
     attributes:
-      label: Security and compatibility considerations
+      label: Security and contract considerations
       description: Consider paths, authentication, commands, edits, Git operations, transports, and existing clients.

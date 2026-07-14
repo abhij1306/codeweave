@@ -14,7 +14,6 @@ fn test_entry(path: &str, content: &str) -> FileEntry {
         hash: content_hash(content),
         language: language_name(Path::new(path)).to_owned(),
         document_type: classify_document(path),
-        lifecycle: classify_lifecycle(path, content),
         symbols,
         size: content.len() as u64,
         modified_ns: 0,
@@ -24,7 +23,6 @@ fn test_entry(path: &str, content: &str) -> FileEntry {
 #[test]
 fn handles_round_trip() {
     let original = RangeHandle {
-        version: 1,
         workspace_id: "w".into(),
         path: "a.rs".into(),
         start_line: 1,
@@ -409,12 +407,9 @@ fn document_classification_uses_path_segments_not_substrings() {
         classify_document("recordings/login.recording.json"),
         "artifact"
     );
-    assert_eq!(
-        classify_document("runtime/session.json"),
-        "runtime_evidence"
-    );
-    assert_eq!(classify_document("evidence/session.txt"), "source");
-    assert_eq!(classify_document("runtime/session.txt"), "source");
+    assert_eq!(classify_document("runtime/state.json"), "runtime_evidence");
+    assert_eq!(classify_document("evidence/state.txt"), "source");
+    assert_eq!(classify_document("runtime/state.txt"), "source");
     assert_eq!(classify_document("logs/server.log"), "log");
 }
 
@@ -713,7 +708,7 @@ fn changing_exclusions_invalidates_the_index_cache() {
 }
 
 #[test]
-fn older_cache_schema_is_rejected() {
+fn mismatched_cache_schema_is_rejected() {
     let workspace = tempfile::tempdir().unwrap();
     let cache_dir = tempfile::tempdir().unwrap();
     let cache_file = cache_dir.path().join("index.json");
@@ -726,7 +721,7 @@ fn older_cache_schema_is_rejected() {
 
     let mut cache: serde_json::Value =
         serde_json::from_slice(&fs::read(&cache_file).unwrap()).unwrap();
-    cache["schema"] = serde_json::json!("codeweave-index-v8");
+    cache["schema"] = serde_json::json!("invalid-schema");
     fs::write(&cache_file, serde_json::to_vec(&cache).unwrap()).unwrap();
 
     let (_, cache_hit) =

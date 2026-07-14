@@ -45,7 +45,7 @@ A useful pull request explains:
 - configuration or documentation changes;
 - security implications, especially for paths, authentication, commands, edits, or Git operations.
 
-Add or update tests for fixes and new behavior. Do not weaken path canonicalization, authentication, command allow-listing, snapshot checks, edit preconditions, or rollback behavior without a clearly documented security rationale.
+Add or update tests for fixes and new behavior. Do not weaken path canonicalization, authentication, snapshot checks, edit preconditions, process-tree termination, or compensation reporting without a clearly documented security rationale.
 
 Use neutral paths such as `/path/to/project` or `C:\\path\\to\\project` in public examples.
 

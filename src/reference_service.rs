@@ -252,7 +252,6 @@ impl<'a> ReferenceService<'a> {
             let handle = indexed
                 .map(|file| {
                     encode_handle(&RangeHandle {
-                        version: 1,
                         workspace_id: workspace_id.to_owned(),
                         path: location.path.clone(),
                         start_line: location.range.start.line,
@@ -601,7 +600,6 @@ fn reference_location(
     window: ReferenceWindow,
 ) -> AppResult<ReferenceLocation> {
     let handle = encode_handle(&RangeHandle {
-        version: 1,
         workspace_id: workspace_id.to_owned(),
         path: file.path.clone(),
         start_line: window.start_line,
@@ -657,7 +655,6 @@ fn declaration_location(
         .into_iter()
         .collect::<Vec<_>>();
     let handle = encode_handle(&RangeHandle {
-        version: 1,
         workspace_id: workspace_id.to_owned(),
         path: path.to_owned(),
         start_line: symbol.start_line,

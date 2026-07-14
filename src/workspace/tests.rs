@@ -1,10 +1,10 @@
 use super::edit::PlannedFile;
-use super::journal::{rotate_journal_if_needed, MutationRecord, MAX_JOURNAL_BYTES};
+use super::events::MutationRecord;
 use super::util::{
     line_ending_label, line_range_bytes, normalize_line_endings_for_content,
     summarize_changed_paths, MAX_CHANGED_PATH_GROUPS, MAX_OBSERVED_CHANGED_PATHS,
 };
-use super::{validated_push_target, RunBaseline, WorkspaceActor};
+use super::{validated_push_target, Workspace};
 use crate::index::content_hash;
 use crate::model::{BashConfig, PolicyConfig, WorkspaceConfig};
 use crate::test_bash_executable;
@@ -23,22 +23,20 @@ fn test_policy() -> PolicyConfig {
         max_context_chars: 50_000,
         max_search_results: 100,
         bash: BashConfig {
-            enabled: true,
             executable: test_bash_executable(),
             default_timeout_ms: 120_000,
             foreground_budget_ms: 20_000,
             max_timeout_ms: 300_000,
             max_output_chars: 30_000,
-            retention_hours: 1,
         },
     }
 }
 
-fn test_actor(root: &Path) -> Arc<WorkspaceActor> {
+fn test_actor(root: &Path) -> Arc<Workspace> {
     test_actor_with_exclusions(root, Vec::new())
 }
 
-fn test_actor_with_policy(root: &Path, policy: PolicyConfig) -> Arc<WorkspaceActor> {
+fn test_actor_with_policy(root: &Path, policy: PolicyConfig) -> Arc<Workspace> {
     test_actor_with_policy_and_exclusions(root, policy, Vec::new())
 }
 
@@ -46,10 +44,10 @@ fn test_actor_with_policy_and_exclusions(
     root: &Path,
     policy: PolicyConfig,
     exclude_paths: Vec<String>,
-) -> Arc<WorkspaceActor> {
+) -> Arc<Workspace> {
     let cache = tempdir().unwrap().keep();
     Arc::new(
-        WorkspaceActor::open(
+        Workspace::open(
             &WorkspaceConfig {
                 id: "main".to_owned(),
                 name: "Main".to_owned(),
@@ -64,13 +62,13 @@ fn test_actor_with_policy_and_exclusions(
     )
 }
 
-fn test_actor_with_budget(root: &Path, foreground_budget_ms: u64) -> Arc<WorkspaceActor> {
+fn test_actor_with_budget(root: &Path, foreground_budget_ms: u64) -> Arc<Workspace> {
     let mut policy = test_policy();
     policy.bash.foreground_budget_ms = foreground_budget_ms;
     test_actor_with_policy(root, policy)
 }
 
-fn test_actor_with_exclusions(root: &Path, exclude_paths: Vec<String>) -> Arc<WorkspaceActor> {
+fn test_actor_with_exclusions(root: &Path, exclude_paths: Vec<String>) -> Arc<Workspace> {
     test_actor_with_policy_and_exclusions(root, test_policy(), exclude_paths)
 }
 
@@ -364,10 +362,7 @@ async fn fetched_windows_text_can_be_previewed_and_applied_exactly() {
     }]);
 
     let preview = actor
-        .code_edit(
-            "test-session",
-            &json!({"preview": true, "changes": changes.clone()}),
-        )
+        .code_edit(&json!({"preview": true, "changes": changes.clone()}))
         .await
         .unwrap();
     assert_eq!(preview["preview"], true);
@@ -376,10 +371,7 @@ async fn fetched_windows_text_can_be_previewed_and_applied_exactly() {
         b"before\r\nold value\r\nafter\r\n"
     );
 
-    let applied = actor
-        .code_edit("test-session", &json!({"changes": changes}))
-        .await
-        .unwrap();
+    let applied = actor.code_edit(&json!({"changes": changes})).await.unwrap();
     assert_eq!(applied["applied"], true);
     assert_eq!(
         fs::read(&path).unwrap(),
@@ -404,18 +396,15 @@ async fn exact_replace_prefers_normalized_crlf_match_over_raw_lf_suffix() {
     let handle = fetched["results"][0]["handle"].as_str().unwrap();
 
     actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [{
-                    "kind": "replace",
-                    "path": "windows.txt",
-                    "handle": handle,
-                    "old_text": "\nold value",
-                    "new_text": "\nnew value"
-                }]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [{
+                "kind": "replace",
+                "path": "windows.txt",
+                "handle": handle,
+                "old_text": "\nold value",
+                "new_text": "\nnew value"
+            }]
+        }))
         .await
         .unwrap();
 
@@ -452,19 +441,13 @@ async fn handle_range_replace_preserves_windows_line_endings() {
     }]);
 
     let preview = actor
-        .code_edit(
-            "test-session",
-            &json!({"preview": true, "changes": changes.clone()}),
-        )
+        .code_edit(&json!({"preview": true, "changes": changes.clone()}))
         .await
         .unwrap();
     assert_eq!(preview["preview"], true);
     assert_eq!(fs::read(&path).unwrap(), b"first\r\nsecond\r\nthird\r\n");
 
-    actor
-        .code_edit("test-session", &json!({"changes": changes}))
-        .await
-        .unwrap();
+    actor.code_edit(&json!({"changes": changes})).await.unwrap();
     assert_eq!(
         fs::read(&path).unwrap(),
         b"first\r\nupdated\r\ncontinued\r\nthird\r\n"
@@ -487,17 +470,14 @@ async fn replace_range_preserves_boundary_when_new_text_omits_newline() {
     let handle = fetched["results"][0]["handle"].as_str().unwrap();
 
     actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [{
-                    "kind": "replace_range",
-                    "path": "value.txt",
-                    "handle": handle,
-                    "new_text": "updated"
-                }]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [{
+                "kind": "replace_range",
+                "path": "value.txt",
+                "handle": handle,
+                "new_text": "updated"
+            }]
+        }))
         .await
         .unwrap();
 
@@ -513,18 +493,15 @@ async fn exact_full_line_replace_preserves_boundary() {
     let actor = test_actor(root.path());
 
     actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [{
-                    "kind": "replace",
-                    "path": "value.txt",
-                    "old_text": "first\nsecond\n",
-                    "new_text": "updated",
-                    "expected_hash": content_hash(original)
-                }]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [{
+                "kind": "replace",
+                "path": "value.txt",
+                "old_text": "first\nsecond\n",
+                "new_text": "updated",
+                "expected_hash": content_hash(original)
+            }]
+        }))
         .await
         .unwrap();
 
@@ -615,52 +592,8 @@ fn workspace_diagnostics_exposes_bash_policy_and_limits() {
     assert_eq!(diagnostics["workspace_id"], "main");
     assert_eq!(diagnostics["file_count"], 1);
     assert_eq!(diagnostics["policy"]["max_search_results"], 100);
-    assert_eq!(diagnostics["policy"]["bash"]["enabled"], true);
-}
-
-#[test]
-fn code_capabilities_reports_public_contracts() {
-    let root = tempdir().unwrap();
-    fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-    let actor = test_actor(root.path());
-
-    let capabilities = actor.code_capabilities().unwrap();
-
-    assert_eq!(capabilities["workspace_id"], "main");
-    assert_eq!(capabilities["retrieval"]["tool"], "code_retrieve");
-    assert!(capabilities["retrieval"]["operations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|operation| operation == "read"));
-    assert!(capabilities["retrieval"]["read_targets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|target| target == "metadata"));
-    assert_eq!(capabilities["editing"]["supports_transaction"], true);
-    assert_eq!(
-        capabilities["editing"]["supports_handle_range_replace"],
-        true
-    );
-    assert_eq!(capabilities["contract_version"], 2);
-    assert_eq!(capabilities["editing"]["atomic_file_replace"], true);
-    assert_eq!(capabilities["editing"]["atomic_multi_file_commit"], false);
-    assert_eq!(
-        capabilities["editing"]["compensating_restore"],
-        "best_effort"
-    );
-    assert_eq!(capabilities["editing"]["manual_recovery_possible"], true);
-    assert_eq!(
-        capabilities["editing"]["validation_failures_preserve_edits"],
-        true
-    );
-    assert_eq!(capabilities["editing"]["validation_may_run_detached"], true);
-    assert!(capabilities["editing"]
-        .get("supports_rollback_on_failure")
-        .is_none());
-    assert_eq!(capabilities["dynamic"]["workspace_id"], "main");
-    assert!(capabilities["error_registry"].is_array());
+    assert!(diagnostics["policy"]["bash"].get("enabled").is_none());
+    assert!(diagnostics["execution"]["bash"]["readiness"].is_string());
 }
 
 #[test]
@@ -679,8 +612,7 @@ fn code_retrieve_batches_explicit_primitives_in_one_round_trip() {
     let actor = test_actor(root.path());
 
     let result = actor
-        .code_retrieve_for_session(
-            "session",
+        .code_retrieve(
             &json!({
                 "operations": [
                     {"id": "file", "operation": "find_file", "name": "Cargo.toml"},
@@ -731,15 +663,12 @@ fn code_retrieve_preserves_success_when_an_operation_fails() {
     let actor = test_actor(root.path());
 
     let result = actor
-        .code_retrieve_for_session(
-            "session",
-            &json!({
-                "operations": [
-                    {"id": "file", "operation": "find_file", "name": "engine.rs"},
-                    {"id": "invalid", "operation": "find_symbol"}
-                ]
-            }),
-        )
+        .code_retrieve(&json!({
+            "operations": [
+                {"id": "file", "operation": "find_file", "name": "engine.rs"},
+                {"id": "invalid", "operation": "find_symbol"}
+            ]
+        }))
         .unwrap();
 
     assert_eq!(result["result_count"], 1);
@@ -756,17 +685,14 @@ fn code_retrieve_reports_malformed_entries_without_losing_successes() {
     let actor = test_actor(root.path());
 
     let result = actor
-        .code_retrieve_for_session(
-            "session",
-            &json!({
-                "operations": [
-                    {"id": "file", "operation": "find_file", "name": "engine.rs"},
-                    "not-an-object",
-                    {"id": "missing-operation"},
-                    {"id": "file", "operation": "find_symbol", "symbol": "extract"}
-                ]
-            }),
-        )
+        .code_retrieve(&json!({
+            "operations": [
+                {"id": "file", "operation": "find_file", "name": "engine.rs"},
+                "not-an-object",
+                {"id": "missing-operation"},
+                {"id": "file", "operation": "find_symbol", "symbol": "extract"}
+            ]
+        }))
         .unwrap();
 
     assert_eq!(result["result_count"], 1);
@@ -788,15 +714,12 @@ fn code_retrieve_rejects_a_stale_snapshot() {
     let actor = test_actor(root.path());
 
     let error = actor
-        .code_retrieve_for_session(
-            "session",
-            &json!({
-                "snapshot_id": "snap_stale",
-                "operations": [
-                    {"operation": "find_file", "name": "engine.rs"}
-                ]
-            }),
-        )
+        .code_retrieve(&json!({
+            "snapshot_id": "snap_stale",
+            "operations": [
+                {"operation": "find_file", "name": "engine.rs"}
+            ]
+        }))
         .unwrap_err();
 
     assert_eq!(error.0.code, "STALE_SNAPSHOT");
@@ -808,8 +731,7 @@ async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
     fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
     let actor = test_actor(root.path());
     actor.mutations.lock().push_back(MutationRecord {
-        mutation_id: "historical".to_owned(),
-        session_id: "external".to_owned(),
+        mutation_id: "event".to_owned(),
         path: "unrelated/generated.txt".to_owned(),
         before_hash: None,
         after_hash: Some("hash".to_owned()),
@@ -820,13 +742,10 @@ async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
     });
 
     let started = actor
-        .run(
-            "session",
-            &json!({
-                "command": "printf codeweave-bash-test",
-                "background": false
-            }),
-        )
+        .run(&json!({
+            "command": "printf codeweave-bash-test",
+            "background": false
+        }))
         .await
         .unwrap();
     let run_id = started["run_id"].as_str().unwrap();
@@ -834,12 +753,9 @@ async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
     assert_eq!(started["status_fetch"]["value"], run_id);
 
     let fetched = actor
-        .read_targets_for_session(
-            "session",
-            &json!({
-                "items": [{"kind": "bash_status", "value": run_id}]
-            }),
-        )
+        .read_targets_batch(&json!({
+            "items": [{"kind": "bash_status", "value": run_id}]
+        }))
         .unwrap();
 
     assert_eq!(fetched["result_count"], 1);
@@ -848,16 +764,13 @@ async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
     assert_eq!(fetched["results"][0]["status"], "succeeded");
 
     let bounded = actor
-        .read_targets_for_session(
-            "session",
-            &json!({
-                "items": [
-                    {"kind": "bash_status", "value": run_id},
-                    {"kind": "bash_status", "value": run_id}
-                ],
-                "max_chars": 5
-            }),
-        )
+        .read_targets_batch(&json!({
+            "items": [
+                {"kind": "bash_status", "value": run_id},
+                {"kind": "bash_status", "value": run_id}
+            ],
+            "max_chars": 5
+        }))
         .unwrap();
     assert!(bounded["results"][0]["output"].as_str().unwrap().len() <= 5);
     assert_eq!(bounded["results"][0]["output_truncated"], true);
@@ -874,13 +787,10 @@ async fn completed_bash_status_does_not_attribute_later_workspace_writes() {
     let actor = test_actor(root.path());
 
     let started = actor
-        .run(
-            "session",
-            &json!({
-                "command": "printf codeweave-bash-test",
-                "background": true
-            }),
-        )
+        .run(&json!({
+            "command": "printf codeweave-bash-test",
+            "background": true
+        }))
         .await
         .unwrap();
     let run_id = started["run_id"].as_str().unwrap();
@@ -897,7 +807,6 @@ async fn completed_bash_status_does_not_attribute_later_workspace_writes() {
 
     actor
         .commit_plan(
-            "session",
             &[PlannedFile {
                 path: ".ai-bridge/codeweave-audit-success.md".to_owned(),
                 before: None,
@@ -908,13 +817,10 @@ async fn completed_bash_status_does_not_attribute_later_workspace_writes() {
         .unwrap();
 
     let fetched = actor
-        .run(
-            "session",
-            &json!({
-                "action": "status",
-                "run_id": run_id
-            }),
-        )
+        .run(&json!({
+            "action": "status",
+            "run_id": run_id
+        }))
         .await
         .unwrap();
 
@@ -923,13 +829,10 @@ async fn completed_bash_status_does_not_attribute_later_workspace_writes() {
     assert_eq!(fetched["observed_changed_paths"], json!([]));
 
     let fetched_again = actor
-        .run(
-            "session",
-            &json!({
-                "action": "status",
-                "run_id": run_id
-            }),
-        )
+        .run(&json!({
+            "action": "status",
+            "run_id": run_id
+        }))
         .await
         .unwrap();
     assert_eq!(
@@ -945,10 +848,8 @@ fn run_change_detection_includes_new_mutations_to_already_dirty_files() {
     let actor = test_actor(root.path());
     let generation = actor.generation();
     let dirty_files = HashSet::from(["existing.rs".to_owned()]);
-    let baseline = RunBaseline::new(generation, dirty_files.clone());
     actor.mutations.lock().push_back(MutationRecord {
         mutation_id: "during-run".to_owned(),
-        session_id: "external".to_owned(),
         path: "existing.rs".to_owned(),
         before_hash: Some("before".to_owned()),
         after_hash: Some("after".to_owned()),
@@ -959,8 +860,14 @@ fn run_change_detection_includes_new_mutations_to_already_dirty_files() {
     });
 
     let mutations = actor.mutations.lock().iter().cloned().collect::<Vec<_>>();
-    let observed =
-        actor.observed_run_changed_paths(&mutations, &baseline, generation + 1, None, &dirty_files);
+    let observed = actor.observed_run_changed_paths(
+        &mutations,
+        generation,
+        &dirty_files,
+        generation + 1,
+        None,
+        &dirty_files,
+    );
 
     assert_eq!(observed, HashSet::from(["existing.rs".to_owned()]));
 }
@@ -973,12 +880,10 @@ fn delayed_reconcile_uses_file_modification_time_for_run_attribution() {
     let actor = test_actor(root.path());
     let generation = actor.generation();
     let dirty_files = HashSet::from(["existing.rs".to_owned()]);
-    let baseline = RunBaseline::new(generation, dirty_files.clone());
     fs::write(&path, "fn existing() { println!(\"changed\"); }\n").unwrap();
     let ended_at = Utc::now() + ChronoDuration::seconds(5);
     actor.mutations.lock().push_back(MutationRecord {
         mutation_id: "delayed-watcher".to_owned(),
-        session_id: "external".to_owned(),
         path: "existing.rs".to_owned(),
         before_hash: Some("before".to_owned()),
         after_hash: Some("after".to_owned()),
@@ -991,7 +896,8 @@ fn delayed_reconcile_uses_file_modification_time_for_run_attribution() {
     let mutations = actor.mutations.lock().iter().cloned().collect::<Vec<_>>();
     let observed = actor.observed_run_changed_paths(
         &mutations,
-        &baseline,
+        generation,
+        &dirty_files,
         generation + 1,
         Some(&ended_at),
         &dirty_files,
@@ -1077,7 +983,7 @@ fn reconciliation_discards_configured_excluded_paths() {
         .needs_reconcile
         .store(true, std::sync::atomic::Ordering::Release);
 
-    let summary = actor.summary("test-session", false).unwrap();
+    let summary = actor.summary().unwrap();
 
     assert_eq!(actor.generation(), generation);
     assert_eq!(summary["dirty_ownership"]["counts"]["observed_external"], 0);
@@ -1247,89 +1153,18 @@ fn failed_write_does_not_leave_an_internal_write_marker() {
         after: None,
     }];
 
-    let error = actor
-        .commit_plan("test-session", &plan, "failed-write")
-        .unwrap_err();
+    let error = actor.commit_plan(&plan, "failed-write").unwrap_err();
     assert_eq!(error.0.code, "ATOMIC_WRITE_FAILED");
     let details = error.0.details.as_ref().unwrap();
     assert_eq!(details["failed_path"], "blocked");
     assert_eq!(details["completed_before_failure"], json!([]));
     assert_eq!(details["restored_paths"], json!([]));
-    assert_eq!(details["rollback_failures"], json!([]));
+    assert_eq!(details["compensation_failures"], json!([]));
     assert_eq!(details["manual_recovery_required"], false);
     assert!(!actor
         .internal_writes
         .lock()
         .contains_key(&actor.root.join("blocked")));
-}
-
-#[test]
-fn journal_failure_rolls_back_applied_files_before_returning_error() {
-    let root = tempdir().unwrap();
-    let original = "before\n";
-    fs::write(root.path().join("value.txt"), original).unwrap();
-    let actor = test_actor(root.path());
-    let generation = actor.generation();
-    *actor.journal_file.lock() = None;
-    let plan = vec![PlannedFile {
-        path: "value.txt".to_owned(),
-        before: Some(original.to_owned()),
-        after: Some("after\n".to_owned()),
-    }];
-
-    let error = actor
-        .commit_plan("test-session", &plan, "journal-failure")
-        .unwrap_err();
-
-    assert_eq!(error.0.code, "JOURNAL_COMMIT_FAILED");
-    let details = error.0.details.as_ref().unwrap();
-    assert_eq!(details["completed_before_failure"], json!(["value.txt"]));
-    assert_eq!(details["restored_paths"], json!(["value.txt"]));
-    assert_eq!(details["rollback_failures"], json!([]));
-    assert_eq!(details["manual_recovery_required"], false);
-    assert_eq!(details["rollback_refresh_error"], serde_json::Value::Null);
-    assert_eq!(
-        fs::read_to_string(root.path().join("value.txt")).unwrap(),
-        original
-    );
-    let fetched = actor
-        .read_targets(&json!({"path": "value.txt", "max_chars": 5_000}))
-        .unwrap();
-    assert_eq!(fetched["results"][0]["content"], original);
-    assert_eq!(actor.generation(), generation);
-}
-
-#[test]
-fn journal_rotates_during_append_when_the_live_file_is_oversized() {
-    let root = tempdir().unwrap();
-    fs::write(root.path().join("value.txt"), "value\n").unwrap();
-    let actor = test_actor(root.path());
-    {
-        let mut slot = actor.journal_file.lock();
-        let file = slot.as_mut().unwrap();
-        file.set_len(MAX_JOURNAL_BYTES + 1).unwrap();
-        std::io::Write::flush(file).unwrap();
-    }
-    let record = MutationRecord {
-        mutation_id: "rotation-record".to_owned(),
-        session_id: "test-session".to_owned(),
-        path: "value.txt".to_owned(),
-        before_hash: None,
-        after_hash: Some("hash".to_owned()),
-        source: "test".to_owned(),
-        request_id: "rotation".to_owned(),
-        timestamp: Utc::now(),
-        generation: actor.generation(),
-    };
-
-    actor.record_mutations(&[record]).unwrap();
-
-    let archive = actor
-        .journal_path
-        .with_file_name("mutations.previous.jsonl");
-    assert!(archive.exists());
-    let live = fs::read_to_string(&actor.journal_path).unwrap();
-    assert!(live.contains("rotation-record"));
 }
 
 #[tokio::test]
@@ -1340,22 +1175,19 @@ async fn stale_snapshot_rebases_when_file_hash_is_current() {
     let actor = test_actor(root.path());
     let old_snapshot = actor.snapshot();
     fs::write(root.path().join("unrelated.rs"), "fn unrelated() {}\n").unwrap();
-    actor.refresh(true, "test-session", false).unwrap();
+    actor.refresh(true).unwrap();
     let result = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "snapshot_id": old_snapshot,
-                "preview": true,
-                "changes": [{
-                    "kind": "replace",
-                    "path": "value.rs",
-                    "old_text": "{ 1 }",
-                    "new_text": "{ 2 }",
-                    "expected_hash": content_hash(original)
-                }]
-            }),
-        )
+        .code_edit(&json!({
+            "snapshot_id": old_snapshot,
+            "preview": true,
+            "changes": [{
+                "kind": "replace",
+                "path": "value.rs",
+                "old_text": "{ 1 }",
+                "new_text": "{ 2 }",
+                "expected_hash": content_hash(original)
+            }]
+        }))
         .await
         .unwrap();
     assert_eq!(result["preview"], true);
@@ -1370,7 +1202,7 @@ fn summary_caps_large_instruction_files() {
     fs::write(root.path().join("AGENTS.md"), &big).unwrap();
     fs::write(root.path().join("CLAUDE.md"), "short and sweet\n").unwrap();
     let actor = test_actor(root.path());
-    let summary = actor.summary("test-session", false).unwrap();
+    let summary = actor.summary().unwrap();
     let instructions = summary["instructions"].as_array().unwrap();
 
     let agents = instructions
@@ -1406,10 +1238,7 @@ async fn response_detail_shapes_edit_diff_payload() {
 
     // compact: no unified diff, but the per-file stat is still present.
     let compact = actor
-        .code_edit(
-            "test-session",
-            &json!({"changes": change, "response_detail": "compact"}),
-        )
+        .code_edit(&json!({"changes": change, "response_detail": "compact"}))
         .await
         .unwrap();
     assert_eq!(compact["applied"], true);
@@ -1421,12 +1250,9 @@ async fn response_detail_shapes_edit_diff_payload() {
 
     // debug: full unified diff is returned verbatim.
     fs::write(root.path().join("value.rs"), original).unwrap();
-    actor.refresh(true, "test-session", false).unwrap();
+    actor.refresh(true).unwrap();
     let debug = actor
-        .code_edit(
-            "test-session",
-            &json!({"changes": change, "response_detail": "debug"}),
-        )
+        .code_edit(&json!({"changes": change, "response_detail": "debug"}))
         .await
         .unwrap();
     assert_eq!(debug["diff_omitted"], false);
@@ -1445,18 +1271,15 @@ async fn standard_response_detail_caps_oversized_edit_diff() {
     let actor = test_actor_with_policy(root.path(), policy);
     let replaced: String = (0..4_000).map(|i| format!("edited {i}\n")).collect();
     let result = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [{
-                    "kind": "create",
-                    "path": "big.txt",
-                    "content": replaced,
-                    "overwrite": true,
-                    "expected_hash": content_hash(&original)
-                }]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [{
+                "kind": "create",
+                "path": "big.txt",
+                "content": replaced,
+                "overwrite": true,
+                "expected_hash": content_hash(&original)
+            }]
+        }))
         .await
         .unwrap();
     assert_eq!(result["applied"], true);
@@ -1473,31 +1296,26 @@ async fn failed_bash_validation_preserves_mutation() {
     let original = "fn value() -> i32 { 1 }\n";
     fs::write(root.path().join("value.rs"), original).unwrap();
     let actor = test_actor(root.path());
-    let summary = actor.summary("test-session", false).unwrap();
+    let summary = actor.summary().unwrap();
     assert_eq!(summary["capabilities"]["bash_available"], true);
     assert!(summary["warnings"].as_array().is_some_and(Vec::is_empty));
     let result = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [{
-                    "kind": "replace",
-                    "path": "value.rs",
-                    "old_text": "{ 1 }",
-                    "new_text": "{ 2 }",
-                    "expected_hash": content_hash(original)
-                }],
-                "validate": [
-                    "printf validation-started",
-                    "printf validation-failed >&2; exit 1"
-                ],
-                "rollback_on_failure": true
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [{
+                "kind": "replace",
+                "path": "value.rs",
+                "old_text": "{ 1 }",
+                "new_text": "{ 2 }",
+                "expected_hash": content_hash(original)
+            }],
+            "validate": [
+                "printf validation-started",
+                "printf validation-failed >&2; exit 1"
+            ]
+        }))
         .await
         .unwrap();
     assert_eq!(result["applied"], true);
-    assert_eq!(result["rolled_back"], false);
     assert_eq!(result["validation_failed"], true);
     assert_eq!(result["validation_status"], "failed");
     assert_eq!(result["reason"], "validation_failed");
@@ -1510,9 +1328,7 @@ async fn failed_bash_validation_preserves_mutation() {
         fs::read_to_string(root.path().join("value.rs")).unwrap(),
         "fn value() -> i32 { 2 }\n"
     );
-    let changes = actor
-        .changes("test-session", &json!({"since_generation": 0}))
-        .unwrap();
+    let changes = actor.changes(&json!({"since_generation": 0})).unwrap();
     assert!(changes["mutations"]
         .as_array()
         .unwrap()
@@ -1534,24 +1350,21 @@ async fn unavailable_bash_validation_rejects_before_mutation() {
         .into_owned();
     let actor = test_actor_with_policy(root.path(), policy);
 
-    let summary = actor.summary("test-session", false).unwrap();
+    let summary = actor.summary().unwrap();
     assert_eq!(summary["capabilities"]["bash_available"], false);
     assert_eq!(summary["capabilities"]["bash"]["readiness"], "unavailable");
 
     let error = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [{
-                    "kind": "replace",
-                    "path": "value.rs",
-                    "old_text": "{ 1 }",
-                    "new_text": "{ 2 }",
-                    "expected_hash": content_hash(original)
-                }],
-                "validate": ["true"]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [{
+                "kind": "replace",
+                "path": "value.rs",
+                "old_text": "{ 1 }",
+                "new_text": "{ 2 }",
+                "expected_hash": content_hash(original)
+            }],
+            "validate": ["true"]
+        }))
         .await
         .unwrap_err();
 
@@ -1569,7 +1382,6 @@ fn dirty_ownership_tracks_only_current_dirty_mcp_paths() {
     actor.mutations.lock().extend([
         MutationRecord {
             mutation_id: "dirty".to_owned(),
-            session_id: "test-session".to_owned(),
             path: "still_dirty.rs".to_owned(),
             before_hash: None,
             after_hash: Some("dirty".to_owned()),
@@ -1580,7 +1392,6 @@ fn dirty_ownership_tracks_only_current_dirty_mcp_paths() {
         },
         MutationRecord {
             mutation_id: "clean".to_owned(),
-            session_id: "test-session".to_owned(),
             path: "clean_now.rs".to_owned(),
             before_hash: None,
             after_hash: Some("clean".to_owned()),
@@ -1592,7 +1403,7 @@ fn dirty_ownership_tracks_only_current_dirty_mcp_paths() {
     ]);
     actor.repo_status.write().dirty_files = vec!["still_dirty.rs".to_owned()];
 
-    let summary = actor.summary("test-session", false).unwrap();
+    let summary = actor.summary().unwrap();
     let changed = summary["dirty_ownership"]["changed_by_mcp"]
         .as_array()
         .unwrap();
@@ -1608,22 +1419,19 @@ async fn slow_bash_validation_queues_remaining_commands() {
     fs::write(root.path().join("value.rs"), original).unwrap();
     let actor = test_actor_with_budget(root.path(), 50);
     let result = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [{
-                    "kind": "replace",
-                    "path": "value.rs",
-                    "old_text": "{ 1 }",
-                    "new_text": "{ 2 }",
-                    "expected_hash": content_hash(original)
-                }],
-                "validate": [
-                    "echo checking; sleep 1",
-                    "printf later > validation-later.txt"
-                ]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [{
+                "kind": "replace",
+                "path": "value.rs",
+                "old_text": "{ 1 }",
+                "new_text": "{ 2 }",
+                "expected_hash": content_hash(original)
+            }],
+            "validate": [
+                "echo checking; sleep 1",
+                "printf later > validation-later.txt"
+            ]
+        }))
         .await
         .unwrap();
     assert_eq!(result["applied"], true);
@@ -1653,35 +1461,23 @@ async fn slow_bash_validation_queues_remaining_commands() {
         json!([leading_run_id, deferred_run_id])
     );
 
-    let mut leading = actor
-        .bash
-        .status_for_session("test-session", leading_run_id)
-        .unwrap();
+    let mut leading = actor.bash.status(leading_run_id).unwrap();
     for _ in 0..200 {
         if leading["ended_at"].is_string() {
             break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-        leading = actor
-            .bash
-            .status_for_session("test-session", leading_run_id)
-            .unwrap();
+        leading = actor.bash.status(leading_run_id).unwrap();
     }
     assert_eq!(leading["status"], "succeeded");
 
-    let mut deferred = actor
-        .bash
-        .status_for_session("test-session", deferred_run_id)
-        .unwrap();
+    let mut deferred = actor.bash.status(deferred_run_id).unwrap();
     for _ in 0..200 {
         if deferred["ended_at"].is_string() {
             break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-        deferred = actor
-            .bash
-            .status_for_session("test-session", deferred_run_id)
-            .unwrap();
+        deferred = actor.bash.status(deferred_run_id).unwrap();
     }
     assert_eq!(deferred["status"], "succeeded");
     assert_eq!(
@@ -1697,22 +1493,19 @@ async fn detached_validation_keeps_leading_failure_as_primary_run() {
     fs::write(root.path().join("value.rs"), original).unwrap();
     let actor = test_actor_with_budget(root.path(), 20);
     let result = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [{
-                    "kind": "replace",
-                    "path": "value.rs",
-                    "old_text": "{ 1 }",
-                    "new_text": "{ 2 }",
-                    "expected_hash": content_hash(original)
-                }],
-                "validate": [
-                    "sleep 0.2; exit 7",
-                    "printf later > validation-after-failure.txt"
-                ]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [{
+                "kind": "replace",
+                "path": "value.rs",
+                "old_text": "{ 1 }",
+                "new_text": "{ 2 }",
+                "expected_hash": content_hash(original)
+            }],
+            "validate": [
+                "sleep 0.2; exit 7",
+                "printf later > validation-after-failure.txt"
+            ]
+        }))
         .await
         .unwrap();
 
@@ -1726,35 +1519,23 @@ async fn detached_validation_keeps_leading_failure_as_primary_run() {
         .unwrap()
         .contains("every ID in validation_run_ids"));
 
-    let mut leading = actor
-        .bash
-        .status_for_session("test-session", leading_run_id)
-        .unwrap();
+    let mut leading = actor.bash.status(leading_run_id).unwrap();
     for _ in 0..100 {
         if leading["ended_at"].is_string() {
             break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-        leading = actor
-            .bash
-            .status_for_session("test-session", leading_run_id)
-            .unwrap();
+        leading = actor.bash.status(leading_run_id).unwrap();
     }
     assert_eq!(leading["status"], "failed");
 
-    let mut deferred = actor
-        .bash
-        .status_for_session("test-session", deferred_run_id)
-        .unwrap();
+    let mut deferred = actor.bash.status(deferred_run_id).unwrap();
     for _ in 0..100 {
         if deferred["ended_at"].is_string() {
             break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-        deferred = actor
-            .bash
-            .status_for_session("test-session", deferred_run_id)
-            .unwrap();
+        deferred = actor.bash.status(deferred_run_id).unwrap();
     }
     assert_eq!(deferred["status"], "succeeded");
     assert_eq!(
@@ -1791,7 +1572,6 @@ fn changes_treats_since_generation_as_exclusive() {
     let actor = test_actor(root.path());
     actor.mutations.lock().push_back(MutationRecord {
         mutation_id: "current".to_owned(),
-        session_id: "test-session".to_owned(),
         path: "value.rs".to_owned(),
         before_hash: None,
         after_hash: Some("hash".to_owned()),
@@ -1801,27 +1581,22 @@ fn changes_treats_since_generation_as_exclusive() {
         generation: 7,
     });
 
-    let after_six = actor
-        .changes("test-session", &json!({"since_generation": 6}))
-        .unwrap();
+    let after_six = actor.changes(&json!({"since_generation": 6})).unwrap();
     assert_eq!(after_six["mutations"].as_array().unwrap().len(), 1);
 
-    let after_seven = actor
-        .changes("test-session", &json!({"since_generation": 7}))
-        .unwrap();
+    let after_seven = actor.changes(&json!({"since_generation": 7})).unwrap();
     assert!(after_seven["mutations"].as_array().unwrap().is_empty());
 }
 
 #[test]
-fn changes_are_filtered_by_calling_session() {
+fn changes_are_shared_across_clients() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("value.rs"), "fn value() {}\n").unwrap();
     let actor = test_actor(root.path());
-    for session_id in ["session-a", "session-b"] {
+    for client in ["client-a", "client-b"] {
         actor.mutations.lock().push_back(MutationRecord {
-            mutation_id: format!("mutation-{session_id}"),
-            session_id: session_id.to_owned(),
-            path: format!("{session_id}.rs"),
+            mutation_id: format!("mutation-{client}"),
+            path: format!("{client}.rs"),
             before_hash: None,
             after_hash: Some("hash".to_owned()),
             source: "mcp_edit".to_owned(),
@@ -1831,24 +1606,21 @@ fn changes_are_filtered_by_calling_session() {
         });
     }
 
-    let result = actor
-        .changes("session-a", &json!({"since_generation": 0}))
-        .unwrap();
+    let result = actor.changes(&json!({"since_generation": 0})).unwrap();
     let mutations = result["mutations"].as_array().unwrap();
 
-    assert_eq!(mutations.len(), 1);
-    assert_eq!(mutations[0]["session_id"], "session-a");
-    assert_eq!(mutations[0]["path"], "session-a.rs");
+    assert_eq!(mutations.len(), 2);
+    assert!(mutations.iter().any(|item| item["path"] == "client-a.rs"));
+    assert!(mutations.iter().any(|item| item["path"] == "client-b.rs"));
 }
 
 #[test]
-fn historical_journal_records_are_not_current_session_changes() {
+fn process_local_changes_include_external_mutations() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("value.rs"), "fn value() {}\n").unwrap();
     let actor = test_actor(root.path());
     actor.mutations.lock().push_back(MutationRecord {
         mutation_id: "old".to_owned(),
-        session_id: "previous-session".to_owned(),
         path: "value.rs".to_owned(),
         before_hash: None,
         after_hash: Some("hash".to_owned()),
@@ -1858,98 +1630,8 @@ fn historical_journal_records_are_not_current_session_changes() {
         generation: 99,
     });
 
-    let result = actor
-        .changes("test-session", &json!({"since_generation": 0}))
-        .unwrap();
-    assert!(result["mutations"].as_array().unwrap().is_empty());
-}
-
-#[test]
-fn workspace_generation_resumes_after_persisted_journal_records() {
-    let root = tempdir().unwrap();
-    let cache = tempdir().unwrap();
-    fs::write(root.path().join("value.rs"), "fn value() {}\n").unwrap();
-    let canonical_root = root.path().canonicalize().unwrap();
-    let repo_cache = cache
-        .path()
-        .join("repos")
-        .join(content_hash(&canonical_root.to_string_lossy()));
-    fs::create_dir_all(&repo_cache).unwrap();
-    let record = MutationRecord {
-        mutation_id: "persisted".to_owned(),
-        session_id: "previous-session".to_owned(),
-        path: "value.rs".to_owned(),
-        before_hash: None,
-        after_hash: Some("hash".to_owned()),
-        source: "external".to_owned(),
-        request_id: "old-request".to_owned(),
-        timestamp: Utc::now(),
-        generation: 99,
-    };
-    fs::write(
-        repo_cache.join("mutations.jsonl"),
-        format!("{}\n", serde_json::to_string(&record).unwrap()),
-    )
-    .unwrap();
-
-    let actor = WorkspaceActor::open(
-        &WorkspaceConfig {
-            id: "main".to_owned(),
-            name: "Main".to_owned(),
-            path: root.path().to_string_lossy().into_owned(),
-            artifact_paths: Vec::new(),
-            exclude_paths: Vec::new(),
-        },
-        test_policy(),
-        cache.path().to_path_buf(),
-    )
-    .unwrap();
-
-    assert_eq!(actor.generation(), 99);
-}
-
-#[test]
-fn oversized_journal_rotates_at_open() {
-    let cache = tempdir().unwrap();
-    let journal = cache.path().join("mutations.jsonl");
-    fs::write(&journal, vec![b'x'; (MAX_JOURNAL_BYTES + 1) as usize]).unwrap();
-
-    rotate_journal_if_needed(&journal).unwrap();
-
-    assert!(!journal.exists());
-    assert!(cache.path().join("mutations.previous.jsonl").exists());
-}
-
-#[test]
-fn interrupted_journal_rotation_recovers_previous_archive() {
-    let cache = tempdir().unwrap();
-    let journal = cache.path().join("mutations.jsonl");
-    let archive = cache.path().join("mutations.previous.jsonl");
-    let backup = cache.path().join("mutations.previous.backup.jsonl");
-    fs::write(&journal, b"current").unwrap();
-    fs::write(&backup, b"previous").unwrap();
-
-    rotate_journal_if_needed(&journal).unwrap();
-
-    assert_eq!(fs::read(&archive).unwrap(), b"previous");
-    assert!(!backup.exists());
-    assert_eq!(fs::read(&journal).unwrap(), b"current");
-}
-
-#[test]
-fn journal_rotation_replaces_archive_without_discarding_live_journal_first() {
-    let cache = tempdir().unwrap();
-    let journal = cache.path().join("mutations.jsonl");
-    let archive = cache.path().join("mutations.previous.jsonl");
-    let backup = cache.path().join("mutations.previous.backup.jsonl");
-    fs::write(&archive, b"older").unwrap();
-    fs::write(&journal, vec![b'x'; (MAX_JOURNAL_BYTES + 1) as usize]).unwrap();
-
-    rotate_journal_if_needed(&journal).unwrap();
-
-    assert!(!journal.exists());
-    assert_eq!(fs::metadata(&archive).unwrap().len(), MAX_JOURNAL_BYTES + 1);
-    assert!(!backup.exists());
+    let result = actor.changes(&json!({"since_generation": 0})).unwrap();
+    assert_eq!(result["mutations"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -2000,7 +1682,7 @@ fn workspace_summary_caps_and_groups_large_change_sets() {
         })
         .collect();
 
-    let summary = actor.summary("test-session", false).unwrap();
+    let summary = actor.summary().unwrap();
 
     assert_eq!(
         summary["dirty_ownership"]["observed_external"]
@@ -2044,27 +1726,24 @@ async fn overlapping_exact_edits_in_one_transaction_are_rejected() {
     // Two `replace` changes whose matched byte ranges overlap on the same file
     // must be refused before anything is written.
     let error = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [
-                    {
-                        "kind": "replace",
-                        "path": "value.rs",
-                        "old_text": "compute(alpha, alpha)",
-                        "new_text": "compute(beta, beta)",
-                        "expected_hash": content_hash(original)
-                    },
-                    {
-                        "kind": "replace",
-                        "path": "value.rs",
-                        "old_text": "alpha, alpha",
-                        "new_text": "gamma, gamma",
-                        "expected_hash": content_hash(original)
-                    }
-                ]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [
+                {
+                    "kind": "replace",
+                    "path": "value.rs",
+                    "old_text": "compute(alpha, alpha)",
+                    "new_text": "compute(beta, beta)",
+                    "expected_hash": content_hash(original)
+                },
+                {
+                    "kind": "replace",
+                    "path": "value.rs",
+                    "old_text": "alpha, alpha",
+                    "new_text": "gamma, gamma",
+                    "expected_hash": content_hash(original)
+                }
+            ]
+        }))
         .await
         .unwrap_err();
 
@@ -2092,26 +1771,23 @@ async fn handle_edit_cannot_share_a_file_with_another_change() {
     let handle = fetched["results"][0]["handle"].as_str().unwrap();
 
     let error = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [
-                    {
-                        "kind": "replace_range",
-                        "path": "value.txt",
-                        "handle": handle,
-                        "new_text": "TWO"
-                    },
-                    {
-                        "kind": "replace",
-                        "path": "value.txt",
-                        "old_text": "three",
-                        "new_text": "THREE",
-                        "expected_hash": content_hash(original)
-                    }
-                ]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [
+                {
+                    "kind": "replace_range",
+                    "path": "value.txt",
+                    "handle": handle,
+                    "new_text": "TWO"
+                },
+                {
+                    "kind": "replace",
+                    "path": "value.txt",
+                    "old_text": "three",
+                    "new_text": "THREE",
+                    "expected_hash": content_hash(original)
+                }
+            ]
+        }))
         .await
         .unwrap_err();
 
@@ -2127,18 +1803,15 @@ async fn syntax_error_gate_blocks_broken_rust_and_leaves_file_untouched() {
     let actor = test_actor(root.path());
 
     let error = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [{
-                    "kind": "replace",
-                    "path": "value.rs",
-                    "old_text": "{ 1 }",
-                    "new_text": "{ 1 ",
-                    "expected_hash": content_hash(original)
-                }]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [{
+                "kind": "replace",
+                "path": "value.rs",
+                "old_text": "{ 1 }",
+                "new_text": "{ 1 ",
+                "expected_hash": content_hash(original)
+            }]
+        }))
         .await
         .unwrap_err();
 
@@ -2160,18 +1833,15 @@ async fn json_edits_are_syntax_checked_and_yaml_edits_are_reported_skipped() {
 
     // D5: JSON now has a bundled grammar, so a broken JSON edit is gated.
     let error = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [{
-                    "kind": "replace",
-                    "path": "data.json",
-                    "old_text": "\"a\": 1",
-                    "new_text": "\"a\": 1,",
-                    "expected_hash": content_hash(json_original)
-                }]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [{
+                "kind": "replace",
+                "path": "data.json",
+                "old_text": "\"a\": 1",
+                "new_text": "\"a\": 1,",
+                "expected_hash": content_hash(json_original)
+            }]
+        }))
         .await
         .unwrap_err();
     assert_eq!(error.0.code, "SYNTAX_ERROR");
@@ -2183,27 +1853,24 @@ async fn json_edits_are_syntax_checked_and_yaml_edits_are_reported_skipped() {
     // A valid JSON edit reports the check ran; a YAML edit (no grammar) reports
     // the bypass explicitly as "skipped" rather than silently passing.
     let applied = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [
-                    {
-                        "kind": "replace",
-                        "path": "data.json",
-                        "old_text": "\"a\": 1",
-                        "new_text": "\"a\": 2",
-                        "expected_hash": content_hash(json_original)
-                    },
-                    {
-                        "kind": "replace",
-                        "path": "data.yaml",
-                        "old_text": "a: 1",
-                        "new_text": "a: 2",
-                        "expected_hash": content_hash(yaml_original)
-                    }
-                ]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [
+                {
+                    "kind": "replace",
+                    "path": "data.json",
+                    "old_text": "\"a\": 1",
+                    "new_text": "\"a\": 2",
+                    "expected_hash": content_hash(json_original)
+                },
+                {
+                    "kind": "replace",
+                    "path": "data.yaml",
+                    "old_text": "a: 1",
+                    "new_text": "a: 2",
+                    "expected_hash": content_hash(yaml_original)
+                }
+            ]
+        }))
         .await
         .unwrap();
 
@@ -2251,19 +1918,16 @@ async fn symbol_anchored_insert_positions_place_content_relative_to_the_symbol()
         };
 
         let result = actor
-            .code_edit(
-                "test-session",
-                &json!({
-                    "changes": [{
-                        "kind": "insert",
-                        "path": "value.rs",
-                        "anchor_symbol": "target",
-                        "position": position,
-                        "content": marker,
-                        "expected_hash": content_hash(original)
-                    }]
-                }),
-            )
+            .code_edit(&json!({
+                "changes": [{
+                    "kind": "insert",
+                    "path": "value.rs",
+                    "anchor_symbol": "target",
+                    "position": position,
+                    "content": marker,
+                    "expected_hash": content_hash(original)
+                }]
+            }))
             .await
             .unwrap();
 
@@ -2288,27 +1952,24 @@ async fn same_file_multi_change_accumulates_on_the_in_progress_plan() {
     // must both land: the second is planned on top of the first via put_plan, not
     // re-read from disk. Only one expected_hash precondition is needed.
     let result = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [
-                    {
-                        "kind": "replace",
-                        "path": "value.txt",
-                        "old_text": "one",
-                        "new_text": "ONE",
-                        "expected_hash": content_hash(original)
-                    },
-                    {
-                        "kind": "replace",
-                        "path": "value.txt",
-                        "old_text": "three",
-                        "new_text": "THREE",
-                        "expected_hash": content_hash(original)
-                    }
-                ]
-            }),
-        )
+        .code_edit(&json!({
+            "changes": [
+                {
+                    "kind": "replace",
+                    "path": "value.txt",
+                    "old_text": "one",
+                    "new_text": "ONE",
+                    "expected_hash": content_hash(original)
+                },
+                {
+                    "kind": "replace",
+                    "path": "value.txt",
+                    "old_text": "three",
+                    "new_text": "THREE",
+                    "expected_hash": content_hash(original)
+                }
+            ]
+        }))
         .await
         .unwrap();
 
@@ -2317,57 +1978,4 @@ async fn same_file_multi_change_accumulates_on_the_in_progress_plan() {
         fs::read_to_string(root.path().join("value.txt")).unwrap(),
         "ONE\ntwo\nTHREE\n"
     );
-}
-
-#[tokio::test]
-async fn deprecated_rollback_flag_does_not_cancel_or_revert_validation() {
-    let root = tempdir().unwrap();
-    let original = "fn value() -> i32 { 1 }\n";
-    fs::write(root.path().join("value.rs"), original).unwrap();
-    let actor = test_actor_with_budget(root.path(), 20);
-
-    let result = actor
-        .code_edit(
-            "test-session",
-            &json!({
-                "changes": [{
-                    "kind": "replace",
-                    "path": "value.rs",
-                    "old_text": "{ 1 }",
-                    "new_text": "{ 2 }",
-                    "expected_hash": content_hash(original)
-                }],
-                "validate": ["echo checking; sleep 0.2"],
-                "rollback_on_failure": true
-            }),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(result["applied"], true);
-    assert_eq!(result["rolled_back"], false);
-    assert_eq!(result["validation_failed"], false);
-    assert_eq!(result["validation_pending"], true);
-    assert_eq!(result["validation_status"], "pending");
-    assert_eq!(
-        fs::read_to_string(root.path().join("value.rs")).unwrap(),
-        "fn value() -> i32 { 2 }\n"
-    );
-
-    let run_id = result["validation_run_id"].as_str().unwrap();
-    let mut status = actor
-        .bash
-        .status_for_session("test-session", run_id)
-        .unwrap();
-    for _ in 0..100 {
-        if status["ended_at"].is_string() {
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-        status = actor
-            .bash
-            .status_for_session("test-session", run_id)
-            .unwrap();
-    }
-    assert_eq!(status["status"], "succeeded");
 }

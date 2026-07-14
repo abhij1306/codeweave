@@ -1,65 +1,105 @@
 use crate::contracts;
 use crate::intelligence::IntelligenceService;
-use crate::model::{required_str, AppError, AppResult, DaemonConfig, WorkspaceConfig};
-use crate::security::{canonical_root, validate_relative};
-use crate::workspace::WorkspaceActor;
+use crate::model::{AppError, AppResult, DaemonConfig, WorkspaceConfig};
+use crate::repository::CliGitBackend;
+use crate::security::canonical_root;
+use crate::workspace::Workspace;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, VecDeque};
-use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-const MAX_LATENCY_SAMPLES: usize = 128;
+/// Adapt each strict public tool to the shared internal engines.
+pub fn prepare_tool_request(method: &str, input: Value) -> AppResult<Value> {
+    crate::tools::validate_input_fields(method, &input)?;
+    let mut params = input
+        .as_object()
+        .cloned()
+        .ok_or_else(|| AppError::invalid("tool input must be an object"))?;
 
-/// Opaque per-request attribution token. It no longer routes to a workspace —
-/// there is exactly one repository for the process lifetime — but it still
-/// scopes Bash runs and journal/`changes` attribution so a stateful HTTP
-/// deployment keeps per-chat isolation for those concerns.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SessionKey(String);
-
-impl SessionKey {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    let mutation = match method {
+        "code_write" => Some((
+            "create",
+            &["path", "content", "overwrite", "expected_hash"][..],
+        )),
+        "code_replace" => Some((
+            "replace",
+            &[
+                "path",
+                "old_text",
+                "new_text",
+                "expected_replacements",
+                "expected_hash",
+                "handle",
+            ][..],
+        )),
+        "code_replace_range" => Some(("replace_range", &["path", "handle", "new_text"][..])),
+        "code_insert" => Some((
+            "insert",
+            &[
+                "path",
+                "content",
+                "anchor_symbol",
+                "position",
+                "expected_hash",
+            ][..],
+        )),
+        "code_delete" => Some(("delete", &["path", "expected_hash"][..])),
+        "code_rename" => Some(("rename", &["path", "to", "expected_hash"][..])),
+        _ => None,
+    };
+    if let Some((kind, fields)) = mutation {
+        let mut change = serde_json::Map::new();
+        change.insert("kind".into(), Value::String(kind.into()));
+        for field in fields {
+            if let Some(value) = params.remove(*field) {
+                change.insert((*field).into(), value);
+            }
+        }
+        if method == "code_write" && !change.contains_key("overwrite") {
+            change.insert("overwrite".into(), Value::Bool(true));
+        }
+        params.insert("changes".into(), Value::Array(vec![Value::Object(change)]));
     }
-
-    pub fn stateless() -> Self {
-        Self::new("stateless")
+    if method == "code_preview" {
+        params.insert("preview".into(), Value::Bool(true));
     }
-
-    pub fn stdio() -> Self {
-        Self::new("stdio")
+    let git_action = method.strip_prefix("git_").and_then(|name| match name {
+        "status" | "diff" | "log" | "show" | "blame" | "preflight" | "stage" | "commit"
+        | "restore" | "push" => Some(name),
+        _ => None,
+    });
+    if let Some(action) = git_action {
+        params.insert("action".into(), Value::String(action.into()));
     }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn is_stateless(&self) -> bool {
-        self.0 == "stateless"
-    }
+    Ok(Value::Object(params))
 }
 
-impl Default for SessionKey {
-    fn default() -> Self {
-        Self::stateless()
-    }
-}
-
-/// Single-repository manager. Holds exactly one `WorkspaceActor`, built eagerly
+/// Single-repository manager. Holds exactly one `Workspace`, built eagerly
 /// at `initialize` from `workspace.path`, and serves it to every request.
-#[derive(Default)]
-pub struct WorkspaceManager {
+pub struct Application {
+    instance_id: Arc<str>,
     config: RwLock<Option<DaemonConfig>>,
-    actor: RwLock<Option<Arc<WorkspaceActor>>>,
+    actor: RwLock<Option<Arc<Workspace>>>,
     intelligence: RwLock<Option<Arc<IntelligenceService>>>,
-    latency: Mutex<HashMap<String, VecDeque<u128>>>,
     lifecycle: Mutex<()>,
     operation_gate: tokio::sync::RwLock<()>,
+}
+
+impl Default for Application {
+    fn default() -> Self {
+        Self {
+            instance_id: Arc::from(uuid::Uuid::new_v4().simple().to_string()),
+            config: RwLock::new(None),
+            actor: RwLock::new(None),
+            intelligence: RwLock::new(None),
+            lifecycle: Mutex::new(()),
+            operation_gate: tokio::sync::RwLock::new(()),
+        }
+    }
 }
 
 async fn run_blocking<F>(operation: F) -> AppResult<Value>
@@ -69,93 +109,6 @@ where
     tokio::task::spawn_blocking(operation)
         .await
         .map_err(AppError::internal)?
-}
-
-fn validate_skill_name(name: &str) -> AppResult<()> {
-    if name.is_empty()
-        || name.contains('\0')
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains(':')
-        || name.ends_with('.')
-        || name.ends_with(' ')
-    {
-        return Err(AppError::invalid("Invalid skill name"));
-    }
-
-    let path = validate_relative(name)?;
-    let mut components = path.components();
-    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-        return Err(AppError::invalid("Invalid skill name"));
-    }
-
-    let base = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
-    let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || base.strip_prefix("COM").is_some_and(|suffix| {
-            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-        })
-        || base.strip_prefix("LPT").is_some_and(|suffix| {
-            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-        });
-    if reserved {
-        return Err(AppError::invalid("Invalid skill name"));
-    }
-    Ok(())
-}
-
-fn reject_legacy_execution_config(config: &Value) -> AppResult<()> {
-    let mut keys = Vec::new();
-    if config.get("tasks").is_some() {
-        keys.push("tasks");
-    }
-    if let Some(policy) = config.get("policy").and_then(Value::as_object) {
-        for key in [
-            "allowedCommands",
-            "allowed_commands",
-            "shellEnabled",
-            "shell_enabled",
-            "maxTaskOutputChars",
-            "max_task_output_chars",
-            "taskRetentionHours",
-            "task_retention_hours",
-        ] {
-            if policy.contains_key(key) {
-                keys.push(key);
-            }
-        }
-    }
-    if keys.is_empty() {
-        return Ok(());
-    }
-    Err(AppError::details(
-        "LEGACY_EXECUTION_CONFIG",
-        "Task profile execution configuration is no longer supported; migrate to policy.bash",
-        json!({"legacy_keys": keys, "migration_target": "policy.bash"}),
-    ))
-}
-
-/// Reject removed multi-workspace config keys with an actionable message instead
-/// of silently ignoring them (serde would drop unknown fields otherwise).
-fn reject_legacy_workspace_config(config: &Value) -> AppResult<()> {
-    let mut keys = Vec::new();
-    if config.get("workspaces").is_some() {
-        keys.push("workspaces");
-    }
-    if let Some(workspace) = config.get("workspace").and_then(Value::as_object) {
-        for key in ["defaultPath", "lockToDefault", "allowedRoots"] {
-            if workspace.contains_key(key) {
-                keys.push(key);
-            }
-        }
-    }
-    if keys.is_empty() {
-        return Ok(());
-    }
-    Err(AppError::details(
-        "LEGACY_WORKSPACE_CONFIG",
-        "Multi-workspace configuration was removed; configure exactly one repository via workspace.path",
-        json!({"removed_keys": keys, "expected": {"workspace": {"path": "C:/absolute/path/to/repo"}}}),
-    ))
 }
 
 /// Derive the actor's construction input from the single configured repository.
@@ -187,33 +140,22 @@ fn single_repo_config(config: &DaemonConfig) -> AppResult<WorkspaceConfig> {
     })
 }
 
-impl WorkspaceManager {
-    pub async fn dispatch(
-        self: &Arc<Self>,
-        session: SessionKey,
-        method: &str,
-        params: &Value,
-    ) -> AppResult<Value> {
+impl Application {
+    pub fn instance_id(&self) -> Arc<str> {
+        Arc::clone(&self.instance_id)
+    }
+
+    pub async fn dispatch(self: &Arc<Self>, method: &str, params: &Value) -> AppResult<Value> {
         if method == "initialize" {
             let _operation = self.operation_gate.write().await;
-            self.dispatch_inner(&session, method, params).await
+            self.dispatch_inner(method, params).await
         } else {
             let _operation = self.operation_gate.read().await;
-            self.dispatch_inner(&session, method, params).await
+            self.dispatch_inner(method, params).await
         }
     }
 
-    pub fn close_session(&self, _session: &SessionKey) {
-        // Single-repo model: sessions no longer bind to a workspace and the sole
-        // actor lives for the process lifetime, so there is nothing to evict.
-    }
-
-    async fn dispatch_inner(
-        self: &Arc<Self>,
-        session: &SessionKey,
-        method: &str,
-        params: &Value,
-    ) -> AppResult<Value> {
+    async fn dispatch_inner(self: &Arc<Self>, method: &str, params: &Value) -> AppResult<Value> {
         let started = Instant::now();
         let mut result = match method {
             "initialize" => {
@@ -222,38 +164,16 @@ impl WorkspaceManager {
                 run_blocking(move || manager.initialize(&params)).await
             }
             "health" => self.health(),
-            "shutdown" => {
-                self.close_session(session);
-                Ok(json!({"ok": true}))
-            }
+            "shutdown" => Ok(json!({"ok": true})),
             "workspace" => {
                 let manager = Arc::clone(self);
-                let session = session.clone();
                 let params = params.clone();
-                run_blocking(move || manager.workspace(&session, &params)).await
+                run_blocking(move || manager.workspace(&params)).await
             }
             "code_retrieve" => {
                 let actor = self.actor()?;
                 let params = params.clone();
-                let session_id = session.as_str().to_owned();
-                run_blocking(move || actor.code_retrieve_for_session(&session_id, &params)).await
-            }
-            "code_capabilities" => {
-                let actor = self.actor()?;
-                let intelligence = self.intelligence.read().clone();
-                run_blocking(move || {
-                    let mut result = actor.code_capabilities()?;
-                    if let Some(object) = result.as_object_mut() {
-                        object.insert(
-                            "intelligence".to_owned(),
-                            intelligence
-                                .map(|service| service.capabilities())
-                                .unwrap_or(Value::Null),
-                        );
-                    }
-                    Ok(result)
-                })
-                .await
+                run_blocking(move || actor.code_retrieve(&params)).await
             }
             "code_intelligence" => {
                 let actor = self.actor()?;
@@ -280,7 +200,6 @@ impl WorkspaceManager {
                         .unwrap_or(Value::Null);
                     let mut preview = actor
                         .code_edit(
-                            session.as_str(),
                             &json!({"preview":true,"changes":changes,"snapshot_id":snapshot}),
                         )
                         .await?;
@@ -301,7 +220,7 @@ impl WorkspaceManager {
                         prepared["snapshot_id"] = snapshot.clone();
                     }
                 }
-                actor.code_edit(session.as_str(), &prepared).await
+                actor.code_edit(&prepared).await
             }
             "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame" | "git_preflight"
             | "git_stage" | "git_commit" | "git_restore" | "git_push" => {
@@ -311,7 +230,7 @@ impl WorkspaceManager {
             }
             "bash" | "bash_status" | "bash_output" | "bash_cancel" => {
                 let prepared = contracts::normalize_bash_request(method, params)?;
-                self.actor()?.run(session.as_str(), &prepared).await
+                self.actor()?.run(&prepared).await
             }
             _ => Err(AppError::details(
                 "METHOD_NOT_FOUND",
@@ -320,30 +239,28 @@ impl WorkspaceManager {
             )),
         }?;
         let elapsed_ms = started.elapsed().as_millis();
-        self.record_latency(method, elapsed_ms);
         add_operation_elapsed(&mut result, elapsed_ms);
         if method == "workspace" {
-            add_latency_metrics(&mut result, self.latency_metrics());
+            if let Some(object) = result.as_object_mut() {
+                object.insert("instance_id".to_owned(), json!(self.instance_id.as_ref()));
+            }
         }
         Ok(result)
     }
 
     /// Build the single repository actor eagerly (index scan + file watcher start
-    /// happen inside `WorkspaceActor::open`) and pre-probe Bash so the first
+    /// happen inside `Workspace::open`) and pre-probe Bash so the first
     /// validated edit does not pay the discovery cost inline.
     fn initialize(&self, params: &Value) -> AppResult<Value> {
-        reject_legacy_execution_config(params)?;
-        reject_legacy_workspace_config(params)?;
-        let config: DaemonConfig = serde_json::from_value(params.clone())?;
-        if config.skills.enabled && !config.skills.explicit_only {
-            return Err(AppError::invalid(
-                "skills.explicitOnly must remain true; automatic skill invocation is not supported",
-            ));
+        let config = crate::model::parse_daemon_config(params)?;
+        if config.config_version != 2 {
+            return Err(AppError::invalid("configVersion must be 2"));
         }
 
         let repo = single_repo_config(&config)?;
+        CliGitBackend::require_worktree(Path::new(&repo.path))?;
         let open_started = Instant::now();
-        let actor = Arc::new(WorkspaceActor::open(
+        let actor = Arc::new(Workspace::open(
             &repo,
             config.policy.clone(),
             PathBuf::from(config.cache_root.clone()),
@@ -358,14 +275,14 @@ impl WorkspaceManager {
         let open_ms = open_started.elapsed().as_millis();
 
         let bash_probe_started = Instant::now();
-        let bash_available = actor.probe_bash().is_ok();
+        actor.probe_bash()?;
+        let bash_available = true;
         let bash_probe_ms = bash_probe_started.elapsed().as_millis();
 
         let _lifecycle = self.lifecycle.lock();
         *self.config.write() = Some(config);
         *self.actor.write() = Some(actor.clone());
         *self.intelligence.write() = Some(intelligence);
-        self.latency.lock().clear();
 
         tracing::info!(
             workspace = %repo.path,
@@ -379,6 +296,7 @@ impl WorkspaceManager {
         Ok(json!({
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
+            "instance_id": self.instance_id.as_ref(),
             "workspace": {"id": repo.id, "name": repo.name, "path": repo.path},
             "index_ready": true,
             "file_count": actor.index_file_count(),
@@ -393,15 +311,15 @@ impl WorkspaceManager {
         Ok(json!({
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
+            "instance_id": self.instance_id.as_ref(),
             "initialized": config.is_some(),
             "index_ready": actor.is_some(),
             "file_count": actor.as_ref().map(|a| a.index_file_count()),
             "last_reconcile_ms_ago": actor.as_ref().map(|a| a.last_reconcile_elapsed_ms()),
-            "latency_metrics": self.latency_metrics(),
         }))
     }
 
-    fn workspace(&self, session: &SessionKey, params: &Value) -> AppResult<Value> {
+    fn workspace(&self, params: &Value) -> AppResult<Value> {
         match params
             .get("action")
             .and_then(Value::as_str)
@@ -416,7 +334,7 @@ impl WorkspaceManager {
                 {
                     actor.summary_ids()
                 } else {
-                    actor.summary(session.as_str(), false)
+                    actor.summary()
                 }
             }
             "refresh" => self.actor()?.refresh(
@@ -424,13 +342,9 @@ impl WorkspaceManager {
                     .get("force")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
-                session.as_str(),
-                false,
             ),
-            "changes" => self.actor()?.changes(session.as_str(), params),
+            "changes" => self.actor()?.changes(params),
             "diagnostics" => self.actor()?.diagnostics(),
-            "skills" => self.list_skills(),
-            "skill" => self.read_skill(params),
             action => Err(AppError::details(
                 "INVALID_WORKSPACE_ACTION",
                 "Unknown workspace action",
@@ -439,119 +353,13 @@ impl WorkspaceManager {
         }
     }
 
-    fn actor(&self) -> AppResult<Arc<WorkspaceActor>> {
+    fn actor(&self) -> AppResult<Arc<Workspace>> {
         self.actor.read().clone().ok_or_else(|| {
             AppError::new(
                 "NOT_INITIALIZED",
                 "Daemon has not been initialized with a repository",
             )
         })
-    }
-
-    fn record_latency(&self, method: &str, elapsed_ms: u128) {
-        let mut latency = self.latency.lock();
-        let samples = latency.entry(method.to_owned()).or_default();
-        samples.push_back(elapsed_ms);
-        while samples.len() > MAX_LATENCY_SAMPLES {
-            samples.pop_front();
-        }
-    }
-
-    fn latency_metrics(&self) -> Value {
-        let latency = self.latency.lock();
-        let mut methods = serde_json::Map::new();
-        for (method, samples) in latency.iter() {
-            if samples.is_empty() {
-                continue;
-            }
-            let mut sorted: Vec<u128> = samples.iter().copied().collect();
-            sorted.sort_unstable();
-            let percentile = |percent: usize| -> u128 {
-                let index = (sorted.len().saturating_sub(1) * percent) / 100;
-                sorted[index]
-            };
-            methods.insert(
-                method.clone(),
-                json!({
-                    "count": samples.len(),
-                    "p50_ms": percentile(50),
-                    "p90_ms": percentile(90),
-                    "max_ms": *sorted.last().unwrap_or(&0),
-                }),
-            );
-        }
-        Value::Object(methods)
-    }
-
-    fn list_skills(&self) -> AppResult<Value> {
-        let config = self.config()?;
-        if !config.skills.enabled {
-            return Err(AppError::new(
-                "SKILLS_DISABLED",
-                "Skills are disabled in configuration",
-            ));
-        }
-        let mut skills = Vec::new();
-        for root in &config.skills.roots {
-            let Ok(entries) = fs::read_dir(root) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path().join("SKILL.md");
-                if !path.is_file() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let description = fs::read_to_string(&path).ok().and_then(|text| {
-                    text.lines().find_map(|line| {
-                        line.strip_prefix("description:")
-                            .map(str::trim)
-                            .map(str::to_owned)
-                    })
-                });
-                skills.push(json!({"name": name, "description": description, "path": path}));
-            }
-        }
-        skills.sort_by(|a, b| {
-            a.get("name")
-                .and_then(Value::as_str)
-                .cmp(&b.get("name").and_then(Value::as_str))
-        });
-        Ok(json!({"explicit_only": true, "skills": skills}))
-    }
-
-    fn read_skill(&self, params: &Value) -> AppResult<Value> {
-        let config = self.config()?;
-        if !config.skills.enabled {
-            return Err(AppError::new(
-                "SKILLS_DISABLED",
-                "Skills are disabled in configuration",
-            ));
-        }
-        let name = required_str(params, "skill_name")?;
-        validate_skill_name(name)?;
-        for root in &config.skills.roots {
-            let path = Path::new(root).join(name).join("SKILL.md");
-            if path.is_file() {
-                return Ok(json!({
-                    "name": name,
-                    "path": path,
-                    "content": fs::read_to_string(path)?
-                }));
-            }
-        }
-        Err(AppError::details(
-            "SKILL_NOT_FOUND",
-            "Skill was not found",
-            json!({"skill_name": name}),
-        ))
-    }
-
-    fn config(&self) -> AppResult<DaemonConfig> {
-        self.config
-            .read()
-            .clone()
-            .ok_or_else(|| AppError::new("NOT_INITIALIZED", "Daemon has not been initialized"))
     }
 }
 
@@ -561,28 +369,20 @@ fn add_operation_elapsed(value: &mut Value, elapsed_ms: u128) {
     }
 }
 
-fn add_latency_metrics(value: &mut Value, metrics: Value) {
-    if let Some(object) = value.as_object_mut() {
-        object.insert("latency_metrics".to_owned(), metrics);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BashConfig, PolicyConfig, SkillsConfig, WorkspaceSettings};
+    use crate::model::{BashConfig, PolicyConfig, WorkspaceSettings};
     use crate::test_bash_executable;
     use tempfile::tempdir;
 
     fn test_bash_config() -> BashConfig {
         BashConfig {
-            enabled: true,
             executable: test_bash_executable(),
             default_timeout_ms: 120_000,
             foreground_budget_ms: 20_000,
             max_timeout_ms: 300_000,
             max_output_chars: 30_000,
-            retention_hours: 1,
         }
     }
 
@@ -591,13 +391,19 @@ mod tests {
         cache: &std::path::Path,
         max_file_bytes: usize,
     ) -> Value {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .expect("git must be available for tests");
+        assert!(status.success());
         serde_json::to_value(DaemonConfig {
+            config_version: 2,
             workspace: WorkspaceSettings {
                 path: root.to_string_lossy().into_owned(),
                 artifact_paths: Vec::new(),
                 exclude_paths: Vec::new(),
             },
-            skills: SkillsConfig::default(),
             intelligence: crate::model::IntelligenceSettings::default(),
             policy: PolicyConfig {
                 max_file_bytes,
@@ -619,7 +425,7 @@ mod tests {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
+        let manager = Application::default();
 
         let result = manager
             .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
@@ -644,10 +450,26 @@ mod tests {
         let mut config = daemon_config(cache.path(), cache.path(), 1_000_000);
         config["workspace"]["path"] = json!("");
 
-        let error = WorkspaceManager::default().initialize(&config).unwrap_err();
+        let error = Application::default().initialize(&config).unwrap_err();
 
         assert_eq!(error.0.code, "INVALID_ARGUMENT");
         assert!(error.0.message.contains("workspace.path"));
+    }
+
+    #[test]
+    fn initialize_requires_exactly_config_version_two() {
+        let root = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let mut config = daemon_config(root.path(), cache.path(), 1_000_000);
+        config["configVersion"] = json!(1);
+        let error = Application::default().initialize(&config).unwrap_err();
+        assert_eq!(error.0.code, "INVALID_ARGUMENT");
+        assert!(error.0.message.contains("configVersion must be 2"));
+
+        config.as_object_mut().unwrap().remove("configVersion");
+        let missing = Application::default().initialize(&config).unwrap_err();
+        assert_eq!(missing.0.code, "INVALID_CONFIG");
+        assert!(missing.0.details.unwrap()["path"].is_string());
     }
 
     #[test]
@@ -656,13 +478,13 @@ mod tests {
         let mut config = daemon_config(cache.path(), cache.path(), 1_000_000);
         config["workspace"]["path"] = json!(cache.path().join("does-not-exist"));
 
-        let error = WorkspaceManager::default().initialize(&config).unwrap_err();
+        let error = Application::default().initialize(&config).unwrap_err();
 
         assert_eq!(error.0.code, "WORKSPACE_NOT_FOUND");
     }
 
     #[test]
-    fn initialize_rejects_removed_multi_workspace_keys() {
+    fn initialize_strictly_rejects_unknown_workspace_keys() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
@@ -687,51 +509,43 @@ mod tests {
         ] {
             let mut config = daemon_config(root.path(), cache.path(), 1_000_000);
             mutate(&mut config);
-            let error = WorkspaceManager::default().initialize(&config).unwrap_err();
-            assert_eq!(error.0.code, "LEGACY_WORKSPACE_CONFIG", "{expected_key}");
-            let removed = error.0.details.as_ref().unwrap()["removed_keys"]
-                .as_array()
-                .unwrap();
-            assert!(removed.iter().any(|k| k == expected_key), "{expected_key}");
+            let error = Application::default().initialize(&config).unwrap_err();
+            assert_eq!(error.0.code, "INVALID_CONFIG", "{expected_key}");
+            assert!(error.0.details.as_ref().unwrap()["path"].is_string());
+            assert!(error.0.message.contains(expected_key), "{expected_key}");
         }
     }
 
     #[test]
-    fn initialize_accepts_bash_policy_and_rejects_legacy_execution_keys() {
+    fn initialize_strictly_rejects_unknown_execution_keys() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
         let valid = daemon_config(root.path(), cache.path(), 1_000_000);
-        WorkspaceManager::default().initialize(&valid).unwrap();
+        Application::default().initialize(&valid).unwrap();
 
-        for (key, value) in [
-            ("allowedCommands", json!(["cargo"])),
-            ("shellEnabled", json!(false)),
-            ("maxTaskOutputChars", json!(30_000)),
-            ("taskRetentionHours", json!(1)),
-        ] {
-            let mut legacy = valid.clone();
-            legacy["policy"][key] = value;
-            let error = WorkspaceManager::default().initialize(&legacy).unwrap_err();
-            assert_eq!(error.0.code, "LEGACY_EXECUTION_CONFIG", "{key}");
-            assert!(error.0.message.contains("policy.bash"));
-        }
+        let key = "unexpectedPolicyField";
+        let mut invalid = valid.clone();
+        invalid["policy"][key] = json!(true);
+        let error = Application::default().initialize(&invalid).unwrap_err();
+        assert_eq!(error.0.code, "INVALID_CONFIG");
+        assert!(error.0.message.contains(key));
 
-        let mut legacy_tasks = valid;
-        legacy_tasks["tasks"] = json!({});
-        let error = WorkspaceManager::default()
-            .initialize(&legacy_tasks)
+        let mut invalid_root = valid;
+        invalid_root["unexpectedRootField"] = json!({});
+        let error = Application::default()
+            .initialize(&invalid_root)
             .unwrap_err();
-        assert_eq!(error.0.code, "LEGACY_EXECUTION_CONFIG");
-        assert!(error.0.message.contains("policy.bash"));
+        assert_eq!(error.0.code, "INVALID_CONFIG");
+        assert!(error.0.message.contains("unexpectedRootField"));
     }
 
     #[test]
-    fn code_tools_share_the_single_actor_across_sessions() {
+    fn code_tools_share_the_single_actor_across_clients() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
+        let manager = Application::default();
         manager
             .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
             .unwrap();
@@ -747,7 +561,7 @@ mod tests {
 
     #[test]
     fn code_tools_before_initialize_report_not_initialized() {
-        let manager = WorkspaceManager::default();
+        let manager = Application::default();
         let Err(error) = manager.actor() else {
             panic!("actor() must fail before initialize");
         };
@@ -759,7 +573,7 @@ mod tests {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
+        let manager = Application::default();
 
         manager
             .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
@@ -779,16 +593,13 @@ mod tests {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
+        let manager = Application::default();
         manager
             .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
             .unwrap();
 
         let summary = manager
-            .workspace(
-                &SessionKey::stdio(),
-                &json!({"action": "summary", "_summary_ids": true}),
-            )
+            .workspace(&json!({"action": "summary", "_summary_ids": true}))
             .unwrap();
 
         assert!(summary.get("workspace_id").is_some());
@@ -799,82 +610,58 @@ mod tests {
     }
 
     #[test]
-    fn workspace_open_action_is_no_longer_supported() {
+    fn workspace_rejects_unknown_actions() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = WorkspaceManager::default();
+        let manager = Application::default();
         manager
             .initialize(&daemon_config(root.path(), cache.path(), 1_000_000))
             .unwrap();
 
         let error = manager
-            .workspace(&SessionKey::stdio(), &json!({"action": "open"}))
+            .workspace(&json!({"action": "unknown_action"}))
             .unwrap_err();
         assert_eq!(error.0.code, "INVALID_WORKSPACE_ACTION");
     }
 
     #[tokio::test]
-    async fn health_and_workspace_summary_expose_latency_metrics() {
+    async fn health_and_workspace_summary_expose_shared_instance() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = Arc::new(WorkspaceManager::default());
+        let manager = Arc::new(Application::default());
         let config = daemon_config(root.path(), cache.path(), 1_000_000);
-        manager
-            .dispatch(SessionKey::stdio(), "initialize", &config)
-            .await
-            .unwrap();
+        manager.dispatch("initialize", &config).await.unwrap();
 
         let summary = manager
-            .dispatch(
-                SessionKey::stdio(),
-                "workspace",
-                &json!({"action": "summary"}),
-            )
+            .dispatch("workspace", &json!({"action": "summary"}))
             .await
             .unwrap();
-        let health = manager
-            .dispatch(SessionKey::stdio(), "health", &json!({}))
-            .await
-            .unwrap();
+        let health = manager.dispatch("health", &json!({})).await.unwrap();
 
-        assert!(summary["latency_metrics"]["workspace"]["p50_ms"].is_number());
-        assert!(health["latency_metrics"]["workspace"]["p90_ms"].is_number());
+        assert_eq!(summary["instance_id"], health["instance_id"]);
         assert_eq!(health["index_ready"], true);
         assert!(health["file_count"].as_u64().unwrap() >= 1);
     }
 
     #[tokio::test]
-    async fn initialize_resets_previous_latency_samples() {
+    async fn reinitialize_preserves_process_instance_id() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = Arc::new(WorkspaceManager::default());
+        let manager = Arc::new(Application::default());
         let config = daemon_config(root.path(), cache.path(), 1_000_000);
+        manager.dispatch("initialize", &config).await.unwrap();
         manager
-            .dispatch(SessionKey::stdio(), "initialize", &config)
+            .dispatch("workspace", &json!({"action": "summary"}))
             .await
             .unwrap();
-        manager
-            .dispatch(
-                SessionKey::stdio(),
-                "workspace",
-                &json!({"action": "summary"}),
-            )
-            .await
-            .unwrap();
-        manager
-            .dispatch(SessionKey::stdio(), "initialize", &config)
-            .await
-            .unwrap();
+        manager.dispatch("initialize", &config).await.unwrap();
 
-        let health = manager
-            .dispatch(SessionKey::stdio(), "health", &json!({}))
-            .await
-            .unwrap();
+        let health = manager.dispatch("health", &json!({})).await.unwrap();
 
-        assert!(health["latency_metrics"].get("workspace").is_none());
+        assert_eq!(health["instance_id"], manager.instance_id().as_ref());
     }
 
     #[tokio::test]
@@ -882,57 +669,36 @@ mod tests {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = Arc::new(WorkspaceManager::default());
+        let manager = Arc::new(Application::default());
         let config = daemon_config(root.path(), cache.path(), 1_000_000);
-        manager
-            .dispatch(SessionKey::stdio(), "initialize", &config)
-            .await
-            .unwrap();
+        manager.dispatch("initialize", &config).await.unwrap();
 
         let raw_command = manager
-            .dispatch(
-                SessionKey::stdio(),
-                "bash",
-                &json!({"command": ["not-a-string"]}),
-            )
+            .dispatch("bash", &json!({"command": ["not-a-string"]}))
             .await
             .unwrap_err();
         assert_eq!(raw_command.0.code, "INVALID_BASH_REQUEST");
 
         let spoofed_action = manager
             .dispatch(
-                SessionKey::stdio(),
                 "bash",
                 &json!({"command": "printf test", "action": "cancel"}),
             )
             .await
             .unwrap_err();
         assert_eq!(spoofed_action.0.code, "INVALID_BASH_REQUEST");
-
-        let removed = manager
-            .dispatch(SessionKey::stdio(), "task_run", &json!({"profile": "test"}))
-            .await
-            .unwrap_err();
-        assert_eq!(removed.0.code, "METHOD_NOT_FOUND");
     }
 
     #[tokio::test]
-    async fn bash_run_registry_is_scoped_by_session() {
+    async fn bash_run_registry_is_shared_by_all_clients() {
         let root = tempdir().unwrap();
         let cache = tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
-        let manager = Arc::new(WorkspaceManager::default());
+        let manager = Arc::new(Application::default());
         let config = daemon_config(root.path(), cache.path(), 1_000_000);
-        manager
-            .dispatch(SessionKey::stdio(), "initialize", &config)
-            .await
-            .unwrap();
-        let session_a = SessionKey::new("http:a");
-        let session_b = SessionKey::new("http:b");
-
+        manager.dispatch("initialize", &config).await.unwrap();
         let started = manager
             .dispatch(
-                session_a.clone(),
                 "bash",
                 &json!({"command": sleep_command(), "background": true}),
             )
@@ -940,50 +706,19 @@ mod tests {
             .unwrap();
         let run_id = started["run_id"].as_str().unwrap();
 
-        let retry_from_other_session = manager
+        let concurrent_retry = manager
             .dispatch(
-                session_b.clone(),
                 "bash",
                 &json!({"command": sleep_command(), "background": true}),
             )
             .await
             .unwrap_err();
-        assert_eq!(retry_from_other_session.0.code, "RUN_BUSY");
+        assert_eq!(concurrent_retry.0.code, "RUN_BUSY");
 
-        let cross_session_cancel = manager
-            .dispatch(session_b, "bash_cancel", &json!({"run_id": run_id}))
+        let cross_client_cancel = manager
+            .dispatch("bash_cancel", &json!({"run_id": run_id}))
             .await
-            .unwrap_err();
-        assert_eq!(cross_session_cancel.0.code, "RUN_NOT_FOUND");
-
-        let _ = manager
-            .dispatch(session_a, "bash_cancel", &json!({"run_id": run_id}))
-            .await;
-    }
-
-    #[test]
-    fn skill_names_must_be_single_safe_path_components() {
-        assert!(validate_skill_name("rust-review").is_ok());
-        for invalid in [
-            "",
-            ".",
-            "..",
-            "../escape",
-            "nested/skill",
-            "nested\\skill",
-            "C:",
-            "name:stream",
-            "CON",
-            "nul.txt",
-            "COM1",
-            "LPT9.md",
-            "trailing.",
-            "trailing ",
-        ] {
-            assert!(
-                validate_skill_name(invalid).is_err(),
-                "accepted invalid skill name {invalid:?}"
-            );
-        }
+            .unwrap();
+        assert_eq!(cross_client_cancel["run_id"], run_id);
     }
 }

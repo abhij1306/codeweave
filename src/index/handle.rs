@@ -5,28 +5,26 @@ use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeHandle {
-    #[serde(rename = "v", alias = "version")]
-    pub version: u8,
-    #[serde(rename = "w", alias = "workspace_id")]
+    #[serde(rename = "w")]
     pub workspace_id: String,
-    #[serde(rename = "p", alias = "path")]
+    #[serde(rename = "p")]
     pub path: String,
-    #[serde(rename = "a", alias = "start_line")]
+    #[serde(rename = "a")]
     pub start_line: usize,
-    #[serde(rename = "b", alias = "end_line")]
+    #[serde(rename = "b")]
     pub end_line: usize,
-    #[serde(rename = "h", alias = "content_hash")]
+    #[serde(rename = "h")]
     pub content_hash: String,
 }
 
 pub fn encode_handle(handle: &RangeHandle) -> AppResult<String> {
     let json = serde_json::to_vec(handle)?;
-    Ok(format!("range:v1:{}", URL_SAFE_NO_PAD.encode(json)))
+    Ok(format!("range:{}", URL_SAFE_NO_PAD.encode(json)))
 }
 
 pub fn decode_handle(input: &str) -> AppResult<RangeHandle> {
     let payload = input
-        .strip_prefix("range:v1:")
+        .strip_prefix("range:")
         .ok_or_else(|| AppError::new("INVALID_HANDLE", "Unsupported range handle"))?;
     let bytes = URL_SAFE_NO_PAD
         .decode(payload)

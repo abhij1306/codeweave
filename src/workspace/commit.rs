@@ -1,16 +1,12 @@
 use super::edit::PlannedFile;
+use super::events::{append_events, MutationRecord};
 use super::io_helpers::{atomic_write, remove_if_exists, restore_one};
-use super::journal::{
-    open_journal, rotate_journal_now, trim_journal, MutationRecord, MAX_JOURNAL_BYTES,
-};
-use super::WorkspaceActor;
+use super::Workspace;
 use crate::index::content_hash;
 use crate::model::{AppError, AppResult};
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::fs;
-use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -44,20 +40,19 @@ impl<'a> CommitProgress<'a> {
 #[derive(Default)]
 struct CompensationReport {
     restored_paths: Vec<String>,
-    rollback_failures: Vec<Value>,
-    rollback_refresh_error: Option<Value>,
+    compensation_failures: Vec<Value>,
+    compensation_refresh_error: Option<Value>,
 }
 
 impl CompensationReport {
     fn manual_recovery_required(&self) -> bool {
-        !self.rollback_failures.is_empty()
+        !self.compensation_failures.is_empty()
     }
 }
 
-impl WorkspaceActor {
+impl Workspace {
     pub(super) fn commit_plan(
         &self,
-        session_id: &str,
         plan: &[PlannedFile],
         request_id: &str,
     ) -> AppResult<Vec<MutationRecord>> {
@@ -67,7 +62,6 @@ impl WorkspaceActor {
             .iter()
             .map(|item| MutationRecord {
                 mutation_id: MutationRecord::new_id(),
-                session_id: session_id.to_owned(),
                 path: item.path.clone(),
                 before_hash: item.before.as_ref().map(|value| content_hash(value)),
                 after_hash: item.after.as_ref().map(|value| content_hash(value)),
@@ -102,7 +96,7 @@ impl WorkspaceActor {
                         "failed_path": item.path,
                         "completed_before_failure": progress.completed_paths(),
                         "restored_paths": report.restored_paths,
-                        "rollback_failures": report.rollback_failures,
+                        "compensation_failures": report.compensation_failures,
                         "manual_recovery_required": manual_recovery_required
                     }),
                 ));
@@ -122,9 +116,6 @@ impl WorkspaceActor {
             .map_err(|error| {
                 self.failed_after_apply(&progress, "INDEX_REFRESH_FAILED", error.to_string())
             })?;
-        self.persist_mutations(&records).map_err(|error| {
-            self.failed_after_apply(&progress, "JOURNAL_COMMIT_FAILED", error.to_string())
-        })?;
         self.refresh_repo_status();
         self.generation.store(generation, Ordering::Release);
         self.recompute_snapshot();
@@ -150,9 +141,9 @@ impl WorkspaceActor {
             json!({
                 "completed_before_failure": progress.completed_paths(),
                 "restored_paths": report.restored_paths,
-                "rollback_failures": report.rollback_failures,
+                "compensation_failures": report.compensation_failures,
                 "manual_recovery_required": manual_recovery_required,
-                "rollback_refresh_error": report.rollback_refresh_error
+                "compensation_refresh_error": report.compensation_refresh_error
             }),
         )
     }
@@ -173,7 +164,7 @@ impl WorkspaceActor {
         for item in completed.iter().rev() {
             match restore_one(&self.root, item) {
                 Ok(()) => report.restored_paths.push(item.path.clone()),
-                Err(error) => report.rollback_failures.push(json!({
+                Err(error) => report.compensation_failures.push(json!({
                     "path": item.path,
                     "error": error.to_string()
                 })),
@@ -193,102 +184,17 @@ impl WorkspaceActor {
             ) {
                 self.pending_paths.lock().extend(paths);
                 self.needs_reconcile.store(true, Ordering::Release);
-                report.rollback_refresh_error = Some(json!(error.0));
+                report.compensation_refresh_error = Some(json!(error.0));
             }
         }
         report
     }
 
-    fn persist_mutations(&self, records: &[MutationRecord]) -> AppResult<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        let mut encoded = Vec::new();
-        for record in records {
-            serde_json::to_writer(&mut encoded, record).map_err(|error| {
-                AppError::details(
-                    "JOURNAL_SERIALIZATION_FAILED",
-                    error.to_string(),
-                    json!({"mutation_id": record.mutation_id}),
-                )
-            })?;
-            encoded.push(b'\n');
-        }
-
-        let mut slot = self.journal_file.lock();
-        let mut file = slot
-            .take()
-            .ok_or_else(|| AppError::new("JOURNAL_UNAVAILABLE", "Mutation journal is not open"))?;
-        let current_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-        if current_len > 0 && current_len.saturating_add(encoded.len() as u64) > MAX_JOURNAL_BYTES {
-            if let Err(error) = file.flush() {
-                *slot = Some(file);
-                return Err(AppError::details(
-                    "JOURNAL_FLUSH_FAILED",
-                    error.to_string(),
-                    json!({}),
-                ));
-            }
-            drop(file);
-            if let Err(error) = rotate_journal_now(&self.journal_path) {
-                *slot = open_journal(&self.journal_path).ok();
-                return Err(error);
-            }
-            file = match open_journal(&self.journal_path) {
-                Ok(file) => file,
-                Err(error) => {
-                    let archive = self.journal_path.with_file_name("mutations.previous.jsonl");
-                    if self.journal_path.exists()
-                        || fs::rename(&archive, &self.journal_path).is_ok()
-                    {
-                        *slot = open_journal(&self.journal_path).ok();
-                    }
-                    return Err(AppError::details(
-                        "JOURNAL_OPEN_FAILED",
-                        error.to_string(),
-                        json!({"path": self.journal_path}),
-                    ));
-                }
-            };
-        }
-
-        let original_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-        if let Err(error) = file
-            .seek(SeekFrom::End(0))
-            .and_then(|_| file.write_all(&encoded))
-            .and_then(|_| file.flush())
-        {
-            let recovery_error = file
-                .set_len(original_len)
-                .and_then(|_| file.flush())
-                .err()
-                .map(|recovery| recovery.to_string());
-            *slot = Some(file);
-            return Err(AppError::details(
-                if recovery_error.is_some() {
-                    "JOURNAL_RECOVERY_FAILED"
-                } else {
-                    "JOURNAL_WRITE_FAILED"
-                },
-                error.to_string(),
-                json!({
-                    "original_len": original_len,
-                    "recovery_error": recovery_error
-                }),
-            ));
-        }
-        *slot = Some(file);
-        Ok(())
-    }
-
     fn publish_mutations(&self, records: &[MutationRecord]) {
-        let mut journal = self.mutations.lock();
-        journal.extend(records.iter().cloned());
-        trim_journal(&mut journal);
+        append_events(&mut self.mutations.lock(), records);
     }
 
     pub(super) fn record_mutations(&self, records: &[MutationRecord]) -> AppResult<()> {
-        self.persist_mutations(records)?;
         self.publish_mutations(records);
         Ok(())
     }

@@ -1,6 +1,7 @@
 use super::*;
 use crate::model::BashConfig;
 use crate::test_bash_executable;
+use std::fs;
 use tempfile::tempdir;
 
 fn policy() -> PolicyConfig {
@@ -9,13 +10,11 @@ fn policy() -> PolicyConfig {
         max_context_chars: 50_000,
         max_search_results: 100,
         bash: BashConfig {
-            enabled: true,
             executable: test_bash_executable(),
             default_timeout_ms: 5_000,
             foreground_budget_ms: 4_000,
             max_timeout_ms: 10_000,
             max_output_chars: 30_000,
-            retention_hours: 1,
         },
     }
 }
@@ -27,20 +26,9 @@ fn policy_with_executable(executable: String) -> PolicyConfig {
 }
 
 fn record(cache: &Path, run_id: &str, status: &str, output: &str) -> RunRecord {
-    record_for_session(cache, run_id, "test-session", status, output)
-}
-
-fn record_for_session(
-    cache: &Path,
-    run_id: &str,
-    session_id: &str,
-    status: &str,
-    output: &str,
-) -> RunRecord {
     RunRecord {
         run_id: run_id.to_owned(),
         sequence: 0,
-        session_id: session_id.to_owned(),
         status: status.to_owned(),
         command: "printf test".to_owned(),
         cwd: cache.to_path_buf(),
@@ -48,11 +36,16 @@ fn record_for_session(
         ended_at: Some(Utc::now()),
         exit_code: (status == "succeeded").then_some(0),
         output: output.to_owned(),
+        stdout: output.to_owned(),
+        stderr: String::new(),
+        combined: output.to_owned(),
         output_truncated: false,
-        logs: RunLogPaths::new(cache, run_id),
         pid: None,
         cancel_requested: false,
         job: None,
+        baseline_generation: None,
+        baseline_dirty: HashSet::new(),
+        frozen_changes: None,
     }
 }
 
@@ -72,9 +65,8 @@ async fn explicit_invalid_bash_path_reports_unavailable_before_starting() {
     assert_eq!(readiness.resolved_executable, None);
 
     let error = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "printf test".to_owned(),
                 cwd: None,
@@ -104,25 +96,23 @@ fn non_default_relative_bash_name_fails_closed_after_probe_failure() {
 }
 
 #[test]
-fn trim_runs_notifies_actual_evictions() {
+fn trim_runs_evicts_only_the_oldest_completed_run() {
     let cache = tempdir().unwrap();
     let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
-    let evicted = Arc::new(Mutex::new(Vec::new()));
-    let observed = Arc::clone(&evicted);
-    supervisor.set_eviction_observer(Arc::new(move |run_ids| {
-        observed.lock().extend_from_slice(run_ids);
-    }));
-    let mut expired = record(cache.path(), "expired", "succeeded", "");
-    expired.ended_at = Some(Utc::now() - ChronoDuration::hours(2));
-    supervisor
-        .runs
-        .lock()
-        .insert("expired".to_owned(), Arc::new(Mutex::new(expired)));
+    for index in 0..=MAX_RETAINED_RUNS {
+        let run_id = format!("run-{index:03}");
+        let mut completed = record(cache.path(), &run_id, "succeeded", "");
+        completed.ended_at = Some(Utc::now() + chrono::Duration::milliseconds(index as i64));
+        supervisor
+            .runs
+            .lock()
+            .insert(run_id, Arc::new(Mutex::new(completed)));
+    }
 
     supervisor.trim_runs();
 
-    assert_eq!(*evicted.lock(), vec!["expired".to_owned()]);
-    assert!(!supervisor.runs.lock().contains_key("expired"));
+    assert!(!supervisor.runs.lock().contains_key("run-000"));
+    assert_eq!(supervisor.runs.lock().len(), MAX_RETAINED_RUNS);
 }
 
 #[tokio::test]
@@ -132,9 +122,8 @@ async fn cwd_must_exist_inside_workspace() {
     let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
 
     let missing = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "printf test".to_owned(),
                 cwd: Some("missing".to_owned()),
@@ -150,9 +139,8 @@ async fn cwd_must_exist_inside_workspace() {
     ));
 
     let escaped = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "printf test".to_owned(),
                 cwd: Some("../outside".to_owned()),
@@ -171,9 +159,8 @@ async fn timeout_above_policy_maximum_is_rejected() {
     let cache = tempdir().unwrap();
     let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
     let error = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "printf test".to_owned(),
                 cwd: None,
@@ -192,9 +179,8 @@ async fn foreground_commands_capture_stdout_stderr_and_failures() {
     let cache = tempdir().unwrap();
     let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
     let succeeded = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "printf stdout; printf stderr >&2".to_owned(),
                 cwd: None,
@@ -210,9 +196,8 @@ async fn foreground_commands_capture_stdout_stderr_and_failures() {
     assert!(succeeded["output"].as_str().unwrap().contains("stderr"));
 
     let failed = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "printf failed >&2; exit 7".to_owned(),
                 cwd: None,
@@ -227,15 +212,14 @@ async fn foreground_commands_capture_stdout_stderr_and_failures() {
 }
 
 #[tokio::test]
-async fn foreground_warm_shell_preserves_quotes_and_non_utf8_output() {
+async fn foreground_process_preserves_quotes_and_non_utf8_output() {
     let root = tempdir().unwrap();
     let cache = tempdir().unwrap();
     let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
 
     let quoted = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "printf \"first's\"".to_owned(),
                 cwd: None,
@@ -249,9 +233,8 @@ async fn foreground_warm_shell_preserves_quotes_and_non_utf8_output() {
     assert!(quoted["output"].as_str().unwrap().contains("first's"));
 
     let binary = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: r"printf '\377'".to_owned(),
                 cwd: None,
@@ -286,9 +269,8 @@ async fn foreground_wsl_bash_maps_windows_working_directory() {
     wsl_policy.bash.executable = wsl_bash.to_string_lossy().into_owned();
     let supervisor = BashSupervisor::new(cache.path().to_path_buf(), wsl_policy).unwrap();
     let result = supervisor
-        .start_for_session(
+        .start(
             &root,
-            "test-session",
             StartRequest {
                 command: "pwd".to_owned(),
                 cwd: None,
@@ -313,9 +295,8 @@ async fn background_commands_can_be_polled_paged_and_cancelled() {
     let cache = tempdir().unwrap();
     let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
     let started = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "echo started; sleep 30".to_owned(),
                 cwd: None,
@@ -334,7 +315,7 @@ async fn background_commands_can_be_polled_paged_and_cancelled() {
         "queued" | "running"
     ));
     let mut output = supervisor
-        .output_stream_for_session("test-session", run_id, None, Some("combined"))
+        .output_stream(run_id, None, Some("combined"))
         .unwrap();
     for _ in 0..50 {
         if output["output"].as_str().unwrap().contains("started") {
@@ -342,16 +323,11 @@ async fn background_commands_can_be_polled_paged_and_cancelled() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
         output = supervisor
-            .output_stream_for_session("test-session", run_id, None, Some("combined"))
+            .output_stream(run_id, None, Some("combined"))
             .unwrap();
     }
     assert!(output["output"].as_str().unwrap().contains("started"));
-    assert_eq!(
-        supervisor
-            .cancel_for_session("test-session", run_id)
-            .unwrap()["status"],
-        "cancelling"
-    );
+    assert_eq!(supervisor.cancel(run_id).unwrap()["status"], "cancelling");
 
     for _ in 0..50 {
         if supervisor.status(run_id).unwrap()["ended_at"].is_string() {
@@ -368,9 +344,8 @@ async fn queued_command_waits_for_the_active_run() {
     let cache = tempdir().unwrap();
     let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
     let active = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "sleep 1".to_owned(),
                 cwd: None,
@@ -382,9 +357,8 @@ async fn queued_command_waits_for_the_active_run() {
         .unwrap();
     let active_run_id = active["run_id"].as_str().unwrap();
     let queued = supervisor
-        .queue_for_session(
+        .queue(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "printf queued > queued.txt".to_owned(),
                 cwd: None,
@@ -399,9 +373,7 @@ async fn queued_command_waits_for_the_active_run() {
     assert_eq!(queued["status"], "queued");
     assert_eq!(queued["queued"], true);
     assert_eq!(
-        supervisor
-            .active_run_view_for_session("test-session")
-            .unwrap()["run_id"],
+        supervisor.active_run_view().unwrap()["run_id"],
         active_run_id
     );
 
@@ -420,7 +392,7 @@ async fn queued_command_waits_for_the_active_run() {
     );
 }
 #[tokio::test]
-async fn client_abort_keeps_run_alive_and_respawns_warm_shell() {
+async fn client_abort_keeps_the_detached_run_alive() {
     // Simulates ChatGPT aborting the HTTP request: the request future is
     // dropped mid-command. The detached execution task must keep running,
     // the permit must free once it finishes, and the next warm run must be
@@ -438,9 +410,8 @@ async fn client_abort_keeps_run_alive_and_respawns_warm_shell() {
     let bg = supervisor.clone();
     let root_path = root.path().to_path_buf();
     let request_task = tokio::spawn(async move {
-        bg.start_for_session(
+        bg.start(
             &root_path,
-            "test-session",
             StartRequest {
                 command: "echo abandoned; sleep 5".to_owned(),
                 cwd: None,
@@ -454,12 +425,10 @@ async fn client_abort_keeps_run_alive_and_respawns_warm_shell() {
     request_task.abort();
     let _ = request_task.await;
 
-    // The permit is still held by the detached command, so an identical
-    // retry dedupes rather than colliding.
+    // The detached command still owns the only execution slot.
     let retry = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "echo abandoned; sleep 5".to_owned(),
                 cwd: None,
@@ -468,8 +437,8 @@ async fn client_abort_keeps_run_alive_and_respawns_warm_shell() {
             },
         )
         .await
-        .unwrap();
-    assert_eq!(retry["deduplicated"], true);
+        .unwrap_err();
+    assert_eq!(retry.0.code, "RUN_BUSY");
 
     // Wait for the abandoned command to finish and free the permit.
     for _ in 0..100 {
@@ -480,11 +449,10 @@ async fn client_abort_keeps_run_alive_and_respawns_warm_shell() {
     }
     assert_eq!(supervisor.running_count(), 0);
 
-    // The next warm run is clean: only its own output, no leakage.
+    // The next process is clean: only its own output, no leakage.
     let fresh = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "printf fresh-output".to_owned(),
                 cwd: None,
@@ -509,9 +477,8 @@ async fn foreground_budget_auto_promotes_long_command() {
     promote_policy.bash.default_timeout_ms = 10_000;
     let supervisor = BashSupervisor::new(cache.path().to_path_buf(), promote_policy).unwrap();
     let result = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "echo warming; sleep 30".to_owned(),
                 cwd: None,
@@ -525,13 +492,11 @@ async fn foreground_budget_auto_promotes_long_command() {
     assert_eq!(result["detached"], true);
     assert_eq!(result["reason"], "foreground_budget_exceeded");
     let run_id = result["run_id"].as_str().unwrap().to_owned();
-    assert!(supervisor
-        .cancel_for_session("test-session", &run_id)
-        .is_ok());
+    assert!(supervisor.cancel(&run_id).is_ok());
 }
 
 #[tokio::test]
-async fn identical_command_dedupes_to_running_run() {
+async fn identical_command_is_not_deduplicated() {
     let root = tempdir().unwrap();
     let cache = tempdir().unwrap();
     let mut dedupe_policy = policy();
@@ -544,26 +509,22 @@ async fn identical_command_dedupes_to_running_run() {
         background: None,
         timeout_ms: None,
     };
-    let first = supervisor
-        .start_for_session(root.path(), "test-session", request())
-        .await
-        .unwrap();
+    let first = supervisor.start(root.path(), request()).await.unwrap();
     assert_eq!(first["status"], "running");
     let run_id = first["run_id"].as_str().unwrap().to_owned();
 
-    let retry = supervisor
-        .start_for_session(root.path(), "test-session", request())
-        .await
-        .unwrap();
-    assert_eq!(retry["deduplicated"], true);
-    assert_eq!(retry["run_id"], run_id);
+    let retry = supervisor.start(root.path(), request()).await.unwrap_err();
+    assert_eq!(retry.0.code, "RUN_BUSY");
+    assert_eq!(
+        retry.0.details.as_ref().unwrap()["active_run"]["run_id"],
+        run_id
+    );
 
     // A genuinely different command still gets a busy error carrying the
     // active run so the model can poll or cancel.
     let busy = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "echo other".to_owned(),
                 cwd: None,
@@ -576,9 +537,7 @@ async fn identical_command_dedupes_to_running_run() {
     assert_eq!(busy.0.code, "RUN_BUSY");
     let details = busy.0.details.unwrap();
     assert_eq!(details["active_run"]["run_id"], run_id);
-    assert!(supervisor
-        .cancel_for_session("test-session", &run_id)
-        .is_ok());
+    assert!(supervisor.cancel(&run_id).is_ok());
 }
 
 #[tokio::test]
@@ -589,9 +548,8 @@ async fn timeout_retains_partial_output() {
     timeout_policy.bash.default_timeout_ms = 100;
     let supervisor = BashSupervisor::new(cache.path().to_path_buf(), timeout_policy).unwrap();
     let result = supervisor
-        .start_for_session(
+        .start(
             root.path(),
-            "test-session",
             StartRequest {
                 command: "printf partial; sleep 30".to_owned(),
                 cwd: None,
@@ -609,10 +567,9 @@ async fn timeout_retains_partial_output() {
 fn output_action_selects_stdout_and_stderr_streams() {
     let cache = tempdir().unwrap();
     let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
-    let item = record(cache.path(), "streams", "failed", "combined");
-    fs::write(&item.logs.combined, "combined").unwrap();
-    fs::write(&item.logs.stdout, "stdout-only").unwrap();
-    fs::write(&item.logs.stderr, "stderr-only").unwrap();
+    let mut item = record(cache.path(), "streams", "failed", "combined");
+    item.stdout = "stdout-only".to_owned();
+    item.stderr = "stderr-only".to_owned();
     supervisor
         .runs
         .lock()
@@ -620,13 +577,13 @@ fn output_action_selects_stdout_and_stderr_streams() {
 
     assert_eq!(
         supervisor
-            .output_stream_for_session("test-session", "streams", None, Some("stdout"))
+            .output_stream("streams", None, Some("stdout"))
             .unwrap()["output"],
         "stdout-only"
     );
     assert_eq!(
         supervisor
-            .output_stream_for_session("test-session", "streams", None, Some("stderr"))
+            .output_stream("streams", None, Some("stderr"))
             .unwrap()["output"],
         "stderr-only"
     );

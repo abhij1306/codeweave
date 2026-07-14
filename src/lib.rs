@@ -1,24 +1,41 @@
-//! Retrieval-facing library surface.
-//!
-//! The CodeWeave server itself is a binary (`main.rs`) with a private module
-//! tree. This thin library re-exposes only the modules the offline evaluation
-//! harness needs to exercise the *real* retrieval engine — no logic is
-//! duplicated; the same source files back both targets. Keeping it minimal
-//! avoids turning the whole server into a library (the P2 "no reorg" decision).
+//! CodeWeave application library. The binary is a thin composition root; all
+//! repository, protocol, execution, and workspace behavior is compiled once
+//! here and is shared by tests and evaluation code.
 
-#[path = "contracts.rs"]
+pub mod bash;
 pub mod contracts;
-#[path = "index/mod.rs"]
 pub mod index;
-#[path = "model.rs"]
+pub mod intelligence;
+pub mod manager;
 pub mod model;
-#[path = "reference_service.rs"]
+pub mod process_runtime;
 pub mod reference_service;
-#[path = "retrieval.rs"]
+pub mod repository;
 pub mod retrieval;
-#[path = "security.rs"]
 pub mod security;
-#[path = "symbols.rs"]
 pub mod symbols;
-#[path = "tools/mod.rs"]
 pub mod tools;
+pub mod workspace;
+
+#[cfg(test)]
+pub(crate) fn test_bash_executable() -> String {
+    #[cfg(windows)]
+    {
+        for root in [
+            std::env::var_os("ProgramW6432"),
+            std::env::var_os("ProgramFiles"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let candidate = std::path::PathBuf::from(root)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "bash".to_owned()
+}

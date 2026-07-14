@@ -1,4 +1,4 @@
-use super::WorkspaceActor;
+use super::Workspace;
 use crate::bash::StartRequest;
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -10,12 +10,8 @@ pub(super) struct ValidationOutcome {
     pub(super) deferred_run_id: Option<String>,
 }
 
-impl WorkspaceActor {
-    pub(super) async fn run_edit_validation(
-        &self,
-        session_id: &str,
-        commands: &[String],
-    ) -> ValidationOutcome {
+impl Workspace {
+    pub(super) async fn run_edit_validation(&self, commands: &[String]) -> ValidationOutcome {
         let budget_ms = self.policy.bash.foreground_budget_ms;
         let validation_started = Instant::now();
         let mut validation = Vec::new();
@@ -31,7 +27,7 @@ impl WorkspaceActor {
                 let mut deferred = vec![command.clone()];
                 deferred.extend(remaining.map(String::clone));
                 match self
-                    .spawn_pending_validation(session_id, &deferred, &mut validation)
+                    .spawn_pending_validation(&deferred, &mut validation)
                     .await
                 {
                     Some(run_id) => pending_run_id = Some(run_id),
@@ -42,9 +38,8 @@ impl WorkspaceActor {
 
             match self
                 .bash
-                .start_for_session(
+                .start(
                     &self.root,
-                    session_id,
                     StartRequest {
                         command: command.clone(),
                         cwd: None,
@@ -69,11 +64,7 @@ impl WorkspaceActor {
                             let deferred = remaining.map(String::clone).collect::<Vec<_>>();
                             if !deferred.is_empty() {
                                 match self
-                                    .spawn_pending_validation(
-                                        session_id,
-                                        &deferred,
-                                        &mut validation,
-                                    )
+                                    .spawn_pending_validation(&deferred, &mut validation)
                                     .await
                                 {
                                     Some(run_id) => deferred_run_id = Some(run_id),
@@ -116,7 +107,6 @@ impl WorkspaceActor {
     /// that already consumed the single execution slot.
     async fn spawn_pending_validation(
         &self,
-        session_id: &str,
         commands: &[String],
         validation: &mut Vec<Value>,
     ) -> Option<String> {
@@ -127,9 +117,8 @@ impl WorkspaceActor {
             .join(" && ");
         match self
             .bash
-            .queue_for_session(
+            .queue(
                 &self.root,
-                session_id,
                 StartRequest {
                     command: joined.clone(),
                     cwd: None,

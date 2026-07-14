@@ -80,7 +80,7 @@ pub(crate) fn workspace_edit_changes(
             after.replace_range(start..end, &text);
         }
         let relative = workspace_relative_path(&canonical_root, &path)?;
-        let expected_hash = codeweave_rust::index::content_hash(&before);
+        let expected_hash = crate::index::content_hash(&before);
         output.push(json!({
             "kind": "replace",
             "path": relative,
@@ -112,7 +112,7 @@ mod tests {
         assert!(changes[0]["new_text"].as_str().unwrap().contains("bistro"));
         assert_eq!(
             changes[0]["expected_hash"],
-            codeweave_rust::index::content_hash("def café():\n    return 1\n")
+            crate::index::content_hash("def café():\n    return 1\n")
         );
     }
 }

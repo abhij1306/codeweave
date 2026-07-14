@@ -4,10 +4,10 @@ use crate::retrieval::{
     prepare_retrieval_operation, PreparedRetrievalOperation, MAX_RETRIEVAL_OPERATIONS,
 };
 
-impl WorkspaceActor {
+impl Workspace {
     /// Execute explicit repository discovery and read operations in one MCP call.
     /// Each entry is an atomic deterministic operation selected by the caller.
-    pub fn code_retrieve_for_session(&self, session_id: &str, params: &Value) -> AppResult<Value> {
+    pub fn code_retrieve(&self, params: &Value) -> AppResult<Value> {
         let started = Instant::now();
         let operations = params
             .get("operations")
@@ -95,7 +95,7 @@ impl WorkspaceActor {
                 continue;
             };
 
-            match self.execute_retrieval_operation(session_id, kind, operation) {
+            match self.execute_retrieval_operation(kind, operation) {
                 Ok(result) => results.push(json!({
                     "id": id,
                     "operation": kind,
@@ -137,14 +137,13 @@ impl WorkspaceActor {
 
     fn execute_retrieval_operation(
         &self,
-        session_id: &str,
         kind: &str,
         operation: &serde_json::Map<String, Value>,
     ) -> AppResult<Value> {
         match prepare_retrieval_operation(kind, operation)? {
             PreparedRetrievalOperation::Search(params) => self.search_index(&params),
             PreparedRetrievalOperation::Read(read) => {
-                let result = self.read_target(session_id, &read.item, read.max_chars)?;
+                let result = self.read_target(&read.item, read.max_chars)?;
                 if read.compact {
                     Ok(super::fetch::compact_fetch_result(&result))
                 } else {

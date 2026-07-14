@@ -1,12 +1,12 @@
+use super::events::MutationRecord;
 use super::io_helpers::{diff_stat, read_optional, render_diff};
-use super::journal::MutationRecord;
 use super::util::{
     changes_without_independent_preconditions, char_boundary_at_or_before, line_offset,
     line_range_bytes, matching_old_text, normalize_line_endings_for_content,
     preserve_terminal_line_ending, stale_snapshot_for_paths,
 };
 use super::validation::ValidationOutcome;
-use super::WorkspaceActor;
+use super::Workspace;
 use crate::contracts;
 use crate::index::{content_hash, decode_handle, CodeIndex};
 use crate::model::{bool_value, required_str, string_list, usize_value, AppError, AppResult};
@@ -101,8 +101,8 @@ impl DiffView {
     }
 }
 
-impl WorkspaceActor {
-    pub async fn code_edit(self: &Arc<Self>, session_id: &str, params: &Value) -> AppResult<Value> {
+impl Workspace {
+    pub async fn code_edit(self: &Arc<Self>, params: &Value) -> AppResult<Value> {
         let validate = string_list(params, "validate");
         if !validate.is_empty() {
             self.bash.ensure_available()?;
@@ -110,13 +110,11 @@ impl WorkspaceActor {
         let write_guard = self.write_lock.clone().lock_owned().await;
         let actor = Arc::clone(self);
         let params_owned = params.clone();
-        let session_id_owned = session_id.to_owned();
         let prepare_started = Instant::now();
-        let prepared = tokio::task::spawn_blocking(move || {
-            actor.prepare_edit(&session_id_owned, &params_owned, write_guard)
-        })
-        .await
-        .map_err(AppError::internal)??;
+        let prepared =
+            tokio::task::spawn_blocking(move || actor.prepare_edit(&params_owned, write_guard))
+                .await
+                .map_err(AppError::internal)??;
         let prepare_ms = prepare_started.elapsed().as_millis();
 
         let applied = match prepared {
@@ -154,7 +152,7 @@ impl WorkspaceActor {
             failed: validation_failed,
             pending_run_id: validation_pending,
             deferred_run_id: deferred_validation_pending,
-        } = self.run_edit_validation(session_id, &validate).await;
+        } = self.run_edit_validation(&validate).await;
 
         if let Some(run_id) = validation_pending {
             let mut validation_run_ids = vec![run_id.clone()];
@@ -170,7 +168,6 @@ impl WorkspaceActor {
             self.reconcile_pending_async().await?;
             let mut response = json!({
                 "applied": true,
-                "rolled_back": false,
                 "validation_failed": validation_failed,
                 "validation_pending": true,
                 "validation_status": "pending",
@@ -205,7 +202,6 @@ impl WorkspaceActor {
         self.reconcile_pending_async().await?;
         let mut response = json!({
             "applied": true,
-            "rolled_back": false,
             "validation_failed": validation_failed,
             "validation_status": if validation_failed { "failed" } else { "passed" },
             "snapshot_rebased_from": snapshot_rebased_from,
@@ -235,7 +231,6 @@ impl WorkspaceActor {
 
     fn prepare_edit(
         &self,
-        session_id: &str,
         params: &Value,
         write_guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> AppResult<PreparedEdit> {
@@ -327,7 +322,7 @@ impl WorkspaceActor {
         self.recheck_preconditions(&planned)?;
         let request_id = format!("req_{}", Uuid::new_v4().simple());
         let commit_started = Instant::now();
-        let apply_result = self.commit_plan(session_id, &planned, &request_id)?;
+        let apply_result = self.commit_plan(&planned, &request_id)?;
         let commit_ms = commit_started.elapsed().as_millis();
         Ok(PreparedEdit::Applied(AppliedEdit {
             write_guard,

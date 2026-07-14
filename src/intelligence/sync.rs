@@ -1,7 +1,7 @@
 use super::normalize::path_uri;
 use super::protocol::TextDocumentSyncKind;
+use crate::index::content_hash;
 use crate::model::{AppError, AppResult};
-use codeweave_rust::index::content_hash;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;

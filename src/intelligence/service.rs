@@ -2,11 +2,11 @@ use super::normalize::{normalize_locations, normalize_reference_locations};
 use super::sync::DocumentSnapshot;
 use super::worker::{LspPreset, LspWorker, WorkerOperation, WorkerResponse};
 use super::workspace_edit::workspace_edit_changes;
+use crate::index::CodeIndex;
 use crate::model::{AppError, AppResult, IntelligenceSettings};
+use crate::reference_service::{ReferenceService, SemanticReferenceMetadata};
 use crate::security::validate_relative;
 use crate::symbols::{extract_symbols, language_name, parse_has_error};
-use codeweave_rust::index::CodeIndex;
-use codeweave_rust::reference_service::{ReferenceService, SemanticReferenceMetadata};
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::fs;
@@ -415,12 +415,12 @@ fn insert_fallback_reason(response: &mut Value, reason: Option<AppError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::WorkspaceExclusions;
     use crate::intelligence::protocol::{
         PositionEncoding, ServerCapabilities, TextDocumentSyncKind,
     };
     use crate::intelligence::sync::{DocumentSnapshot, SynchronizedDocument};
     use crate::intelligence::worker::WorkerResponse;
-    use codeweave_rust::index::WorkspaceExclusions;
 
     #[test]
     fn semantic_reference_hash_must_match_live_index() {

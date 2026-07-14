@@ -1,13 +1,11 @@
 {
+  "configVersion": 2,
   "server": {
     "host": "127.0.0.1",
     "port": 8813,
     "authMode": "bearer",
     "tokenFile": ".mcp-token",
-    "statefulMode": false,
-    "jsonResponse": true,
     "idleTimeoutMs": 5000,
-    "toolProfile": "full",
     "allowedHosts": [
       "localhost",
       "127.0.0.1",
@@ -29,11 +27,6 @@
       "**/.ruff_cache/",
       "*.log"
     ]
-  },
-  "skills": {
-    "enabled": false,
-    "roots": [],
-    "explicitOnly": true
   },
   "intelligence": {
     "rust": {
@@ -60,13 +53,11 @@
     "maxContextChars": 50000,
     "maxSearchResults": 100,
     "bash": {
-      "enabled": true,
       "executable": "bash",
       "defaultTimeoutMs": 120000,
       "foregroundBudgetMs": 20000,
       "maxTimeoutMs": 300000,
-      "maxOutputChars": 30000,
-      "retentionHours": 1
+      "maxOutputChars": 30000
     }
   }
 }

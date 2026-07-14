@@ -2,20 +2,16 @@ mod execution;
 mod readiness;
 
 use crate::model::{AppError, AppResult, PolicyConfig};
-use crate::process_runtime::{
-    remove_logs, strip_ansi, terminate_process_tree, OutputStream, RunLogPaths, WarmShell,
-    WindowsJob,
-};
+use crate::process_runtime::{strip_ansi, terminate_process_tree, OutputStream, WindowsJob};
 use crate::security::resolve_existing;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use execution::{execute, execute_warm, finalize_run_error};
+use chrono::{DateTime, Utc};
+use execution::{execute, finalize_run_error};
 use parking_lot::Mutex;
 use readiness::resolve_bash;
 pub use readiness::BashReadiness;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -24,9 +20,6 @@ use std::sync::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
-
-pub(crate) type RunCompletionObserver = Arc<dyn Fn(&str, DateTime<Utc>) + Send + Sync>;
-pub(crate) type RunEvictionObserver = Arc<dyn Fn(&[String]) + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BashRunView {
@@ -48,7 +41,6 @@ pub struct BashRunView {
 pub(crate) struct RunRecord {
     run_id: String,
     sequence: u64,
-    session_id: String,
     status: String,
     command: String,
     cwd: PathBuf,
@@ -56,11 +48,16 @@ pub(crate) struct RunRecord {
     ended_at: Option<DateTime<Utc>>,
     exit_code: Option<i32>,
     pub(crate) output: String,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) combined: String,
     pub(crate) output_truncated: bool,
-    pub(crate) logs: RunLogPaths,
     pid: Option<u32>,
     cancel_requested: bool,
     job: Option<Arc<WindowsJob>>,
+    baseline_generation: Option<u64>,
+    baseline_dirty: HashSet<String>,
+    frozen_changes: Option<(u64, HashSet<String>)>,
 }
 
 struct ExecutionGuard {
@@ -108,37 +105,13 @@ impl Drop for ExecutionGuard {
     }
 }
 
-fn cleanup_orphan_logs(log_root: &Path, retention_hours: i64) {
-    let Ok(entries) = fs::read_dir(log_root) else {
-        return;
-    };
-    let max_age = std::time::Duration::from_secs((retention_hours as u64) * 60 * 60);
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_stale = entry
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > max_age);
-        if is_stale {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct BashSupervisor {
     runs: Arc<Mutex<HashMap<String, Arc<Mutex<RunRecord>>>>>,
     next_run_sequence: Arc<AtomicU64>,
     run_permit: Arc<Semaphore>,
-    warm_shell: Arc<tokio::sync::Mutex<Option<WarmShell>>>,
-    cache_root: PathBuf,
     policy: PolicyConfig,
-    retention_hours: i64,
     readiness: BashReadiness,
-    completion_observer: Arc<Mutex<Option<RunCompletionObserver>>>,
-    eviction_observer: Arc<Mutex<Option<RunEvictionObserver>>>,
 }
 
 impl std::fmt::Debug for BashSupervisor {
@@ -146,9 +119,7 @@ impl std::fmt::Debug for BashSupervisor {
         formatter
             .debug_struct("BashSupervisor")
             .field("runs", &self.runs)
-            .field("cache_root", &self.cache_root)
             .field("policy", &self.policy)
-            .field("retention_hours", &self.retention_hours)
             .field("readiness", &self.readiness)
             .finish_non_exhaustive()
     }
@@ -160,10 +131,9 @@ struct ExecutionRequest {
     cwd: PathBuf,
     timeout_ms: u64,
     max_output: usize,
-    completion_observer: Option<RunCompletionObserver>,
 }
 
-const MAX_RETAINED_RUNS: usize = 256;
+const MAX_RETAINED_RUNS: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct StartRequest {
@@ -181,17 +151,7 @@ struct PreparedStartRequest {
 }
 
 impl BashSupervisor {
-    pub fn new(cache_root: PathBuf, policy: PolicyConfig) -> AppResult<Self> {
-        let log_root = cache_root.join("bash-logs");
-        fs::create_dir_all(&log_root)?;
-        let retention_hours = policy.bash.retention_hours;
-        if retention_hours <= 0 {
-            return Err(AppError::details(
-                "INVALID_POLICY",
-                "policy.bash.retentionHours must be greater than zero",
-                json!({"retention_hours": retention_hours}),
-            ));
-        }
+    pub fn new(_cache_root: PathBuf, policy: PolicyConfig) -> AppResult<Self> {
         if policy.bash.executable.trim().is_empty() {
             return Err(AppError::details(
                 "INVALID_POLICY",
@@ -226,28 +186,14 @@ impl BashSupervisor {
                 }),
             ));
         }
-        cleanup_orphan_logs(&log_root, retention_hours);
         let readiness = resolve_bash(&policy);
         Ok(Self {
             runs: Arc::new(Mutex::new(HashMap::new())),
             next_run_sequence: Arc::new(AtomicU64::new(0)),
             run_permit: Arc::new(Semaphore::new(1)),
-            warm_shell: Arc::new(tokio::sync::Mutex::new(None)),
-            cache_root,
             policy,
-            retention_hours,
             readiness,
-            completion_observer: Arc::new(Mutex::new(None)),
-            eviction_observer: Arc::new(Mutex::new(None)),
         })
-    }
-
-    pub(crate) fn set_completion_observer(&self, observer: RunCompletionObserver) {
-        *self.completion_observer.lock() = Some(observer);
-    }
-
-    pub(crate) fn set_eviction_observer(&self, observer: RunEvictionObserver) {
-        *self.eviction_observer.lock() = Some(observer);
     }
 
     pub fn readiness(&self) -> BashReadiness {
@@ -255,13 +201,6 @@ impl BashSupervisor {
     }
 
     pub fn ensure_available(&self) -> AppResult<()> {
-        if !self.policy.bash.enabled {
-            return Err(AppError::details(
-                "BASH_DISABLED",
-                "Bash execution is disabled by policy",
-                json!({"configuration_hint": "Set policy.bash.enabled to true and restart CodeWeave."}),
-            ));
-        }
         if self.readiness.is_ready() {
             return Ok(());
         }
@@ -281,6 +220,67 @@ impl BashSupervisor {
             .values()
             .filter(|record| record.lock().ended_at.is_none())
             .count()
+    }
+
+    pub(crate) fn set_change_baseline(
+        &self,
+        run_id: &str,
+        generation: u64,
+        dirty_files: HashSet<String>,
+    ) {
+        if let Some(record) = self.runs.lock().get(run_id).cloned() {
+            let mut record = record.lock();
+            record.baseline_generation = Some(generation);
+            record.baseline_dirty = dirty_files;
+        }
+    }
+
+    pub(crate) fn observe_changes<F>(
+        &self,
+        run_id: &str,
+        current_generation: u64,
+        current_dirty: HashSet<String>,
+        terminal: bool,
+        calculate: F,
+    ) -> AppResult<(u64, u64, HashSet<String>)>
+    where
+        F: FnOnce(
+            u64,
+            &HashSet<String>,
+            Option<&DateTime<Utc>>,
+            &HashSet<String>,
+        ) -> HashSet<String>,
+    {
+        let record = self.runs.lock().get(run_id).cloned().ok_or_else(|| {
+            AppError::details(
+                "RUN_NOT_FOUND",
+                "Bash run not found",
+                json!({"run_id": run_id}),
+            )
+        })?;
+        let mut record = record.lock();
+        if record.baseline_generation.is_none() {
+            record.baseline_generation = Some(current_generation);
+            record.baseline_dirty = current_dirty.clone();
+        }
+        let start = record.baseline_generation.unwrap_or(current_generation);
+        if let Some((generation, paths)) = &record.frozen_changes {
+            return Ok((start, *generation, paths.clone()));
+        }
+        let changed = calculate(
+            start,
+            &record.baseline_dirty,
+            if terminal {
+                record.ended_at.as_ref()
+            } else {
+                None
+            },
+            &current_dirty,
+        );
+        if terminal {
+            record.frozen_changes = Some((current_generation, changed.clone()));
+        }
+        Ok((start, current_generation, changed))
     }
 
     fn prepare_start_request(
@@ -323,32 +323,12 @@ impl BashSupervisor {
         })
     }
 
-    pub async fn start_for_session(
-        &self,
-        root: &Path,
-        session_id: &str,
-        request: StartRequest,
-    ) -> AppResult<serde_json::Value> {
+    pub async fn start(&self, root: &Path, request: StartRequest) -> AppResult<serde_json::Value> {
         let prepared = self.prepare_start_request(root, request)?;
         let permit = match self.run_permit.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                // The single run slot is busy. If the caller re-issued an
-                // identical command against the same cwd (ChatGPT retries a
-                // timed-out call verbatim), hand back the in-flight run so the
-                // model polls it instead of flailing on RUN_BUSY.
-                if let Some(active) =
-                    self.active_run_matching(session_id, &prepared.command, &prepared.cwd)
-                {
-                    let mut view = self.status_for_session(session_id, &active)?;
-                    view["deduplicated"] = Value::Bool(true);
-                    view["guidance"] = Value::String(
-                        "An identical command is already running; poll bash_status with this run_id."
-                            .to_owned(),
-                    );
-                    return Ok(view);
-                }
-                let active = self.active_run_view_for_session(session_id);
+                let active = self.active_run_view();
                 return Err(AppError::details(
                     "RUN_BUSY",
                     "Another command is already running",
@@ -361,25 +341,21 @@ impl BashSupervisor {
                 ));
             }
         };
-        self.start_prepared_for_session(session_id, prepared, Some(permit))
-            .await
+        self.start_prepared(prepared, Some(permit)).await
     }
 
-    pub(crate) async fn queue_for_session(
+    pub(crate) async fn queue(
         &self,
         root: &Path,
-        session_id: &str,
         request: StartRequest,
     ) -> AppResult<serde_json::Value> {
         let mut prepared = self.prepare_start_request(root, request)?;
         prepared.background = true;
-        self.start_prepared_for_session(session_id, prepared, None)
-            .await
+        self.start_prepared(prepared, None).await
     }
 
-    async fn start_prepared_for_session(
+    async fn start_prepared(
         &self,
-        session_id: &str,
         prepared: PreparedStartRequest,
         immediate_permit: Option<OwnedSemaphorePermit>,
     ) -> AppResult<serde_json::Value> {
@@ -392,12 +368,9 @@ impl BashSupervisor {
         let queued = immediate_permit.is_none();
         let run_id = format!("run_{}", Uuid::new_v4().simple());
         let sequence = self.next_run_sequence.fetch_add(1, Ordering::Relaxed);
-        let log_root = self.cache_root.join("bash-logs");
-        let logs = RunLogPaths::new(&log_root, &run_id);
         let record = Arc::new(Mutex::new(RunRecord {
             run_id: run_id.clone(),
             sequence,
-            session_id: session_id.to_owned(),
             status: "queued".to_owned(),
             command: command.clone(),
             cwd: cwd.clone(),
@@ -405,11 +378,16 @@ impl BashSupervisor {
             ended_at: None,
             exit_code: None,
             output: String::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            combined: String::new(),
             output_truncated: false,
-            logs,
             pid: None,
             cancel_requested: false,
             job: None,
+            baseline_generation: None,
+            baseline_dirty: HashSet::new(),
+            frozen_changes: None,
         }));
         self.runs.lock().insert(run_id.clone(), record.clone());
         self.trim_runs();
@@ -418,17 +396,14 @@ impl BashSupervisor {
             .executable()
             .expect("prepare_start_request guarantees a resolved executable");
         let max_output = self.policy.bash.max_output_chars;
-        let completion_observer = self.completion_observer.lock().clone();
 
         // Execution always runs on a detached task, even for foreground calls.
         // If the client aborts the request, the command keeps running and owns
         // the permit until completion. Queued internal runs wait for that permit
         // inside their detached task, so they are immediately pollable without
         // violating the single-slot execution order.
-        let warm_shell = self.warm_shell.clone();
         let semaphore = self.run_permit.clone();
         let execution_record = record.clone();
-        let execution_completion_observer = completion_observer.clone();
         let mut handle = tokio::spawn(async move {
             let permit = match immediate_permit {
                 Some(permit) => permit,
@@ -439,11 +414,7 @@ impl BashSupervisor {
                             "BASH_QUEUE_CLOSED",
                             "Bash execution queue is unavailable",
                         );
-                        finalize_run_error(
-                            &execution_record,
-                            &error,
-                            execution_completion_observer.as_ref(),
-                        );
+                        finalize_run_error(&execution_record, &error);
                         return Err(error);
                     }
                 },
@@ -455,19 +426,10 @@ impl BashSupervisor {
                 cwd,
                 timeout_ms,
                 max_output,
-                completion_observer: execution_completion_observer.clone(),
             };
-            let result = if background {
-                execute(record, request).await
-            } else {
-                execute_warm(warm_shell, record, request).await
-            };
+            let result = execute(record, request).await;
             if let Err(error) = &result {
-                finalize_run_error(
-                    &execution_record,
-                    error,
-                    execution_completion_observer.as_ref(),
-                );
+                finalize_run_error(&execution_record, error);
             }
             result
         });
@@ -539,29 +501,15 @@ impl BashSupervisor {
         }
     }
 
-    /// Dedupe key for retried commands: an *active* run with the same command
-    /// text and working directory. Single-slot semantics make an identical
-    /// concurrent command an almost-certain client retry.
-    fn active_run_matching(&self, session_id: &str, command: &str, cwd: &Path) -> Option<String> {
-        self.runs.lock().values().find_map(|record| {
-            let record = record.lock();
-            (record.ended_at.is_none()
-                && record.session_id == session_id
-                && record.command == command
-                && record.cwd == cwd)
-                .then(|| record.run_id.clone())
-        })
-    }
-
     /// Summary of the currently active run, attached to RUN_BUSY so the model
     /// can poll or cancel instead of retrying blindly.
-    fn active_run_view_for_session(&self, session_id: &str) -> Option<serde_json::Value> {
+    fn active_run_view(&self) -> Option<serde_json::Value> {
         let records = self.runs.lock().values().cloned().collect::<Vec<_>>();
         records
             .into_iter()
             .filter_map(|record| {
                 let record = record.lock();
-                if record.ended_at.is_some() || record.session_id != session_id {
+                if record.ended_at.is_some() {
                     return None;
                 }
                 let priority = match record.status.as_str() {
@@ -590,35 +538,9 @@ impl BashSupervisor {
         self.status_with_limit(run_id, self.policy.bash.max_output_chars)
     }
 
-    pub fn status_for_session(
-        &self,
-        session_id: &str,
-        run_id: &str,
-    ) -> AppResult<serde_json::Value> {
-        self.status_with_limit_for_session(session_id, run_id, self.policy.bash.max_output_chars)
-    }
-
     pub fn status_with_limit(
         &self,
         run_id: &str,
-        max_output: usize,
-    ) -> AppResult<serde_json::Value> {
-        self.status_record(run_id, None, max_output)
-    }
-
-    pub fn status_with_limit_for_session(
-        &self,
-        session_id: &str,
-        run_id: &str,
-        max_output: usize,
-    ) -> AppResult<serde_json::Value> {
-        self.status_record(run_id, Some(session_id), max_output)
-    }
-
-    fn status_record(
-        &self,
-        run_id: &str,
-        session_id: Option<&str>,
         max_output: usize,
     ) -> AppResult<serde_json::Value> {
         let record = self.runs.lock().get(run_id).cloned().ok_or_else(|| {
@@ -629,30 +551,12 @@ impl BashSupervisor {
             )
         })?;
         let record = record.lock();
-        if session_id.is_some_and(|session_id| session_id != record.session_id) {
-            return Err(AppError::details(
-                "RUN_NOT_FOUND",
-                "Bash run not found in this session",
-                json!({"run_id": run_id}),
-            ));
-        }
         Ok(serde_json::to_value(view(&record, max_output))?)
     }
 
-    pub fn output_stream_for_session(
-        &self,
-        session_id: &str,
-        run_id: &str,
-        continuation: Option<&str>,
-        requested_stream: Option<&str>,
-    ) -> AppResult<serde_json::Value> {
-        self.output_stream_for_owner(run_id, Some(session_id), continuation, requested_stream)
-    }
-
-    fn output_stream_for_owner(
+    pub fn output_stream(
         &self,
         run_id: &str,
-        session_id: Option<&str>,
         continuation: Option<&str>,
         requested_stream: Option<&str>,
     ) -> AppResult<serde_json::Value> {
@@ -666,28 +570,17 @@ impl BashSupervisor {
             )
         })?;
         let record = record.lock();
-        if session_id.is_some_and(|session_id| session_id != record.session_id) {
-            return Err(AppError::details(
-                "RUN_NOT_FOUND",
-                "Bash run not found in this session",
-                json!({"run_id": run_id}),
-            ));
-        }
-        let full = fs::read(record.logs.path(stream))
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_else(|_| {
-                if stream == OutputStream::Combined {
-                    record.output.clone()
-                } else {
-                    String::new()
-                }
-            });
+        let full = match stream {
+            OutputStream::Stdout => &record.stdout,
+            OutputStream::Stderr => &record.stderr,
+            OutputStream::Combined => &record.combined,
+        };
         let requested_offset = continuation_offset(continuation, run_id, stream)
             .unwrap_or(0)
             .min(full.len());
-        let offset = char_boundary(&full, requested_offset);
+        let offset = char_boundary(full, requested_offset);
         let end = char_boundary(
-            &full,
+            full,
             (offset + self.policy.bash.max_output_chars).min(full.len()),
         );
         let next = (end < full.len()).then(|| format!("bash:{run_id}:{}:{end}", stream.as_str()));
@@ -702,19 +595,7 @@ impl BashSupervisor {
         }))
     }
 
-    pub fn cancel_for_session(
-        &self,
-        session_id: &str,
-        run_id: &str,
-    ) -> AppResult<serde_json::Value> {
-        self.cancel_for_owner(run_id, Some(session_id))
-    }
-
-    fn cancel_for_owner(
-        &self,
-        run_id: &str,
-        session_id: Option<&str>,
-    ) -> AppResult<serde_json::Value> {
+    pub fn cancel(&self, run_id: &str) -> AppResult<serde_json::Value> {
         let record = self.runs.lock().get(run_id).cloned().ok_or_else(|| {
             AppError::details(
                 "RUN_NOT_FOUND",
@@ -724,13 +605,6 @@ impl BashSupervisor {
         })?;
         let (pid, job) = {
             let mut item = record.lock();
-            if session_id.is_some_and(|session_id| session_id != item.session_id) {
-                return Err(AppError::details(
-                    "RUN_NOT_FOUND",
-                    "Bash run not found in this session",
-                    json!({"run_id": run_id}),
-                ));
-            }
             if item.ended_at.is_some() {
                 return Ok(serde_json::to_value(view(
                     &item,
@@ -747,11 +621,7 @@ impl BashSupervisor {
         Ok(json!({"run_id": run_id, "status": "cancelling"}))
     }
 
-    pub fn read_log_for_session(&self, session_id: &str, run_id: &str) -> AppResult<String> {
-        self.read_log_for_owner(run_id, Some(session_id))
-    }
-
-    fn read_log_for_owner(&self, run_id: &str, session_id: Option<&str>) -> AppResult<String> {
+    pub fn read_output(&self, run_id: &str) -> AppResult<String> {
         let record = self
             .runs
             .lock()
@@ -759,66 +629,23 @@ impl BashSupervisor {
             .cloned()
             .ok_or_else(|| AppError::new("RUN_NOT_FOUND", "Bash run not found"))?;
         let record = record.lock();
-        if session_id.is_some_and(|session_id| session_id != record.session_id) {
-            return Err(AppError::new(
-                "RUN_NOT_FOUND",
-                "Bash run not found in this session",
-            ));
-        }
-        Ok(fs::read(&record.logs.combined)
-            .map(|bytes| strip_ansi(&String::from_utf8_lossy(&bytes)))
-            .unwrap_or_else(|_| record.output.clone()))
+        Ok(strip_ansi(&record.combined))
     }
 
     fn trim_runs(&self) {
-        let retention_hours = self.retention_hours;
-        let cutoff = Utc::now() - ChronoDuration::hours(retention_hours);
-        let mut removed_logs = Vec::new();
-        let mut removed_run_ids = Vec::new();
-        {
-            let mut runs = self.runs.lock();
-            let expired: Vec<String> = runs
+        let mut runs = self.runs.lock();
+        if runs.len() > MAX_RETAINED_RUNS {
+            let mut completed: Vec<_> = runs
                 .iter()
                 .filter_map(|(run_id, record)| {
-                    let record = record.lock();
-                    record
-                        .ended_at
-                        .is_some_and(|ended| ended < cutoff)
-                        .then(|| run_id.clone())
+                    record.lock().ended_at.map(|ended| (run_id.clone(), ended))
                 })
                 .collect();
-            for run_id in expired {
-                if let Some(record) = runs.remove(&run_id) {
-                    removed_run_ids.push(run_id);
-                    removed_logs.push(record.lock().logs.clone());
-                }
+            completed.sort_by_key(|(_, ended)| *ended);
+            let remove_count = runs.len().saturating_sub(MAX_RETAINED_RUNS);
+            for (run_id, _) in completed.into_iter().take(remove_count) {
+                runs.remove(&run_id);
             }
-
-            if runs.len() > MAX_RETAINED_RUNS {
-                let mut completed: Vec<_> = runs
-                    .iter()
-                    .filter_map(|(run_id, record)| {
-                        let record = record.lock();
-                        record.ended_at.map(|ended| (run_id.clone(), ended))
-                    })
-                    .collect();
-                completed.sort_by_key(|(_, ended)| *ended);
-                let remove_count = runs.len().saturating_sub(MAX_RETAINED_RUNS);
-                for (run_id, _) in completed.into_iter().take(remove_count) {
-                    if let Some(record) = runs.remove(&run_id) {
-                        removed_run_ids.push(run_id);
-                        removed_logs.push(record.lock().logs.clone());
-                    }
-                }
-            }
-        }
-        if !removed_run_ids.is_empty() {
-            if let Some(observer) = self.eviction_observer.lock().clone() {
-                observer(&removed_run_ids);
-            }
-        }
-        for logs in removed_logs {
-            remove_logs(&logs);
         }
     }
 }

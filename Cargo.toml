@@ -1,5 +1,5 @@
 [workspace]
-members = ["eval"]
+members = ["."]
 
 [lib]
 name = "codeweave_rust"
@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [package]
 name = "codeweave-rust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Local-first Rust MCP server for safe code search, editing, Git, and development commands"
@@ -21,26 +21,26 @@ categories = ["development-tools"]
 
 [dependencies]
 anyhow = "1.0"
-axum = "0.8"
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "tracing"] }
 base64 = "0.22"
 cap-std = "4.0"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.5", features = ["derive"] }
-futures-util = "0.3"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
 ignore = "0.4"
 notify = "8.2"
 parking_lot = "0.12"
 regex = "1.11"
 rayon = "1.10"
-rmcp = { version = "1.8", features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "1.8", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_path_to_error = "0.1"
 sha2 = "0.10"
 similar = "2.7"
 subtle = "2.6"
-tokio = { version = "1.47", features = ["full"] }
-tower-http = { version = "0.6", features = ["limit", "trace"] }
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }
@@ -55,9 +55,6 @@ tree-sitter-c-sharp = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-json = "0.24"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
