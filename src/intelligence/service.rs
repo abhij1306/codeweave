@@ -245,36 +245,76 @@ impl IntelligenceService {
 
     fn diagnostics(&self, params: &Value) -> AppResult<Value> {
         let (_relative, path) = self.relative_and_local_path(params)?;
+        let max_results = params
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 200) as usize;
         if let Some(worker) = self.worker_for(&path) {
             let semantic = self
                 .document_for(worker, &path)
                 .and_then(|document| worker.execute(WorkerOperation::Diagnostics, document));
             match semantic {
                 Ok(response) => {
+                    let (diagnostics, total_count, result_count, truncated) =
+                        limit_diagnostics(&response.result, max_results)?;
                     return Ok(json!({
                         "operation": "diagnostics",
                         "backend": "semantic",
                         "semantic": true,
                         "evidence": "semantic",
-                        "diagnostics": response.result,
+                        "status": "available",
+                        "diagnostics_available": true,
+                        "semantic_diagnostics_available": true,
+                        "diagnostics": diagnostics,
+                        "total_count": total_count,
+                        "result_count": result_count,
+                        "truncated": truncated,
                         "synchronization": Self::semantic_metadata(&response)
                     }));
                 }
-                Err(error) => return self.diagnostics_fallback(&path, Some(error)),
+                Err(error) => {
+                    return self.diagnostics_fallback(
+                        &path,
+                        max_results,
+                        Some(error),
+                        Some(worker.status()),
+                    )
+                }
             }
         }
-        self.diagnostics_fallback(&path, None)
+        self.diagnostics_fallback(&path, max_results, None, None)
     }
 
-    fn diagnostics_fallback(&self, path: &Path, reason: Option<AppError>) -> AppResult<Value> {
-        let result = TreeSitterBackend.diagnostics(path)?;
+    fn diagnostics_fallback(
+        &self,
+        path: &Path,
+        max_results: usize,
+        reason: Option<AppError>,
+        semantic_backend: Option<Value>,
+    ) -> AppResult<Value> {
+        let mut result = TreeSitterBackend.diagnostics(path)?;
+        let (diagnostics, total_count, result_count, truncated) =
+            limit_diagnostics(&result["diagnostics"], max_results)?;
+        result["diagnostics"] = diagnostics;
+        let semantic_available = reason.is_none();
         let mut response = json!({
             "operation": "diagnostics",
             "backend": "fallback",
             "evidence": "syntactic",
+            "status": if semantic_available { "available" } else { "partial" },
+            "diagnostics_available": semantic_available,
+            "semantic_diagnostics_available": false,
+            "diagnostic_scope": "syntax_only",
+            "total_count": total_count,
+            "result_count": result_count,
+            "truncated": truncated,
             "result": result
         });
         insert_fallback_reason(&mut response, reason);
+        if let (Some(object), Some(status)) = (response.as_object_mut(), semantic_backend) {
+            object.insert("semantic_backend".to_owned(), status);
+        }
         Ok(response)
     }
 
@@ -412,6 +452,28 @@ fn insert_fallback_reason(response: &mut Value, reason: Option<AppError>) {
     }
 }
 
+fn limit_diagnostics(
+    diagnostics: &Value,
+    max_results: usize,
+) -> AppResult<(Value, usize, usize, bool)> {
+    let diagnostics = diagnostics
+        .as_array()
+        .ok_or_else(|| AppError::new("LSP_PROTOCOL_ERROR", "Diagnostic result is not an array"))?;
+    let total_count = diagnostics.len();
+    let limited = diagnostics
+        .iter()
+        .take(max_results)
+        .cloned()
+        .collect::<Vec<_>>();
+    let result_count = limited.len();
+    Ok((
+        Value::Array(limited),
+        total_count,
+        result_count,
+        total_count > result_count,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +515,7 @@ mod tests {
                 definition_provider: true,
                 rename_provider: true,
                 diagnostics_provider: true,
+                pull_diagnostics_provider: true,
                 sync_kind: TextDocumentSyncKind::Full,
                 position_encoding: PositionEncoding::Utf16,
                 server_name: Some("fixture".to_owned()),
@@ -464,5 +527,57 @@ mod tests {
             .verify_index_hash("src/main.rs", &response)
             .unwrap_err();
         assert_eq!(error.0.code, "LSP_INDEX_STALE");
+    }
+
+    #[test]
+    fn diagnostics_timeout_is_explicitly_partial_and_preserves_lifecycle() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sample.py");
+        fs::write(&path, "value = 1\n").unwrap();
+        let exclusions = WorkspaceExclusions::new(root.path(), &[]).unwrap();
+        let index = Arc::new(RwLock::new(
+            CodeIndex::scan(root.path(), 1_000_000, &[], &exclusions).unwrap(),
+        ));
+        let service = IntelligenceService::new(
+            root.path().to_path_buf(),
+            IntelligenceSettings::default(),
+            "diagnostics".to_owned(),
+            index,
+            Arc::new(RwLock::new("snap_diagnostics".to_owned())),
+        );
+        let result = service
+            .diagnostics_fallback(
+                &path,
+                20,
+                Some(AppError::new("LSP_TIMEOUT", "timed out")),
+                Some(json!({"readiness": "lazy", "last_error": "timed out"})),
+            )
+            .unwrap();
+
+        assert_eq!(result["status"], "partial");
+        assert_eq!(result["diagnostics_available"], false);
+        assert_eq!(result["semantic_diagnostics_available"], false);
+        assert_eq!(result["diagnostic_scope"], "syntax_only");
+        assert_eq!(result["fallback_reason"]["code"], "LSP_TIMEOUT");
+        assert_eq!(result["semantic_backend"]["last_error"], "timed out");
+        assert!(result["result"]["diagnostics"].is_array());
+    }
+
+    #[test]
+    fn diagnostics_limit_reports_total_result_count_and_truncation() {
+        let diagnostics = json!([
+            {"message": "one"},
+            {"message": "two"},
+            {"message": "three"}
+        ]);
+        let (limited, total_count, result_count, truncated) =
+            limit_diagnostics(&diagnostics, 2).unwrap();
+
+        assert_eq!(limited.as_array().unwrap().len(), 2);
+        assert_eq!(limited[0]["message"], "one");
+        assert_eq!(limited[1]["message"], "two");
+        assert_eq!(total_count, 3);
+        assert_eq!(result_count, 2);
+        assert!(truncated);
     }
 }

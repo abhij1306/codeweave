@@ -284,14 +284,14 @@ pub fn registry() -> &'static [ToolDefinition] {
         ToolDefinition {
             name: "bash_status",
             title: "Bash Run Status",
-            description: "Return live or completed state and the retained output tail for a Bash run.",
+            description: "Return live or completed state and the retained output tail for a Bash run, including how many prefix characters were discarded.",
             safety: ToolSafety::Read,
             input_schema: bash::bash_status,
         },
         ToolDefinition {
             name: "bash_output",
             title: "Bash Run Output",
-            description: "Page retained combined, stdout, or stderr output for a Bash run.",
+            description: "Page retained combined, stdout, or stderr output for a Bash run. Continuations cover only the bounded tail; retention metadata reports any discarded prefix.",
             safety: ToolSafety::Read,
             input_schema: bash::bash_output,
         },
@@ -360,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn list_payload_shape_is_valid_and_flat() {
+    fn list_payload_shape_uses_only_the_edit_discriminator_union() {
         let access = fixed_access();
         let items = access.list_payload().as_array().unwrap();
         assert_eq!(items.len(), 25);
@@ -370,7 +370,7 @@ mod tests {
             assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
             assert_eq!(item["execution"]["taskSupport"], "forbidden");
             let encoded = schema.to_string();
-            for forbidden in ["\"oneOf\"", "\"allOf\"", "\"not\"", "\"const\""] {
+            for forbidden in ["\"allOf\"", "\"not\"", "\"const\""] {
                 assert!(
                     !encoded.contains(forbidden),
                     "{} in {}",
@@ -378,6 +378,11 @@ mod tests {
                     item["name"]
                 );
             }
+            let allows_change_union = matches!(
+                item["name"].as_str(),
+                Some("code_preview" | "code_transaction")
+            );
+            assert_eq!(encoded.contains("\"oneOf\""), allows_change_union);
         }
     }
 }

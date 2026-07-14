@@ -1,8 +1,9 @@
 # Tool reference
 
-The registry is fixed at 25 tools. Every request schema is flat and rejects
-unknown top-level fields. Operation-specific DTO validation rejects fields that
-do not apply to the selected retrieval, edit, Git, or Bash operation.
+The registry is fixed at 25 tools. Every top-level request schema rejects
+unknown fields. Preview and transaction changes publish a discriminated union
+keyed by `kind`; operation-specific DTO validation enforces the same required
+and allowed fields at runtime.
 
 ## Workspace and reads
 
@@ -11,6 +12,14 @@ do not apply to the selected retrieval, edit, Git, or Bash operation.
   reference, outline, repository-map, and exact-read operations.
 - `code_intelligence`: definitions, references, hover, symbols, diagnostics,
   and rename preview through optional LSP with evidence-labeled fallback.
+
+Diagnostics consume the language server's published cache or standard pull
+response, depending on the advertised capability. Semantic success reports
+`diagnostics_available: true`. A timeout reports `status: "partial"` and
+`diagnostics_available: false`, preserves the LSP error and lifecycle state,
+and labels any Tree-sitter result as `diagnostic_scope: "syntax_only"`.
+`max_results` limits returned diagnostics to at most 200; `total_count`,
+`result_count`, and `truncated` describe the bounded result.
 
 Retrieval handles bind ranges to a workspace, snapshot, path, and content hash.
 Complete-range replacement uses `code_replace_range` with that handle.
@@ -43,6 +52,8 @@ or externally visible operations retain explicit confirmation/preflight rules.
 
 Runs execute sequentially. Foreground calls that exceed the response budget
 continue as the same background run. Retrying the command does not deduplicate
-it; poll the returned run ID. Output is bounded and remains available in memory
-until the completed run is evicted. At most 128 completed runs are retained and
-active runs are never evicted.
+it; poll the returned run ID. Output retention is a bounded tail. Responses
+report `dropped_prefix_chars`, `retained_start_offset`, and
+`retention_policy: "tail"`; continuation tokens page only within that retained
+buffer. Output remains available in memory until the completed run is evicted.
+At most 128 completed runs are retained and active runs are never evicted.

@@ -63,6 +63,7 @@ pub(crate) struct ServerCapabilities {
     pub(crate) definition_provider: bool,
     pub(crate) rename_provider: bool,
     pub(crate) diagnostics_provider: bool,
+    pub(crate) pull_diagnostics_provider: bool,
     pub(crate) sync_kind: TextDocumentSyncKind,
     pub(crate) position_encoding: PositionEncoding,
     pub(crate) server_name: Option<String>,
@@ -77,6 +78,7 @@ impl ServerCapabilities {
             "definition_provider": self.definition_provider,
             "rename_provider": self.rename_provider,
             "diagnostics_provider": self.diagnostics_provider,
+            "diagnostics_transport": if self.pull_diagnostics_provider { "pull" } else { "publish" },
             "sync_kind": self.sync_kind.as_str(),
             "position_encoding": self.position_encoding.as_str(),
             "server_name": self.server_name,
@@ -136,6 +138,12 @@ pub(crate) fn initialize_params(root_uri: &str) -> Value {
                 "definition": {"dynamicRegistration": false, "linkSupport": true},
                 "references": {"dynamicRegistration": false},
                 "rename": {"dynamicRegistration": false, "prepareSupport": false},
+                "publishDiagnostics": {
+                    "relatedInformation": true,
+                    "versionSupport": true,
+                    "codeDescriptionSupport": true,
+                    "dataSupport": true
+                },
                 "diagnostic": {"dynamicRegistration": false}
             }
         },
@@ -163,6 +171,7 @@ pub(crate) fn parse_initialize_result(
         rename_provider: provider_enabled(capabilities.get("renameProvider")),
         diagnostics_provider: provider_enabled(capabilities.get("diagnosticProvider"))
             || capabilities.get("textDocumentSync").is_some(),
+        pull_diagnostics_provider: provider_enabled(capabilities.get("diagnosticProvider")),
         sync_kind: TextDocumentSyncKind::parse(capabilities.get("textDocumentSync")),
         position_encoding: PositionEncoding::parse(
             capabilities.get("positionEncoding").and_then(Value::as_str),
@@ -227,9 +236,23 @@ mod tests {
         assert!(parsed.references_provider);
         assert!(parsed.definition_provider);
         assert!(!parsed.rename_provider);
+        assert!(parsed.diagnostics_provider);
+        assert!(parsed.pull_diagnostics_provider);
         assert_eq!(parsed.sync_kind, TextDocumentSyncKind::Incremental);
         assert_eq!(parsed.position_encoding, PositionEncoding::Utf8);
         assert_eq!(parsed.server_name.as_deref(), Some("fixture"));
         assert_eq!(parsed.initialization_ms, 17);
+    }
+
+    #[test]
+    fn initialize_params_advertise_push_and_pull_diagnostics_support() {
+        let params = initialize_params("file:///workspace");
+        let text_document = &params["capabilities"]["textDocument"];
+        assert_eq!(text_document["publishDiagnostics"]["versionSupport"], true);
+        assert_eq!(
+            text_document["publishDiagnostics"]["relatedInformation"],
+            true
+        );
+        assert_eq!(text_document["diagnostic"]["dynamicRegistration"], false);
     }
 }

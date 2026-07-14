@@ -551,6 +551,15 @@ impl WorkerRuntime {
             WorkerOperation::Diagnostics => {
                 if let Some(cached) = self.diagnostics.get(&document.uri) {
                     cached.clone()
+                } else if capabilities.pull_diagnostics_provider {
+                    let report = self.request(
+                        "textDocument/diagnostic",
+                        json!({"textDocument": {"uri": document.uri}}),
+                    )?;
+                    let diagnostics = diagnostic_report_items(report)?;
+                    self.diagnostics
+                        .insert(document.uri.clone(), diagnostics.clone());
+                    diagnostics
                 } else {
                     self.wait_for_diagnostics(&document.uri)?
                 }
@@ -701,7 +710,9 @@ impl WorkerRuntime {
             let message = receive_before(&mut *process, deadline)?;
             if message.get("method").and_then(Value::as_str)
                 == Some("textDocument/publishDiagnostics")
-                && message["params"]["uri"].as_str() == Some(uri)
+                && message["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|published| diagnostic_uri_matches(&self.root, uri, published))
             {
                 let diagnostics = message["params"]["diagnostics"].clone();
                 self.diagnostics.insert(uri.to_owned(), diagnostics.clone());
@@ -752,6 +763,31 @@ fn receive_before(process: &mut dyn RpcTransport, deadline: Instant) -> AppResul
     })
 }
 
+fn diagnostic_report_items(report: Value) -> AppResult<Value> {
+    if report.is_array() {
+        return Ok(report);
+    }
+    if let Some(items) = report.get("items").filter(|items| items.is_array()) {
+        return Ok(items.clone());
+    }
+    Err(AppError::details(
+        "LSP_PROTOCOL_ERROR",
+        "Language-server diagnostic response does not contain an items array",
+        json!({"response": report}),
+    ))
+}
+
+fn diagnostic_uri_matches(root: &Path, requested: &str, published: &str) -> bool {
+    requested == published
+        || match (
+            super::normalize::uri_path(root, requested),
+            super::normalize::uri_path(root, published),
+        ) {
+            (Ok(requested), Ok(published)) => requested == published,
+            _ => false,
+        }
+}
+
 fn latency_p50(samples: &VecDeque<u128>) -> Option<u128> {
     if samples.is_empty() {
         return None;
@@ -777,6 +813,8 @@ mod tests {
         sent: Arc<Mutex<Vec<Value>>>,
         queued: VecDeque<io::Result<Value>>,
         fail_request_once: Arc<AtomicBool>,
+        advertise_pull_diagnostics: bool,
+        publish_equivalent_uri: bool,
     }
 
     impl RpcTransport for FakeTransport {
@@ -787,18 +825,21 @@ mod tests {
                 value.get("method").and_then(Value::as_str),
             ) {
                 if method == "initialize" {
+                    let mut capabilities = json!({
+                        "referencesProvider": true,
+                        "definitionProvider": true,
+                        "renameProvider": true,
+                        "textDocumentSync": {"change": 2},
+                        "positionEncoding": "utf-8"
+                    });
+                    if self.advertise_pull_diagnostics {
+                        capabilities["diagnosticProvider"] = json!({});
+                    }
                     self.queued.push_back(Ok(json!({
                         "jsonrpc": "2.0",
                         "id": id,
                         "result": {
-                            "capabilities": {
-                                "referencesProvider": true,
-                                "definitionProvider": true,
-                                "renameProvider": true,
-                                "diagnosticProvider": {},
-                                "textDocumentSync": {"change": 2},
-                                "positionEncoding": "utf-8"
-                            },
+                            "capabilities": capabilities,
                             "serverInfo": {"name": "fixture", "version": "1"}
                         }
                     })));
@@ -818,10 +859,13 @@ mod tests {
                 value.get("method").and_then(Value::as_str),
                 Some("textDocument/didOpen" | "textDocument/didChange")
             ) {
-                let uri = value["params"]["textDocument"]["uri"]
+                let mut uri = value["params"]["textDocument"]["uri"]
                     .as_str()
                     .unwrap()
                     .to_owned();
+                if self.publish_equivalent_uri {
+                    uri = uri.replace("%C3%A9", "%c3%a9");
+                }
                 self.queued.push_back(Ok(json!({
                     "jsonrpc": "2.0",
                     "method": "textDocument/publishDiagnostics",
@@ -842,11 +886,22 @@ mod tests {
         sent: Arc<Mutex<Vec<Value>>>,
         fail_request_once: Arc<AtomicBool>,
     ) -> TransportFactory {
+        fake_factory_with_diagnostics(sent, fail_request_once, true, false)
+    }
+
+    fn fake_factory_with_diagnostics(
+        sent: Arc<Mutex<Vec<Value>>>,
+        fail_request_once: Arc<AtomicBool>,
+        advertise_pull_diagnostics: bool,
+        publish_equivalent_uri: bool,
+    ) -> TransportFactory {
         Arc::new(move || {
             Ok(Box::new(FakeTransport {
                 sent: Arc::clone(&sent),
                 queued: VecDeque::new(),
                 fail_request_once: Arc::clone(&fail_request_once),
+                advertise_pull_diagnostics,
+                publish_equivalent_uri,
             }))
         })
     }
@@ -898,6 +953,83 @@ mod tests {
             change["params"]["contentChanges"][0]["text"],
             second.content
         );
+    }
+
+    #[test]
+    fn python_diagnostics_use_pull_request_then_cached_result() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sample.py");
+        std::fs::write(&path, "value: int = 'wrong'\n").unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let worker = LspWorker::test_with_factory(
+            root.path().to_path_buf(),
+            LspPreset::Python,
+            Duration::from_millis(100),
+            fake_factory(Arc::clone(&sent), Arc::new(AtomicBool::new(false))),
+        );
+        let document = DocumentSnapshot::read(&path, "python").unwrap();
+
+        let cold = worker
+            .execute(WorkerOperation::Diagnostics, document.clone())
+            .unwrap();
+        let warm = worker
+            .execute(WorkerOperation::Diagnostics, document)
+            .unwrap();
+
+        assert_eq!(cold.result, json!([]));
+        assert_eq!(warm.result, json!([]));
+        let diagnostic_requests = sent
+            .lock()
+            .iter()
+            .filter(|message| message["method"] == "textDocument/diagnostic")
+            .count();
+        assert_eq!(diagnostic_requests, 1);
+    }
+
+    #[test]
+    fn published_diagnostic_uri_matches_equivalent_file_uri_encoding() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("café.py");
+        std::fs::write(&path, "value = 1\n").unwrap();
+        let requested = super::super::normalize::path_uri(&path);
+        let published = requested.replace("%C3%A9", "%c3%a9");
+        assert_ne!(requested, published);
+        assert!(diagnostic_uri_matches(root.path(), &requested, &published));
+    }
+
+    #[test]
+    fn publish_diagnostics_are_available_cold_and_cached_warm() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("café.py");
+        std::fs::write(&path, "value: int = 'wrong'\n").unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let worker = LspWorker::test_with_factory(
+            root.path().to_path_buf(),
+            LspPreset::Python,
+            Duration::from_millis(100),
+            fake_factory_with_diagnostics(
+                Arc::clone(&sent),
+                Arc::new(AtomicBool::new(false)),
+                false,
+                true,
+            ),
+        );
+        let document = DocumentSnapshot::read(&path, "python").unwrap();
+
+        let cold = worker
+            .execute(WorkerOperation::Diagnostics, document.clone())
+            .unwrap();
+        let warm = worker
+            .execute(WorkerOperation::Diagnostics, document)
+            .unwrap();
+
+        assert_eq!(cold.result, json!([]));
+        assert_eq!(warm.result, json!([]));
+        assert_eq!(worker.status()["restart_count"], 0);
+        assert!(!sent
+            .lock()
+            .iter()
+            .any(|message| message["method"] == "textDocument/diagnostic"));
     }
 
     #[test]

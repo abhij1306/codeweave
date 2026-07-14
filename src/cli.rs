@@ -970,10 +970,14 @@ mod tests {
             assert_eq!(schema["type"], "object");
             assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
             let encoded = schema.to_string();
-            assert!(!encoded.contains("\"oneOf\""));
             assert!(!encoded.contains("\"allOf\""));
             assert!(!encoded.contains("\"not\""));
             assert!(!encoded.contains("\"const\""));
+            let allows_change_union = matches!(
+                item["name"].as_str(),
+                Some("code_preview" | "code_transaction")
+            );
+            assert_eq!(encoded.contains("\"oneOf\""), allows_change_union);
             assert_eq!(item["execution"]["taskSupport"], "forbidden");
         }
 

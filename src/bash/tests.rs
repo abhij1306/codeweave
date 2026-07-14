@@ -40,6 +40,9 @@ fn record(cache: &Path, run_id: &str, status: &str, output: &str) -> RunRecord {
         stderr: String::new(),
         combined: output.to_owned(),
         output_truncated: false,
+        stdout_dropped_chars: 0,
+        stderr_dropped_chars: 0,
+        combined_dropped_chars: 0,
         pid: None,
         cancel_requested: false,
         job: None,
@@ -570,17 +573,21 @@ fn output_action_selects_stdout_and_stderr_streams() {
     let mut item = record(cache.path(), "streams", "failed", "combined");
     item.stdout = "stdout-only".to_owned();
     item.stderr = "stderr-only".to_owned();
+    item.stdout_dropped_chars = 17;
     supervisor
         .runs
         .lock()
         .insert("streams".to_owned(), Arc::new(Mutex::new(item)));
 
-    assert_eq!(
-        supervisor
-            .output_stream("streams", None, Some("stdout"))
-            .unwrap()["output"],
-        "stdout-only"
-    );
+    let stdout = supervisor
+        .output_stream("streams", None, Some("stdout"))
+        .unwrap();
+    assert_eq!(stdout["output"], "stdout-only");
+    assert_eq!(stdout["output_truncated"], true);
+    assert_eq!(stdout["retention_policy"], "tail");
+    assert_eq!(stdout["dropped_prefix_chars"], 17);
+    assert_eq!(stdout["retained_start_offset"], 17);
+    assert_eq!(stdout["continuation_scope"], "retained_buffer");
     assert_eq!(
         supervisor
             .output_stream("streams", None, Some("stderr"))

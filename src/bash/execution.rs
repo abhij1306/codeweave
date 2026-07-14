@@ -267,13 +267,18 @@ fn append_stream(
         return;
     }
     let mut item = record.lock();
-    let target = if stdout {
-        &mut item.stdout
+    let dropped = if stdout {
+        append_bounded(&mut item.stdout, &text, limit, truncated)
     } else {
-        &mut item.stderr
+        append_bounded(&mut item.stderr, &text, limit, truncated)
     };
-    append_bounded(target, &text, limit, truncated);
-    append_bounded(&mut item.combined, &text, limit, truncated);
+    if stdout {
+        item.stdout_dropped_chars += dropped;
+    } else {
+        item.stderr_dropped_chars += dropped;
+    }
+    let combined_dropped = append_bounded(&mut item.combined, &text, limit, truncated);
+    item.combined_dropped_chars += combined_dropped;
     item.output = item.combined.clone();
     item.output_truncated = *truncated;
 }
@@ -359,11 +364,16 @@ impl StreamDecoder {
     }
 }
 
-fn append_bounded(target: &mut String, text: &str, limit: usize, truncated: &mut bool) {
+fn append_bounded(target: &mut String, text: &str, limit: usize, truncated: &mut bool) -> usize {
     target.push_str(text);
-    if target.chars().count() > limit {
+    let count = target.chars().count();
+    if count > limit {
+        let dropped = count - limit;
         *target = tail_chars(target, limit);
         *truncated = true;
+        dropped
+    } else {
+        0
     }
 }
 
@@ -439,7 +449,7 @@ pub(super) fn finalize_run_error(record: &Arc<Mutex<RunRecord>>, error: &AppErro
 
 #[cfg(test)]
 mod tests {
-    use super::StreamDecoder;
+    use super::{append_bounded, StreamDecoder};
 
     #[test]
     fn stream_decoder_preserves_split_utf8_and_ansi_state() {
@@ -460,5 +470,15 @@ mod tests {
         let mut decoder = StreamDecoder::default();
         assert_eq!(decoder.decode(&[0xe2, 0x82]), "");
         assert_eq!(decoder.finish(), "�");
+    }
+
+    #[test]
+    fn bounded_output_reports_the_discarded_character_count() {
+        let mut output = "abc".to_owned();
+        let mut truncated = false;
+        let dropped = append_bounded(&mut output, "déf", 4, &mut truncated);
+        assert_eq!(output, "cdéf");
+        assert_eq!(dropped, 2);
+        assert!(truncated);
     }
 }

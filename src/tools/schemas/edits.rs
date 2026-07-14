@@ -1,7 +1,6 @@
 //! Input schemas for the edit tools: the narrow single-operation writers plus
 //! the code_preview / code_transaction multi-file engine entry points.
 
-use crate::contracts::change_kind_names;
 use serde_json::{json, Value};
 
 const HANDLE_DESCRIPTION: &str = "Fresh range handle returned by a code_retrieve read. It binds the workspace, path, line range, and content hash. A handle-based change must be the only change for its file in one transaction; combining it with another change for that file is rejected as ambiguous.";
@@ -146,34 +145,98 @@ pub fn code_transaction() -> Value {
     })
 }
 
-/// A deliberately flat superset schema. Per-kind required fields are published
-/// by runtime validation; conditional JSON Schema would make hosted clients
-/// less reliable and is rejected by the registry's flat-schema checks.
+/// A discriminated union matching the runtime `CHANGE_CONTRACTS`. Keeping each
+/// branch closed prevents fields from one edit kind being accepted for another.
 fn change_schema() -> Value {
     json!({
         "type": "object",
-        "properties": {
-            "kind": {"type": "string", "enum": change_kind_names(), "description": "Required operation kind."},
-            "path": {"type": "string"},
-            "to": {"type": "string"},
-            "content": {"type": "string"},
-            "old_text": {"type": "string"},
-            "new_text": {"type": "string", "description": REPLACEMENT_TEXT_DESCRIPTION},
-            "handle": {"type": "string", "description": format!("Optional for replace and required for replace_range. {HANDLE_DESCRIPTION}")},
-            "anchor_symbol": {"type": "string"},
-            "position": {"type": "string", "enum": ["before", "after", "inside_start", "inside_end"]},
-            "overwrite": {"type": "boolean"},
-            "expected_hash": {"type": "string"},
-            "expected_replacements": {"type": "integer", "minimum": 1}
-        },
-        "required": ["kind"],
-        "additionalProperties": false
+        "description": "One operation-specific edit change. Select the branch whose kind matches the requested operation.",
+        "oneOf": [
+            {
+                "type": "object",
+                "title": "Create change",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["create"]},
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "overwrite": {"type": "boolean", "default": false},
+                    "expected_hash": {"type": "string"}
+                },
+                "required": ["kind", "path", "content"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "title": "Replace change",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["replace"]},
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string", "description": REPLACEMENT_TEXT_DESCRIPTION},
+                    "expected_replacements": {"type": "integer", "minimum": 1, "default": 1},
+                    "expected_hash": {"type": "string"},
+                    "handle": {"type": "string", "description": OPTIONAL_HANDLE_DESCRIPTION}
+                },
+                "required": ["kind", "path", "old_text", "new_text"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "title": "Replace range change",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["replace_range"]},
+                    "path": {"type": "string"},
+                    "handle": {"type": "string", "description": HANDLE_DESCRIPTION},
+                    "new_text": {"type": "string", "description": REPLACEMENT_TEXT_DESCRIPTION}
+                },
+                "required": ["kind", "path", "handle", "new_text"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "title": "Insert change",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["insert"]},
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "anchor_symbol": {"type": "string"},
+                    "position": {"type": "string", "enum": ["before", "after", "inside_start", "inside_end"]},
+                    "expected_hash": {"type": "string"}
+                },
+                "required": ["kind", "path", "content", "anchor_symbol", "position"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "title": "Delete change",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["delete"]},
+                    "path": {"type": "string"},
+                    "expected_hash": {"type": "string"}
+                },
+                "required": ["kind", "path"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "title": "Rename change",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["rename"]},
+                    "path": {"type": "string"},
+                    "to": {"type": "string"},
+                    "expected_hash": {"type": "string"}
+                },
+                "required": ["kind", "path", "to"],
+                "additionalProperties": false
+            }
+        ]
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::CHANGE_CONTRACTS;
 
     #[test]
     fn edit_schemas_advertise_post_apply_validation() {
@@ -200,15 +263,25 @@ mod tests {
         let replace = code_replace();
         let replace_range = code_replace_range();
         let change = change_schema();
+        let variants = change["oneOf"].as_array().expect("change variants");
+        let replace_change = variants
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["enum"][0] == "replace")
+            .expect("replace change");
+        let replace_range_change = variants
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["enum"][0] == "replace_range")
+            .expect("replace range change");
         assert_eq!(
-            change["properties"]["handle"]["description"],
-            format!("Optional for replace and required for replace_range. {HANDLE_DESCRIPTION}")
+            replace_change["properties"]["handle"]["description"],
+            OPTIONAL_HANDLE_DESCRIPTION
         );
 
         for description in [
             replace["properties"]["handle"]["description"].as_str(),
             replace_range["properties"]["handle"]["description"].as_str(),
-            change["properties"]["handle"]["description"].as_str(),
+            replace_change["properties"]["handle"]["description"].as_str(),
+            replace_range_change["properties"]["handle"]["description"].as_str(),
         ] {
             let description = description.expect("handle description");
             assert!(description.contains("code_retrieve"));
@@ -219,11 +292,51 @@ mod tests {
         for description in [
             replace["properties"]["new_text"]["description"].as_str(),
             replace_range["properties"]["new_text"]["description"].as_str(),
-            change["properties"]["new_text"]["description"].as_str(),
+            replace_change["properties"]["new_text"]["description"].as_str(),
+            replace_range_change["properties"]["new_text"]["description"].as_str(),
         ] {
             let description = description.expect("new_text description");
             assert!(description.contains("terminal newline"));
             assert!(description.contains("preserves"));
+        }
+    }
+
+    #[test]
+    fn transaction_changes_are_discriminated_and_closed_by_kind() {
+        let schema = change_schema();
+        let variants = schema["oneOf"].as_array().expect("change variants");
+        assert_eq!(variants.len(), 6);
+        let create = variants
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["enum"][0] == "create")
+            .expect("create change");
+        assert_eq!(create["required"], json!(["kind", "path", "content"]));
+        assert!(create["properties"].get("new_text").is_none());
+        assert_eq!(create["additionalProperties"], false);
+
+        for contract in CHANGE_CONTRACTS {
+            let variant = variants
+                .iter()
+                .find(|variant| variant["properties"]["kind"]["enum"][0] == contract.name)
+                .unwrap_or_else(|| panic!("missing {} change schema", contract.name));
+            let required = variant["required"]
+                .as_array()
+                .expect("required fields")
+                .iter()
+                .map(|field| field.as_str().expect("required field"))
+                .collect::<Vec<_>>();
+            assert_eq!(required, contract.required, "{} required", contract.name);
+
+            let mut advertised = variant["properties"]
+                .as_object()
+                .expect("change properties")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            advertised.sort_unstable();
+            let mut runtime = contract.allowed_fields().collect::<Vec<_>>();
+            runtime.sort_unstable();
+            assert_eq!(advertised, runtime, "{} allowed", contract.name);
         }
     }
 }

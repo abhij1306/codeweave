@@ -26,9 +26,10 @@ active runs are never evicted.
 
 The MCP surface is fixed at 25 tools: workspace, retrieval and intelligence;
 six narrow edits plus preview and transaction; ten Git operations; and the four
-Bash lifecycle operations. Requests use flat schemas accepted by the supported hosted clients,
-then cross a strict typed validation boundary. Unknown or operation-inapplicable
-fields are errors.
+Bash lifecycle operations. Top-level requests use flat schemas accepted by the
+supported hosted clients. The `code_preview` and `code_transaction` change
+arrays use a discriminated `oneOf` schema keyed by `kind`, matching the strict
+typed validation boundary. Unknown or operation-inapplicable fields are errors.
 
 Configuration requires `configVersion: 2` and rejects unknown fields at every
 level. Streamable HTTP is stateless and returns JSON. Stdio is available for
@@ -54,3 +55,5 @@ filesystem commit.
   partial output.
 - Semantic results are current only when the synchronized document hash still
   matches both disk and the live index; otherwise fallback evidence is returned.
+- Published diagnostic URIs are resolved to canonical workspace paths before
+  cache matching, including equivalent Windows URI casing and encoding.

@@ -10,7 +10,7 @@ pub fn code_intelligence() -> Value {
             "line": {"type": "integer", "minimum": 1, "description": "One-based line number."},
             "column": {"type": "integer", "minimum": 0, "description": "Zero-based UTF-16 code-unit offset within the line; CodeWeave converts it to the server's negotiated position encoding."},
             "new_name": {"type": "string"},
-            "max_results": {"type": "integer", "minimum": 1, "maximum": 9007199254740991_i64, "default": 20}
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20, "description": "Maximum references or diagnostics returned. Diagnostics also report total_count, result_count, and truncated."}
         },
         "required": ["operation"],
         "additionalProperties": false,

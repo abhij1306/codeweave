@@ -32,6 +32,9 @@ pub struct BashRunView {
     pub exit_code: Option<i32>,
     pub output: String,
     pub output_truncated: bool,
+    pub retention_policy: &'static str,
+    pub dropped_prefix_chars: usize,
+    pub retained_start_offset: usize,
     pub log_handle: String,
     pub status_fetch: serde_json::Value,
     pub pid: Option<u32>,
@@ -52,6 +55,9 @@ pub(crate) struct RunRecord {
     pub(crate) stderr: String,
     pub(crate) combined: String,
     pub(crate) output_truncated: bool,
+    pub(crate) stdout_dropped_chars: usize,
+    pub(crate) stderr_dropped_chars: usize,
+    pub(crate) combined_dropped_chars: usize,
     pid: Option<u32>,
     cancel_requested: bool,
     job: Option<Arc<WindowsJob>>,
@@ -382,6 +388,9 @@ impl BashSupervisor {
             stderr: String::new(),
             combined: String::new(),
             output_truncated: false,
+            stdout_dropped_chars: 0,
+            stderr_dropped_chars: 0,
+            combined_dropped_chars: 0,
             pid: None,
             cancel_requested: false,
             job: None,
@@ -575,6 +584,11 @@ impl BashSupervisor {
             OutputStream::Stderr => &record.stderr,
             OutputStream::Combined => &record.combined,
         };
+        let dropped_prefix_chars = match stream {
+            OutputStream::Stdout => record.stdout_dropped_chars,
+            OutputStream::Stderr => record.stderr_dropped_chars,
+            OutputStream::Combined => record.combined_dropped_chars,
+        };
         let requested_offset = continuation_offset(continuation, run_id, stream)
             .unwrap_or(0)
             .min(full.len());
@@ -591,7 +605,13 @@ impl BashSupervisor {
             "stream": stream.as_str(),
             "output": strip_ansi(&full[offset..end]),
             "continuation": next,
-            "total_chars": full.len()
+            "total_chars": dropped_prefix_chars + full.chars().count(),
+            "retained_chars": full.chars().count(),
+            "output_truncated": dropped_prefix_chars > 0,
+            "retention_policy": "tail",
+            "dropped_prefix_chars": dropped_prefix_chars,
+            "retained_start_offset": dropped_prefix_chars,
+            "continuation_scope": "retained_buffer"
         }))
     }
 
@@ -671,6 +691,9 @@ fn view(record: &RunRecord, max_output: usize) -> BashRunView {
         exit_code: record.exit_code,
         output,
         output_truncated: record.output_truncated || record.output.chars().count() > max_output,
+        retention_policy: "tail",
+        dropped_prefix_chars: record.combined_dropped_chars,
+        retained_start_offset: record.combined_dropped_chars,
         log_handle: format!("bash-log:{}", record.run_id),
         status_fetch: json!({"kind": "bash_status", "value": record.run_id}),
         pid: record.pid,
