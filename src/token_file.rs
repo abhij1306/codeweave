@@ -74,6 +74,20 @@ impl Drop for LocalDescriptor {
 }
 
 #[cfg(windows)]
+struct LocalWideString(windows_sys::core::PWSTR);
+
+#[cfg(windows)]
+impl Drop for LocalWideString {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::LocalFree(self.0 as _);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
 pub(crate) fn create_private(path: &Path, contents: &[u8]) -> Result<()> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::{
@@ -87,7 +101,10 @@ pub(crate) fn create_private(path: &Path, contents: &[u8]) -> Result<()> {
         Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL},
     };
 
-    let descriptor_text: Vec<u16> = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
+    let current_user_sid = current_user_sid_string()?;
+    let descriptor_text: Vec<u16> = format!(
+        "O:{current_user_sid}D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
+    )
         .encode_utf16()
         .chain(Some(0))
         .collect();
@@ -208,6 +225,26 @@ fn current_user_token_info() -> Result<Vec<usize>> {
             .context("reading the current Windows user SID");
     }
     Ok(buffer)
+}
+
+#[cfg(windows)]
+fn current_user_sid_string() -> Result<String> {
+    use windows_sys::Win32::Security::{Authorization::ConvertSidToStringSidW, TOKEN_USER};
+
+    let buffer = current_user_token_info()?;
+    let current_user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+    let mut sid_text = std::ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(current_user.User.Sid, &mut sid_text) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("formatting the current Windows user SID");
+    }
+    let sid_text = LocalWideString(sid_text);
+    let mut length = 0;
+    while unsafe { *sid_text.0.add(length) } != 0 {
+        length += 1;
+    }
+    String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text.0, length) })
+        .context("decoding the current Windows user SID")
 }
 
 #[cfg(windows)]
