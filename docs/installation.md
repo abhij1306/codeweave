@@ -40,37 +40,38 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 ```
 
-## Build CodeWeave
+## Install CodeWeave
 
 ```bash
-git clone <repository-url>
-cd codeweave
-cargo build --release
+cargo install --git https://github.com/abhij1306/codeweave --locked
 ```
 
 PowerShell:
 
 ```powershell
-cargo build --release
+cargo install --git https://github.com/abhij1306/codeweave --locked
 ```
 
 ## First-run setup and pre-flight
 
-Create a configuration and bearer token for a project with `init`, then validate the real startup path with `doctor`:
+Run the interactive installer. It creates the configuration and private bearer,
+validates the real startup path, and prints a ready-to-paste MCP client command:
 
 ```bash
-cargo run -- init --path /absolute/path/to/project
-cargo run -- doctor --config config.json
+codeweave install
 ```
 
 PowerShell:
 
 ```powershell
-cargo run -- init --path C:\Development\project
-cargo run -- doctor --config config.json
+codeweave install
 ```
 
-`init` refuses to replace an existing config unless given `--force`. `doctor` checks JSON/config validation, the workspace, Git, the HTTP port, bearer-token presence, eager index initialization, and Bash; a failed check produces a non-zero exit. It does not create a missing token — run `init` or start `serve` once after fixing the configuration.
+For non-interactive automation, use `codeweave init --path <repository>` followed
+by `codeweave doctor`. `init` refuses to replace an existing config unless given
+`--force`. `doctor` checks JSON/config validation, the workspace, Git, the HTTP
+port, bearer-token permissions, eager index initialization, and Bash; a failed
+check produces a non-zero exit.
 
 ## Configure
 
@@ -120,21 +121,22 @@ reference in the README and `docs/tools.md`.
 HTTP:
 
 ```bash
-cargo run --release -- --transport http --config config.json
+codeweave serve --transport http --config config.json
 ```
 
 Stdio:
 
 ```bash
-cargo run --release -- --transport stdio --config config.json
+codeweave serve --transport stdio --config config.json
 ```
 
 ## Update
 
 ```bash
-git pull --ff-only
-cargo test --release
-cargo build --release
+cargo install --git https://github.com/abhij1306/codeweave --locked --force
 ```
 
-Run `doctor` before replacing a running instance.
+Run `doctor` before replacing a running instance. Older Windows versions may
+have created a token file with inherited permissions; if `doctor` rejects it,
+stop CodeWeave, remove only the configured token file, and start CodeWeave once
+to rotate it with a protected DACL.

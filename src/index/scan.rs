@@ -6,7 +6,7 @@ use super::{
     IndexMetrics,
 };
 use crate::model::{AppError, AppResult};
-use crate::security::{relative_string, validate_relative};
+use crate::security::{read_workspace_file, relative_string, validate_relative};
 use crate::symbols::{extract_symbols, language_name, Symbol};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
@@ -640,24 +640,12 @@ pub(super) fn read_entry(
     max_file_bytes: usize,
     cached_files: &HashMap<String, FileEntry>,
 ) -> AppResult<Option<FileEntry>> {
-    let metadata = match fs::metadata(path) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    if metadata.len() as usize > max_file_bytes {
-        return Ok(None);
-    }
     let relative = relative_string(root, path);
-    let modified_ns = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    let bytes = match fs::read(path) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
+    let confined = match read_workspace_file(root, &relative, max_file_bytes)? {
+        Some(value) => value,
+        None => return Ok(None),
     };
+    let bytes = confined.bytes;
     if bytes.iter().take(8_192).any(|byte| *byte == 0) {
         return Ok(None);
     }
@@ -672,8 +660,8 @@ pub(super) fn read_entry(
     if let Some(cached) = cached_files.get(&relative) {
         if cached.hash == hash {
             let mut cached = cached.clone();
-            cached.size = metadata.len();
-            cached.modified_ns = modified_ns;
+            cached.size = confined.size;
+            cached.modified_ns = confined.modified_ns;
             return Ok(Some(cached));
         }
     }
@@ -694,8 +682,8 @@ pub(super) fn read_entry(
         language,
         document_type,
         symbols,
-        size: metadata.len(),
-        modified_ns,
+        size: confined.size,
+        modified_ns: confined.modified_ns,
     }))
 }
 

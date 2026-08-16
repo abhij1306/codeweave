@@ -4,13 +4,25 @@ CodeWeave is added to ChatGPT through the **Apps** interface using a public HTTP
 
 ## Before connecting
 
+Custom Apps in [Developer Mode](https://developers.openai.com/api/docs/guides/developer-mode)
+are available on ChatGPT Pro, Plus, Business, Enterprise, and Education plans
+on the web. In a managed workspace, you must be a workspace admin or have the
+RBAC permission to create custom Apps. Enable **Developer Mode** under
+**Settings → Security and login** before continuing.
+
+ChatGPT custom Apps support [OAuth 2.1](https://developers.openai.com/plugins/build/auth),
+no authentication, and mixed authentication. This setup uses **OAuth 2.1** at
+the public MCP gateway; the CodeWeave bearer remains a private credential only
+for the gateway-to-origin hop.
+
 Start CodeWeave locally:
 
 ```bash
-cargo run --release -- --transport http --config config.json
+codeweave serve --transport http --config config.json
 ```
 
-Then expose it with ngrok, Cloudflare Tunnel, or another trusted HTTPS reverse proxy as described in the root [README](../README.md#4-expose-codeweave-over-https).
+Then expose it through an MCP gateway or HTTPS reverse proxy that authenticates
+the external ChatGPT caller before it adds the private CodeWeave origin bearer.
 
 Your final URL must end in `/mcp`, for example:
 
@@ -30,9 +42,16 @@ The exact labels can vary by account, workspace policy, and current ChatGPT rele
 
 ## Authentication
 
-Do not paste `.mcp-token` into ChatGPT. That token protects the local CodeWeave origin and should be injected internally by ngrok or another trusted reverse proxy.
+Do not paste `.mcp-token` into ChatGPT. It is a private hop credential for the
+local origin, not external caller authentication.
 
-ChatGPT only needs the public HTTPS `/mcp` App URL.
+The public endpoint must require a caller identity supported by your ChatGPT
+workspace (normally an OAuth-capable MCP gateway) and inject the origin bearer
+only after that identity is accepted. A public URL by itself is never sufficient.
+
+`start-ngrok.ps1` now enforces HTTP Basic authentication and is suitable only
+for MCP clients that can send Basic credentials. Do not use it as a URL-only
+ChatGPT App endpoint.
 
 ## Verify safely
 

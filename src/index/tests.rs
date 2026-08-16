@@ -20,6 +20,27 @@ fn test_entry(path: &str, content: &str) -> FileEntry {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn incremental_refresh_does_not_follow_symlinks_outside_workspace() {
+    use std::collections::HashSet;
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.rs"), "fn outside_secret() {}\n").unwrap();
+    let exclusions = WorkspaceExclusions::new(root.path(), &[]).unwrap();
+    let mut index = CodeIndex::scan(root.path(), 1_000_000, &[], &exclusions).unwrap();
+    let link = root.path().join("linked.rs");
+    symlink(outside.path().join("secret.rs"), &link).unwrap();
+
+    index
+        .refresh_paths(root.path(), &HashSet::from([link]), 1_000_000, &exclusions)
+        .unwrap();
+
+    assert!(index.get("linked.rs").is_none());
+}
+
 #[test]
 fn handles_round_trip() {
     let original = RangeHandle {

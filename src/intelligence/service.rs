@@ -2,13 +2,14 @@ use super::normalize::{normalize_locations, normalize_reference_locations};
 use super::sync::DocumentSnapshot;
 use super::worker::{LspPreset, LspWorker, WorkerOperation, WorkerResponse};
 use super::workspace_edit::workspace_edit_changes;
-use crate::index::CodeIndex;
+use crate::index::{content_hash, CodeIndex};
 use crate::model::{AppError, AppResult, IntelligenceSettings};
 use crate::reference_service::{ReferenceService, SemanticReferenceMetadata};
-use crate::security::validate_relative;
+use crate::security::{read_workspace_file, validate_relative};
 use crate::symbols::{extract_symbols, language_name, parse_has_error};
 use parking_lot::RwLock;
 use serde_json::{json, Value};
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,37 +25,30 @@ pub struct IntelligenceService {
     typescript: Arc<LspWorker>,
 }
 
-pub trait CodeIntelligenceBackend: Send + Sync {
-    fn definition(&self, path: &Path, line: usize, column: usize) -> AppResult<Value>;
-    fn diagnostics(&self, path: &Path) -> AppResult<Value>;
+fn definition_from_content(
+    parse_path: &Path,
+    relative: &str,
+    content: &str,
+    line: usize,
+) -> AppResult<Value> {
+    let symbol = extract_symbols(parse_path, content)
+        .into_iter()
+        .find(|symbol| symbol.start_line <= line && symbol.end_line >= line);
+    Ok(json!({
+        "evidence": "syntactic",
+        "result": symbol.map(|symbol| json!({"path": relative, "symbol": symbol}))
+    }))
 }
 
-#[derive(Default)]
-pub struct TreeSitterBackend;
-
-impl CodeIntelligenceBackend for TreeSitterBackend {
-    fn definition(&self, path: &Path, line: usize, _column: usize) -> AppResult<Value> {
-        let content = fs::read_to_string(path)?;
-        let symbol = extract_symbols(path, &content)
-            .into_iter()
-            .find(|symbol| symbol.start_line <= line && symbol.end_line >= line);
-        Ok(json!({
-            "evidence": "syntactic",
-            "result": symbol.map(|symbol| json!({"path": path, "symbol": symbol}))
-        }))
-    }
-
-    fn diagnostics(&self, path: &Path) -> AppResult<Value> {
-        let content = fs::read_to_string(path)?;
-        Ok(json!({
-            "evidence": "syntactic",
-            "diagnostics": if parse_has_error(path, &content) == Some(true) {
-                vec![json!({"severity": "error", "message": "Tree-sitter reported a syntax error"})]
-            } else {
-                Vec::<Value>::new()
-            }
-        }))
-    }
+fn diagnostics_from_content(path: &Path, content: &str) -> AppResult<Value> {
+    Ok(json!({
+        "evidence": "syntactic",
+        "diagnostics": if parse_has_error(path, content) == Some(true) {
+            vec![json!({"severity": "error", "message": "Tree-sitter reported a syntax error"})]
+        } else {
+            Vec::<Value>::new()
+        }
+    }))
 }
 
 impl IntelligenceService {
@@ -126,7 +120,7 @@ impl IntelligenceService {
         }
     }
 
-    fn relative_and_local_path(&self, params: &Value) -> AppResult<(String, PathBuf)> {
+    fn indexed_target(&self, params: &Value) -> AppResult<(String, PathBuf, String)> {
         let relative = params
             .get("path")
             .and_then(Value::as_str)
@@ -134,7 +128,29 @@ impl IntelligenceService {
         let relative = validate_relative(relative)?
             .to_string_lossy()
             .replace('\\', "/");
-        Ok((relative.clone(), self.root.join(relative)))
+        let (content, indexed_hash) = self
+            .index
+            .read()
+            .get(&relative)
+            .map(|entry| (entry.content.clone(), entry.hash.clone()))
+            .ok_or_else(|| {
+                AppError::details(
+                    "LSP_INDEX_STALE",
+                    "Code-intelligence target is not present in the confined live index",
+                    json!({"path": relative}),
+                )
+            })?;
+        let current = read_workspace_file(&self.root, &relative, content.len().saturating_add(1))?
+            .and_then(|file| String::from_utf8(file.bytes).ok())
+            .filter(|current| content_hash(current) == indexed_hash)
+            .ok_or_else(|| {
+                AppError::details(
+                    "LSP_INDEX_STALE",
+                    "Code-intelligence target no longer matches the confined live index",
+                    json!({"path": relative}),
+                )
+            })?;
+        Ok((relative.clone(), self.root.join(&relative), current))
     }
 
     fn worker_for(&self, path: &Path) -> Option<&LspWorker> {
@@ -147,8 +163,13 @@ impl IntelligenceService {
         worker.configured().then_some(worker)
     }
 
-    fn document_for(&self, worker: &LspWorker, path: &Path) -> AppResult<DocumentSnapshot> {
-        DocumentSnapshot::read(path, worker.preset().language_id())
+    fn document_for(
+        &self,
+        worker: &LspWorker,
+        relative: &str,
+        content: String,
+    ) -> AppResult<DocumentSnapshot> {
+        DocumentSnapshot::from_content(&self.root, relative, worker.preset().language_id(), content)
     }
 
     fn verify_index_hash(&self, relative: &str, response: &WorkerResponse) -> AppResult<()> {
@@ -185,7 +206,7 @@ impl IntelligenceService {
     }
 
     fn definition(&self, params: &Value) -> AppResult<Value> {
-        let (_relative, path) = self.relative_and_local_path(params)?;
+        let (relative, path, content) = self.indexed_target(params)?;
         let line = params
             .get("line")
             .and_then(Value::as_u64)
@@ -194,7 +215,7 @@ impl IntelligenceService {
         let column = params.get("column").and_then(Value::as_u64).unwrap_or(0) as usize;
         if let Some(worker) = self.worker_for(&path) {
             let semantic = self
-                .document_for(worker, &path)
+                .document_for(worker, &relative, content.clone())
                 .and_then(|document| {
                     worker.execute(WorkerOperation::Definition { line, column }, document)
                 })
@@ -218,21 +239,22 @@ impl IntelligenceService {
                     }));
                 }
                 Err(error) => {
-                    return self.definition_fallback(&path, line, column, Some(error));
+                    return self.definition_fallback(&relative, &path, &content, line, Some(error));
                 }
             }
         }
-        self.definition_fallback(&path, line, column, None)
+        self.definition_fallback(&relative, &path, &content, line, None)
     }
 
     fn definition_fallback(
         &self,
-        path: &Path,
+        relative: &str,
+        parse_path: &Path,
+        content: &str,
         line: usize,
-        column: usize,
         reason: Option<AppError>,
     ) -> AppResult<Value> {
-        let result = TreeSitterBackend.definition(path, line, column)?;
+        let result = definition_from_content(parse_path, relative, content, line)?;
         let mut response = json!({
             "operation": "definition",
             "backend": "fallback",
@@ -244,7 +266,7 @@ impl IntelligenceService {
     }
 
     fn diagnostics(&self, params: &Value) -> AppResult<Value> {
-        let (_relative, path) = self.relative_and_local_path(params)?;
+        let (relative, path, content) = self.indexed_target(params)?;
         let max_results = params
             .get("max_results")
             .and_then(Value::as_u64)
@@ -252,7 +274,7 @@ impl IntelligenceService {
             .clamp(1, 200) as usize;
         if let Some(worker) = self.worker_for(&path) {
             let semantic = self
-                .document_for(worker, &path)
+                .document_for(worker, &relative, content.clone())
                 .and_then(|document| worker.execute(WorkerOperation::Diagnostics, document));
             match semantic {
                 Ok(response) => {
@@ -276,6 +298,7 @@ impl IntelligenceService {
                 Err(error) => {
                     return self.diagnostics_fallback(
                         &path,
+                        &content,
                         max_results,
                         Some(error),
                         Some(worker.status()),
@@ -283,17 +306,18 @@ impl IntelligenceService {
                 }
             }
         }
-        self.diagnostics_fallback(&path, max_results, None, None)
+        self.diagnostics_fallback(&path, &content, max_results, None, None)
     }
 
     fn diagnostics_fallback(
         &self,
         path: &Path,
+        content: &str,
         max_results: usize,
         reason: Option<AppError>,
         semantic_backend: Option<Value>,
     ) -> AppResult<Value> {
-        let mut result = TreeSitterBackend.diagnostics(path)?;
+        let mut result = diagnostics_from_content(path, content)?;
         let (diagnostics, total_count, result_count, truncated) =
             limit_diagnostics(&result["diagnostics"], max_results)?;
         result["diagnostics"] = diagnostics;
@@ -319,7 +343,7 @@ impl IntelligenceService {
     }
 
     fn references(&self, params: &Value) -> AppResult<Value> {
-        let (relative, path) = self.relative_and_local_path(params)?;
+        let (relative, path, content) = self.indexed_target(params)?;
         let line = params
             .get("line")
             .and_then(Value::as_u64)
@@ -334,7 +358,7 @@ impl IntelligenceService {
         let snapshot_id = self.snapshot_id.read().clone();
 
         let semantic = self.worker_for(&path).map(|worker| {
-            self.document_for(worker, &path)
+            self.document_for(worker, &relative, content.clone())
                 .and_then(|document| {
                     worker.execute(WorkerOperation::References { line, column }, document)
                 })
@@ -404,7 +428,7 @@ impl IntelligenceService {
     }
 
     fn rename_preview(&self, params: &Value) -> AppResult<Value> {
-        let (relative, path) = self.relative_and_local_path(params)?;
+        let (relative, path, content) = self.indexed_target(params)?;
         let line = params
             .get("line")
             .and_then(Value::as_u64)
@@ -427,7 +451,7 @@ impl IntelligenceService {
                 column,
                 new_name: new_name.to_owned(),
             },
-            self.document_for(worker, &path)?,
+            self.document_for(worker, &relative, content)?,
         )?;
         self.verify_index_hash(&relative, &response)?;
         let changes = workspace_edit_changes(
@@ -548,6 +572,7 @@ mod tests {
         let result = service
             .diagnostics_fallback(
                 &path,
+                "value = 1\n",
                 20,
                 Some(AppError::new("LSP_TIMEOUT", "timed out")),
                 Some(json!({"readiness": "lazy", "last_error": "timed out"})),
@@ -579,5 +604,64 @@ mod tests {
         assert_eq!(total_count, 3);
         assert_eq!(result_count, 2);
         assert!(truncated);
+    }
+
+    #[test]
+    fn fallback_definition_serializes_only_the_workspace_relative_path() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("main.rs");
+        fs::write(&path, "fn relative_symbol() {}\n").unwrap();
+        let exclusions = WorkspaceExclusions::new(root.path(), &[]).unwrap();
+        let index = Arc::new(RwLock::new(
+            CodeIndex::scan(root.path(), 1_000_000, &[], &exclusions).unwrap(),
+        ));
+        let service = IntelligenceService::new(
+            root.path().to_path_buf(),
+            IntelligenceSettings::default(),
+            "relative-definition".to_owned(),
+            index,
+            Arc::new(RwLock::new("snap_relative_definition".to_owned())),
+        );
+
+        let result = service
+            .execute(&json!({"operation":"definition", "path":"main.rs", "line":1}))
+            .unwrap();
+
+        assert_eq!(result["result"]["result"]["path"], "main.rs");
+        assert!(!result
+            .to_string()
+            .contains(root.path().to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intelligence_never_reads_replaced_symlink_target_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = root.path().join("main.rs");
+        fs::write(&path, "fn safe_symbol() {}\n").unwrap();
+        fs::write(outside.path().join("secret.rs"), "fn outside_secret() {}\n").unwrap();
+        let exclusions = WorkspaceExclusions::new(root.path(), &[]).unwrap();
+        let index = Arc::new(RwLock::new(
+            CodeIndex::scan(root.path(), 1_000_000, &[], &exclusions).unwrap(),
+        ));
+        let service = IntelligenceService::new(
+            root.path().to_path_buf(),
+            IntelligenceSettings::default(),
+            "confined".to_owned(),
+            index,
+            Arc::new(RwLock::new("snap_confined".to_owned())),
+        );
+        fs::remove_file(&path).unwrap();
+        symlink(outside.path().join("secret.rs"), &path).unwrap();
+
+        let error = service
+            .execute(&json!({"operation":"definition", "path":"main.rs", "line":1}))
+            .unwrap_err();
+
+        assert_eq!(error.0.code, "LSP_INDEX_STALE");
+        assert!(!error.to_string().contains("outside_secret"));
     }
 }

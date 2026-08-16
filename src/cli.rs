@@ -1,4 +1,5 @@
 mod mcp_transport;
+mod token_file;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -45,9 +46,9 @@ fn test_bash_executable() -> String {
     "bash".to_owned()
 }
 
-const SERVER_NAME: &str = "codeweave-rust";
+const SERVER_NAME: &str = "codeweave";
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Transport {
     Http,
     Stdio,
@@ -79,6 +80,16 @@ enum Command {
         #[arg(long)]
         path: Option<PathBuf>,
         /// Overwrite an existing config.json instead of refusing.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run the interactive first-install wizard, validate the repository, and
+    /// print a ready-to-paste MCP client configuration.
+    Install {
+        /// Project directory to serve. Prompted for when omitted.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Replace an existing config without an overwrite prompt.
         #[arg(long)]
         force: bool,
     },
@@ -302,9 +313,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 fn load_or_create_bearer_token(path: &Path) -> Result<String> {
-    match std::fs::read_to_string(path) {
-        Ok(value) => {
-            validate_token_permissions(path)?;
+    match token_file::read_private(path)? {
+        Some(value) => {
             let token = value.trim();
             if token.is_empty() {
                 anyhow::bail!("bearer token file is empty: {}", path.display());
@@ -312,49 +322,23 @@ fn load_or_create_bearer_token(path: &Path) -> Result<String> {
             eprintln!("bearer authentication loaded from {}", path.display());
             Ok(token.to_owned())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        None => {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!("creating bearer token directory {}", parent.display())
                 })?;
             }
             let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options
-                .open(path)
-                .with_context(|| format!("creating bearer token file {}", path.display()))?;
-            file.write_all(token.as_bytes())
-                .with_context(|| format!("writing bearer token file {}", path.display()))?;
+            token_file::create_private(path, token.as_bytes())?;
             eprintln!("generated bearer token at {}", path.display());
             Ok(token)
         }
-        Err(error) => Err(error).with_context(|| format!("reading token file {}", path.display())),
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, windows))]
 fn validate_token_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(path)?.permissions().mode();
-    if mode & 0o077 != 0 {
-        anyhow::bail!(
-            "bearer token file {} must not be accessible by group or other users; run chmod 600 {}",
-            path.display(),
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_token_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+    token_file::validate_private(path)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,24 +528,19 @@ async fn doctor_checks(cli: &Cli) -> Vec<Check> {
 
     if matches!(cli.transport, Transport::Http) && server.auth_mode == "bearer" {
         let token_path = config_relative_path(&cli.config, &server.token_file);
-        match std::fs::read_to_string(&token_path) {
-            Ok(value) if !value.trim().is_empty() => {
-                match validate_token_permissions(&token_path) {
-                    Ok(()) => checks.push(Check::ok(
-                        "token",
-                        format!("{} is present and protected", token_path.display()),
-                    )),
-                    Err(error) => checks.push(Check::fail("token", error.to_string())),
-                }
-            }
-            Ok(_) => checks.push(Check::fail(
+        match token_file::read_private(&token_path) {
+            Ok(Some(value)) if !value.trim().is_empty() => checks.push(Check::ok(
+                "token",
+                format!("{} is present and protected", token_path.display()),
+            )),
+            Ok(Some(_)) => checks.push(Check::fail(
                 "token",
                 format!(
                     "{} is empty; delete it and run serve, or write a token",
                     token_path.display()
                 ),
             )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(Check::fail(
+            Ok(None) => checks.push(Check::fail(
                 "token",
                 format!(
                     "{} is missing; run serve once or run init",
@@ -644,26 +623,81 @@ async fn run_doctor(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn run_init(cli: &Cli, requested_path: Option<PathBuf>, force: bool) -> Result<()> {
+fn prompt(
+    input: &mut impl io::BufRead,
+    output: &mut impl Write,
+    label: &str,
+    default: &str,
+) -> Result<String> {
+    write!(output, "{label} [{default}]: ").context("writing installer prompt")?;
+    output.flush().context("flushing installer prompt")?;
+    let mut answer = String::new();
+    input
+        .read_line(&mut answer)
+        .context("reading installer response")?;
+    let answer = answer.trim();
+    Ok(if answer.is_empty() {
+        default.to_owned()
+    } else {
+        answer.to_owned()
+    })
+}
+
+fn prompt_yes_no(
+    input: &mut impl io::BufRead,
+    output: &mut impl Write,
+    label: &str,
+    default: bool,
+) -> Result<bool> {
+    let suffix = if default { "Y/n" } else { "y/N" };
+    loop {
+        write!(output, "{label} [{suffix}]: ").context("writing installer prompt")?;
+        output.flush().context("flushing installer prompt")?;
+        let mut answer = String::new();
+        input
+            .read_line(&mut answer)
+            .context("reading installer response")?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" => return Ok(default),
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => writeln!(output, "Please answer yes or no.")?,
+        }
+    }
+}
+
+fn requested_project(
+    requested_path: Option<PathBuf>,
+    input: &mut impl io::BufRead,
+    output: &mut impl Write,
+) -> Result<PathBuf> {
     let project = match requested_path {
         Some(path) => path,
         None => {
             let cwd = std::env::current_dir().context("reading current directory")?;
-            print!("Project directory [{}]: ", cwd.display());
-            io::stdout().flush().context("flushing prompt")?;
-            let mut input = String::new();
-            io::stdin()
-                .read_line(&mut input)
-                .context("reading project directory")?;
-            let trimmed = input.trim();
-            if trimmed.is_empty() {
-                cwd
-            } else {
-                PathBuf::from(trimmed)
-            }
+            PathBuf::from(prompt(
+                input,
+                output,
+                "Project directory",
+                &cwd.to_string_lossy(),
+            )?)
         }
     };
-    let project = security::canonical_root(&project).map_err(|error| anyhow::anyhow!(error))?;
+    security::canonical_root(&project).map_err(|error| anyhow::anyhow!(error))
+}
+
+struct InitializedConfig {
+    project: PathBuf,
+    server: ServerConfig,
+    token_path: PathBuf,
+}
+
+fn write_initial_config(
+    cli: &Cli,
+    project: PathBuf,
+    force: bool,
+    port: Option<u16>,
+) -> Result<InitializedConfig> {
     if cli.config.exists() && !force {
         anyhow::bail!(
             "{} already exists; rerun with --force to replace it",
@@ -674,6 +708,9 @@ fn run_init(cli: &Cli, requested_path: Option<PathBuf>, force: bool) -> Result<(
     let mut template: Value = serde_json::from_str(include_str!("../config.example.json"))
         .context("parsing embedded config.example.json")?;
     template["workspace"]["path"] = Value::String(project.to_string_lossy().into_owned());
+    if let Some(port) = port {
+        template["server"]["port"] = json!(port);
+    }
     let rendered =
         serde_json::to_string_pretty(&template).context("serializing config template")?;
     if let Some(parent) = cli
@@ -692,18 +729,151 @@ fn run_init(cli: &Cli, requested_path: Option<PathBuf>, force: bool) -> Result<(
     if server.auth_mode == "bearer" {
         load_or_create_bearer_token(&token_path)?;
     }
-    println!(
+    Ok(InitializedConfig {
+        project,
+        server,
+        token_path,
+    })
+}
+
+fn run_init(cli: &Cli, requested_path: Option<PathBuf>, force: bool) -> Result<()> {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let project = requested_project(requested_path, &mut input, &mut output)?;
+    let initialized = write_initial_config(cli, project, force, None)?;
+    writeln!(
+        output,
         "Created {} for {}.",
         cli.config.display(),
-        project.display()
-    );
-    println!("Local MCP URL: http://{}:{}/mcp", server.host, server.port);
-    if server.auth_mode == "bearer" {
-        println!("Origin bearer token: {}", token_path.display());
+        initialized.project.display()
+    )?;
+    writeln!(
+        output,
+        "Local MCP URL: http://{}:{}/mcp",
+        initialized.server.host, initialized.server.port
+    )?;
+    if initialized.server.auth_mode == "bearer" {
+        writeln!(
+            output,
+            "Origin bearer token: {}",
+            initialized.token_path.display()
+        )?;
     }
-    println!("Next: codeweave serve --config {}", cli.config.display());
-    println!("Then follow docs/connect-chatgpt.md or docs/connect-claude.md to expose the local URL over HTTPS.");
+    writeln!(output, "Next: codeweave serve --config {}", cli.config.display())?;
+    writeln!(output, "Then follow docs/connect-chatgpt.md or docs/connect-claude.md for an authenticated HTTPS gateway.")?;
     Ok(())
+}
+
+async fn run_install_with_io(
+    cli: &Cli,
+    requested_path: Option<PathBuf>,
+    force: bool,
+    input: &mut impl io::BufRead,
+    output: &mut impl Write,
+) -> Result<()> {
+    writeln!(output, "CodeWeave interactive installation")?;
+    writeln!(output, "-------------------------------")?;
+    let project = requested_project(requested_path, input, output)?;
+    let overwrite = if cli.config.exists() && !force {
+        prompt_yes_no(
+            input,
+            output,
+            &format!("Replace existing {}?", cli.config.display()),
+            false,
+        )?
+    } else {
+        force
+    };
+    if cli.config.exists() && !overwrite {
+        anyhow::bail!("installation canceled; existing config was left unchanged");
+    }
+
+    writeln!(output, "How will your MCP client connect?")?;
+    writeln!(output, "  1) stdio — local clients; no listening port (recommended)")?;
+    writeln!(output, "  2) HTTP  — loopback server for an authenticated gateway")?;
+    let transport = loop {
+        match prompt(input, output, "Connection", "1")?.as_str() {
+            "1" | "stdio" => break Transport::Stdio,
+            "2" | "http" => break Transport::Http,
+            _ => writeln!(output, "Choose 1 (stdio) or 2 (HTTP).")?,
+        }
+    };
+    let port = if transport == Transport::Http {
+        loop {
+            let value = prompt(input, output, "Local HTTP port", &default_port().to_string())?;
+            match value.parse::<u16>() {
+                Ok(port) if port > 0 => break Some(port),
+                _ => writeln!(output, "Enter a port from 1 to 65535.")?,
+            }
+        }
+    } else {
+        None
+    };
+
+    let initialized = write_initial_config(cli, project, true, port)?;
+    writeln!(output, "\nValidating the generated installation...")?;
+    let validation_cli = Cli {
+        command: None,
+        config: cli.config.clone(),
+        transport,
+        host: cli.host.clone(),
+        port: port.or(cli.port),
+    };
+    let checks = doctor_checks(&validation_cli).await;
+    let failed = checks.iter().any(|check| !check.ok);
+    for check in &checks {
+        let status = if check.ok { "ok" } else { "FAIL" };
+        writeln!(output, "[{status}] {} — {}", check.name, check.detail)?;
+    }
+    if failed {
+        anyhow::bail!("installation was created, but validation failed; fix the checks above and run `codeweave doctor`");
+    }
+
+    let executable = std::env::current_exe().context("resolving the CodeWeave executable")?;
+    let config = std::fs::canonicalize(&cli.config).unwrap_or_else(|_| cli.config.clone());
+    writeln!(
+        output,
+        "\nInstallation complete for {}.",
+        initialized.project.display()
+    )?;
+    match transport {
+        Transport::Stdio => {
+            let client = json!({
+                "command": executable,
+                "args": ["serve", "--transport", "stdio", "--config", config]
+            });
+            writeln!(output, "Paste this command configuration into a local MCP client:")?;
+            writeln!(output, "{}", serde_json::to_string_pretty(&client)?)?;
+        }
+        Transport::Http => {
+            writeln!(
+                output,
+                "Start: codeweave serve --transport http --config {}",
+                config.display()
+            )?;
+            writeln!(
+                output,
+                "Local URL: http://{}:{}/mcp",
+                initialized.server.host, initialized.server.port
+            )?;
+            writeln!(
+                output,
+                "Origin token: {} (keep private; a public gateway must authenticate callers separately)",
+                initialized.token_path.display()
+            )?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_install(cli: &Cli, requested_path: Option<PathBuf>, force: bool) -> Result<()> {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    run_install_with_io(cli, requested_path, force, &mut input, &mut output).await
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -717,6 +887,10 @@ pub(crate) async fn main() -> Result<()> {
         Some(Command::Init { path, force }) => {
             let (path, force) = (path.clone(), *force);
             run_init(&cli, path, force)
+        }
+        Some(Command::Install { path, force }) => {
+            let (path, force) = (path.clone(), *force);
+            run_install(&cli, path, force).await
         }
         Some(Command::Doctor) => run_doctor(&cli).await,
     }
@@ -763,6 +937,57 @@ async fn run_serve(cli: Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn powershell_literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    #[cfg(windows)]
+    fn run_ngrok_helper(username: &str, password: &str, token: &str) -> std::process::Output {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config.json");
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&json!({
+                "server": {
+                    "authMode": "bearer",
+                    "port": 8813,
+                    "tokenFile": ".mcp-token",
+                    "allowedHosts": ["*"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.path().join(".mcp-token"), token).unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("start-ngrok.ps1");
+        let command = format!(
+            "function global:ngrok {{}}; \
+             $credential = [PSCredential]::new({}, (ConvertTo-SecureString {} -AsPlainText -Force)); \
+             & {} -Config {} -ClientCredential $credential",
+            powershell_literal(username),
+            powershell_literal(password),
+            powershell_literal(&script.to_string_lossy()),
+            powershell_literal(&config.to_string_lossy()),
+        );
+        let encoded_bytes: Vec<u8> = command
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+
+        ProcessCommand::new("pwsh.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &STANDARD.encode(encoded_bytes),
+            ])
+            .output()
+            .unwrap()
+    }
 
     fn cli_for(config: PathBuf) -> Cli {
         Cli {
@@ -852,6 +1077,47 @@ mod tests {
         );
         assert!(config_relative_path(&config_path, ".mcp-token").is_file());
         assert!(run_init(&cli, Some(project.path().to_path_buf()), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn interactive_install_defaults_to_stdio_and_prints_client_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        let cli = Cli {
+            command: Some(Command::Install {
+                path: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+                force: false,
+            }),
+            config: config_path.clone(),
+            transport: Transport::Http,
+            host: None,
+            port: None,
+        };
+        let mut input = io::Cursor::new(b"\n");
+        let mut output = Vec::new();
+
+        run_install_with_io(
+            &cli,
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            false,
+            &mut input,
+            &mut output,
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Installation complete"));
+        assert!(output.contains("\"stdio\""));
+        assert!(output.contains("\"command\""));
+        assert!(output.contains("port — skipped for stdio transport"));
+        assert!(config_path.is_file());
+    }
+
+    #[test]
+    fn install_subcommand_is_discoverable() {
+        let cli = Cli::parse_from(["codeweave", "install", "--path", "."]);
+        assert!(matches!(cli.command, Some(Command::Install { .. })));
     }
 
     #[test]
@@ -1381,6 +1647,88 @@ mod tests {
         assert_eq!(resolved, PathBuf::from("C:/path/to/codeweave/.mcp-token"));
     }
 
+    #[test]
+    fn ngrok_helper_authenticates_public_caller_before_injecting_origin_token() {
+        let script = include_str!("../start-ngrok.ps1");
+        let basic_auth = script.find("type: basic-auth").unwrap();
+        let remove_headers = script.find("type: remove-headers").unwrap();
+        let inject_origin = script.find("authorization: $OriginAuthorization").unwrap();
+
+        assert!(script.contains("[Parameter(Mandatory = $true)]"));
+        assert!(script.contains("enforce: true"));
+        assert!(basic_auth < remove_headers);
+        assert!(remove_headers < inject_origin);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ngrok_helper_rejects_interpolation_in_each_sensitive_input() {
+        for (username, password, token, expected) in [
+            (
+                "user${name}",
+                "safe-password",
+                "safe-token",
+                "public tunnel username",
+            ),
+            (
+                "safe-user",
+                "pass${word}",
+                "safe-token",
+                "public tunnel password",
+            ),
+            (
+                "safe-user",
+                "safe-password",
+                "token${value}",
+                "bearer token",
+            ),
+        ] {
+            let output = run_ngrok_helper(username, password, token);
+            let message = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!output.status.success(), "{message}");
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains("must not contain"), "{message}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ngrok_helper_preserves_valid_credentials_and_token() {
+        let output = run_ngrok_helper("safe-user", "safe-password", "safe-token");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn generated_windows_token_has_a_protected_explicit_acl() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("token");
+
+        let token = load_or_create_bearer_token(&path).unwrap();
+
+        assert!(!token.is_empty());
+        validate_token_permissions(&path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inherited_windows_token_acl_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("token");
+        std::fs::write(&path, "not-private").unwrap();
+
+        assert!(validate_token_permissions(&path).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn generated_token_is_exclusive_and_private() {
@@ -1409,7 +1757,7 @@ mod tests {
         assert_eq!(server.port, 8813);
         assert_eq!(
             server.allowed_hosts,
-            ["localhost", "127.0.0.1", "::1", "codeweave.example.com"].map(str::to_owned)
+            ["localhost", "127.0.0.1", "::1"].map(str::to_owned)
         );
         assert!(!server.allowed_hosts.iter().any(|host| host == "*"));
 

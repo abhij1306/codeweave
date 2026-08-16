@@ -28,6 +28,21 @@ use crate::tools::ToolAccess;
 use crate::{health, is_loopback, live, tool_failure, tool_result, AppState, Cli, SERVER_NAME};
 
 const INSTRUCTIONS: &str = "Use code_retrieve for repository discovery and exact reads, code_intelligence for semantic operations, the narrow edit tools for one-file changes, and code_preview/code_transaction for coordinated changes. Run commands with bash and use the narrowly scoped Git tools for repository operations. CodeWeave serves one shared repository fixed in config.json.";
+const MAX_MCP_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BUFFERED_MCP_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CONCURRENT_MCP_BODY_COLLECTIONS: usize =
+    MAX_BUFFERED_MCP_REQUEST_BYTES / MAX_MCP_REQUEST_BYTES;
+const MAX_HTTP_CONNECTIONS: usize = 128;
+
+#[derive(Clone)]
+struct McpBodyBudget(Arc<tokio::sync::Semaphore>);
+
+impl McpBodyBudget {
+    fn new(permits: usize) -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(permits)))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct CodeWeaveMcp {
     state: AppState,
@@ -102,6 +117,38 @@ async fn require_auth(State(state): State<AppState>, request: Request, next: Nex
     }
 }
 
+async fn limit_mcp_body(
+    State(budget): State<McpBodyBudget>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let _permit = match budget.0.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({
+                    "error": "MCP request body capacity is temporarily exhausted"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let (parts, body) = request.into_parts();
+    match axum::body::to_bytes(body, MAX_MCP_REQUEST_BYTES).await {
+        Ok(bytes) => next
+            .run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+            .await,
+        Err(_) => (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            axum::Json(serde_json::json!({
+                "error": "request body exceeds the 4 MiB MCP limit"
+            })),
+        )
+            .into_response(),
+    }
+}
+
 pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
     if let Some(host) = &cli.host {
         state.server.host = host.clone();
@@ -113,6 +160,22 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
         anyhow::bail!("refusing unauthenticated HTTP on non-loopback host")
     }
 
+    let app = build_http_app(state.clone());
+
+    let address = format!("{}:{}", state.server.host, state.server.port);
+    let listener = tokio::net::TcpListener::bind(&address).await?;
+    eprintln!("{SERVER_NAME} listening on http://{address}/mcp");
+    serve_with_idle_timeout(listener, app, state.server.idle_timeout_ms).await
+}
+
+fn build_http_app(state: AppState) -> Router {
+    build_http_app_with_body_budget(
+        state,
+        McpBodyBudget::new(MAX_CONCURRENT_MCP_BODY_COLLECTIONS),
+    )
+}
+
+fn build_http_app_with_body_budget(state: AppState, body_budget: McpBodyBudget) -> Router {
     let allowed_hosts = configured_allowed_hosts(&state.server);
 
     let mut config = StreamableHttpServerConfig::default();
@@ -134,19 +197,17 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
 
     let mcp_routes = Router::new()
         .nest_service("/mcp", service)
+        .layer(middleware::from_fn_with_state(
+            body_budget,
+            limit_mcp_body,
+        ))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
-    let app = Router::new()
+    Router::new()
         .route("/live", get(live))
         .route("/health", get(health))
         .merge(mcp_routes)
-        .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(state.clone());
-
-    let address = format!("{}:{}", state.server.host, state.server.port);
-    let listener = tokio::net::TcpListener::bind(&address).await?;
-    eprintln!("{SERVER_NAME} listening on http://{address}/mcp");
-    serve_with_idle_timeout(listener, app, state.server.idle_timeout_ms).await
+        .with_state(state)
 }
 
 fn is_accept_resource_exhaustion(error: &std::io::Error) -> bool {
@@ -170,13 +231,10 @@ fn is_accept_resource_exhaustion(error: &std::io::Error) -> bool {
 /// closed after the timeout. It resets per request and does not interrupt an
 /// in-flight request/response (e.g. a long foreground `bash` POST).
 ///
-/// HTTP version: we keep the auto (h1/h2) builder but only tune HTTP/1.1. Every
-/// real client here — the OpenAI connector, ngrok, curl — speaks HTTP/1.1 to the
-/// origin (TLS/ALPN is terminated at the tunnel, so h2c prior-knowledge does not
-/// reach us). `header_read_timeout` is an HTTP/1 setting; HTTP/2 has its own
-/// keep-alive knobs and would bypass the idle bound. Rather than add a parallel
-/// h2 idle configuration for traffic that never arrives, the idle guarantee is
-/// intentionally scoped to HTTP/1.1.
+/// HTTP/2 is disabled at the loopback origin because supported clients and
+/// tunnels speak HTTP/1.1 there, while h2c would bypass the HTTP/1 request-head
+/// idle bound. A fixed connection semaphore also bounds sockets and tasks before
+/// application authentication runs.
 async fn serve_with_idle_timeout(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -193,10 +251,16 @@ async fn serve_with_idle_timeout(
             .timer(TokioTimer::new())
             .header_read_timeout(std::time::Duration::from_millis(idle_timeout_ms));
     }
-    let builder = Arc::new(builder);
+    let builder = Arc::new(builder.http1_only());
+    let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS));
     let mut accept_backoff = std::time::Duration::from_millis(10);
 
     loop {
+        let permit = connection_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("HTTP connection limiter closed"))?;
         let (stream, _addr) = match listener.accept().await {
             Ok(accepted) => {
                 accept_backoff = std::time::Duration::from_millis(10);
@@ -237,6 +301,7 @@ async fn serve_with_idle_timeout(
         let service = TowerToHyperService::new(app.clone());
         let builder = builder.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let _ = builder.serve_connection_with_upgrades(io, service).await;
         });
     }
@@ -286,6 +351,116 @@ pub(crate) async fn run_stdio(state: AppState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        AppState {
+            manager: Arc::new(crate::manager::Application::default()),
+            server: crate::ServerConfig {
+                host: "127.0.0.1".to_owned(),
+                port: 8813,
+                auth_mode: "bearer".to_owned(),
+                token_file: ".mcp-token".to_owned(),
+                allowed_hosts: Vec::new(),
+                allowed_origins: Vec::new(),
+                idle_timeout_ms: 5000,
+            },
+            token: Some(Arc::new(b"test-token".to_vec())),
+            tool_access: Arc::new(crate::resolve_tool_access()),
+            instance_id: Arc::from("transport-test"),
+        }
+    }
+
+    #[tokio::test]
+    async fn real_mcp_route_rejects_body_over_four_mib() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::HOST, "127.0.0.1:8813")
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .body(Body::from(vec![b' '; MAX_MCP_REQUEST_BYTES + 1]))
+            .unwrap();
+
+        let response = build_http_app(test_state()).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn authentication_runs_before_oversized_body_collection() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::HOST, "127.0.0.1:8813")
+            .header(header::AUTHORIZATION, "Bearer wrong-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(vec![b' '; MAX_MCP_REQUEST_BYTES + 1]))
+            .unwrap();
+
+        let response = build_http_app(test_state()).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn small_authenticated_mcp_request_reaches_service() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::HOST, "127.0.0.1:8813")
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"transport-test","version":"1"}}}"#,
+            ))
+            .unwrap();
+
+        let response = build_http_app(test_state()).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn excess_request_is_rejected_when_body_budget_is_saturated() {
+        let budget = McpBodyBudget::new(1);
+        let permit = budget.0.clone().try_acquire_owned().unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::HOST, "127.0.0.1:8813")
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let response = build_http_app_with_body_budget(test_state(), budget)
+            .oneshot(request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(permit);
+    }
+
+    #[test]
+    fn origin_connection_capacity_is_bounded() {
+        let limiter = tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS);
+        let permits = (0..MAX_HTTP_CONNECTIONS)
+            .map(|_| limiter.try_acquire())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(limiter.try_acquire().is_err());
+        drop(permits);
+        assert!(limiter.try_acquire().is_ok());
+    }
 
     #[test]
     fn accept_resource_exhaustion_classifies_common_platform_codes() {

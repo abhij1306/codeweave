@@ -7,10 +7,11 @@ CodeWeave is added to Claude as a custom **Connector** using a public HTTPS MCP 
 Terminal 1:
 
 ```bash
-cargo run --release -- --transport http --config config.json
+codeweave serve --transport http --config config.json
 ```
 
-Terminal 2 starts ngrok, Cloudflare Tunnel, or another trusted HTTPS reverse proxy. Follow the commands in the root [README](../README.md#4-expose-codeweave-over-https).
+Terminal 2 starts an MCP gateway or HTTPS reverse proxy that authenticates the
+external Claude caller before adding the private CodeWeave origin bearer.
 
 Use the public URL ending in `/mcp`:
 
@@ -30,9 +31,14 @@ The exact menu names can vary by Claude product and release.
 
 ## Authentication
 
-Do not enter `.mcp-token` in Claude. It is an internal origin credential used between the tunnel or reverse proxy and the local CodeWeave server.
+Do not enter `.mcp-token` in Claude. It is a private hop credential used between
+the authenticated gateway and the local CodeWeave server.
 
-Claude only receives the public HTTPS Connector URL.
+The public endpoint must require a caller identity supported by your Claude
+deployment. A public URL by itself is never sufficient. The bundled
+`start-ngrok.ps1` helper requires HTTP Basic authentication; use it only when
+the selected Claude client can attach those credentials. Otherwise use an
+OAuth-capable MCP gateway.
 
 ## Verify safely
 
