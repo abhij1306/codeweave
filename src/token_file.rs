@@ -17,15 +17,6 @@ pub(crate) fn create_private(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 #[cfg(unix)]
-pub(crate) fn validate_private(path: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        anyhow::bail!("bearer token file {} must not be a symlink", path.display());
-    }
-    validate_unix_metadata(path, &metadata)
-}
-
-#[cfg(unix)]
 fn validate_unix_metadata(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
