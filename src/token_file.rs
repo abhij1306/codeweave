@@ -36,7 +36,9 @@ pub(crate) fn read_private(path: &Path) -> Result<Option<String>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("inspecting token file {}", path.display())),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting token file {}", path.display()))
+        }
     };
     if metadata.file_type().is_symlink() {
         anyhow::bail!("bearer token file {} must not be a symlink", path.display());
@@ -102,12 +104,11 @@ pub(crate) fn create_private(path: &Path, contents: &[u8]) -> Result<()> {
     };
 
     let current_user_sid = current_user_sid_string()?;
-    let descriptor_text: Vec<u16> = format!(
-        "O:{current_user_sid}D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
-    )
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
+    let descriptor_text: Vec<u16> =
+        format!("O:{current_user_sid}D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let converted = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -158,14 +159,8 @@ fn well_known_sid(kind: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE) -> Re
 
     let mut sid = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
     let mut size = sid.len() as u32;
-    let created = unsafe {
-        CreateWellKnownSid(
-            kind,
-            std::ptr::null_mut(),
-            sid.as_mut_ptr() as _,
-            &mut size,
-        )
-    };
+    let created =
+        unsafe { CreateWellKnownSid(kind, std::ptr::null_mut(), sid.as_mut_ptr() as _, &mut size) };
     if created == 0 {
         return Err(std::io::Error::last_os_error()).context("creating a well-known Windows SID");
     }
@@ -197,17 +192,10 @@ fn current_user_token_info() -> Result<Vec<usize>> {
     let token = HandleGuard(token);
     let mut required = 0u32;
     unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            std::ptr::null_mut(),
-            0,
-            &mut required,
-        );
+        GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut required);
     }
     if required == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("sizing the current Windows user SID");
+        return Err(std::io::Error::last_os_error()).context("sizing the current Windows user SID");
     }
     let word = std::mem::size_of::<usize>();
     let mut buffer = vec![0usize; (required as usize).div_ceil(word)];
@@ -249,11 +237,9 @@ fn current_user_sid_string() -> Result<String> {
 
 #[cfg(windows)]
 pub(crate) fn validate_private(path: &Path) -> Result<()> {
-    use windows_sys::Win32::{
-        Security::{
-            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
-            ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-        },
+    use windows_sys::Win32::Security::{
+        Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+        ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     };
 
     let path_wide = wide_path(path);
@@ -291,9 +277,9 @@ fn validate_windows_descriptor(
 ) -> Result<()> {
     use windows_sys::Win32::{
         Security::{
-            EqualSid, GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE,
-            PSID, SE_DACL_PROTECTED, WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid,
-            WinLocalSystemSid,
+            EqualSid, GetAce, GetSecurityDescriptorControl, WinBuiltinAdministratorsSid,
+            WinCreatorOwnerRightsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, PSID,
+            SE_DACL_PROTECTED,
         },
         System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE},
     };
@@ -335,7 +321,8 @@ fn validate_windows_descriptor(
     for index in 0..ace_count {
         let mut raw_ace = std::ptr::null_mut();
         if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 {
-            return Err(std::io::Error::last_os_error()).context("reading Windows token DACL entry");
+            return Err(std::io::Error::last_os_error())
+                .context("reading Windows token DACL entry");
         }
         let header = unsafe { &*(raw_ace as *const windows_sys::Win32::Security::ACE_HEADER) };
         if header.AceType as u32 == ACCESS_DENIED_ACE_TYPE {
@@ -369,8 +356,8 @@ fn validate_private_handle(
     handle: windows_sys::Win32::Foundation::HANDLE,
 ) -> Result<()> {
     use windows_sys::Win32::Security::{
-        Authorization::{GetSecurityInfo, SE_FILE_OBJECT}, ACL, DACL_SECURITY_INFORMATION,
-        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+        ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     };
 
     let mut owner: PSID = std::ptr::null_mut();
@@ -404,8 +391,8 @@ pub(crate) fn read_private(path: &Path) -> Result<Option<String>> {
     use windows_sys::Win32::{
         Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{
-            CreateFileW, GetFileInformationByHandleEx, FILE_ATTRIBUTE_REPARSE_POINT,
-            FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FileAttributeTagInfo,
+            CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
             OPEN_EXISTING, READ_CONTROL,
         },
     };
@@ -447,7 +434,10 @@ pub(crate) fn read_private(path: &Path) -> Result<Option<String>> {
             .with_context(|| format!("inspecting token file {}", path.display()));
     }
     if tag_info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        anyhow::bail!("bearer token file {} must not be a reparse point", path.display());
+        anyhow::bail!(
+            "bearer token file {} must not be a reparse point",
+            path.display()
+        );
     }
     validate_private_handle(path, handle)?;
     let mut value = String::new();

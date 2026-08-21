@@ -6,6 +6,7 @@ Thank you for contributing.
 
 - Search existing issues and pull requests to avoid duplication.
 - Keep the change focused and avoid unrelated formatting churn.
+- Keep hand-maintained Rust files under `src/` and `tests/` at or below 800 logical lines; split files by responsibility when they grow beyond that limit.
 - Do not commit credentials, bearer tokens, private URLs, personal information, generated caches, or machine-specific absolute paths.
 - For vulnerabilities, follow the private reporting guidance in [SECURITY.md](SECURITY.md).
 

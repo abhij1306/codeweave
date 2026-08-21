@@ -1,6 +1,7 @@
 use super::normalize::{normalize_locations, normalize_reference_locations};
+use super::preset::LspPreset;
 use super::sync::DocumentSnapshot;
-use super::worker::{LspPreset, LspWorker, WorkerOperation, WorkerResponse};
+use super::worker::{LspWorker, WorkerOperation, WorkerResponse};
 use super::workspace_edit::workspace_edit_changes;
 use crate::index::{content_hash, CodeIndex};
 use crate::model::{AppError, AppResult, IntelligenceSettings};

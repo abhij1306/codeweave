@@ -134,8 +134,6 @@ Optional semantic backends are `rust-analyzer`, `basedpyright-langserver`, and
 `typescript-language-server`. They are disabled until enabled in the generated
 configuration.
 
-Do not commit `config.json`, `.mcp-token`, or `.codeweave-cache/`.
-
 ## Updating
 
 Install the newest release from GitHub:

@@ -24,8 +24,12 @@ use rmcp::{
 };
 use serde_json::Value;
 
-use crate::tools::ToolAccess;
-use crate::{health, is_loopback, live, tool_failure, tool_result, AppState, Cli, SERVER_NAME};
+use super::args::Cli;
+use super::config::ServerConfig;
+use super::server::{authorized, health, is_loopback, live, tool_failure, tool_result, AppState};
+use super::SERVER_NAME;
+use codeweave_rust::manager;
+use codeweave_rust::tools::ToolAccess;
 
 const INSTRUCTIONS: &str = "Use code_retrieve for repository discovery and exact reads, code_intelligence for semantic operations, the narrow edit tools for one-file changes, and code_preview/code_transaction for coordinated changes. Run commands with bash and use the narrowly scoped Git tools for repository operations. CodeWeave serves one shared repository fixed in config.json.";
 const MAX_MCP_REQUEST_BYTES: usize = 4 * 1024 * 1024;
@@ -92,7 +96,7 @@ impl ServerHandler for CodeWeaveMcp {
                 None,
             ));
         }
-        let result = match crate::manager::prepare_tool_request(name, args) {
+        let result = match manager::prepare_tool_request(name, args) {
             Ok(prepared) => self.state.manager.dispatch(name, &prepared).await,
             Err(error) => Err(error),
         };
@@ -106,7 +110,7 @@ impl ServerHandler for CodeWeaveMcp {
 }
 
 async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if crate::authorized(request.headers(), &state) {
+    if authorized(request.headers(), &state) {
         next.run(request).await
     } else {
         (
@@ -136,9 +140,10 @@ async fn limit_mcp_body(
     };
     let (parts, body) = request.into_parts();
     match axum::body::to_bytes(body, MAX_MCP_REQUEST_BYTES).await {
-        Ok(bytes) => next
-            .run(Request::from_parts(parts, axum::body::Body::from(bytes)))
-            .await,
+        Ok(bytes) => {
+            next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+                .await
+        }
         Err(_) => (
             axum::http::StatusCode::PAYLOAD_TOO_LARGE,
             axum::Json(serde_json::json!({
@@ -197,10 +202,7 @@ fn build_http_app_with_body_budget(state: AppState, body_budget: McpBodyBudget) 
 
     let mcp_routes = Router::new()
         .nest_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(
-            body_budget,
-            limit_mcp_body,
-        ))
+        .layer(middleware::from_fn_with_state(body_budget, limit_mcp_body))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .route("/live", get(live))
@@ -307,7 +309,7 @@ async fn serve_with_idle_timeout(
     }
 }
 
-fn configured_allowed_hosts(server: &crate::ServerConfig) -> Vec<String> {
+fn configured_allowed_hosts(server: &ServerConfig) -> Vec<String> {
     if server.allowed_hosts.iter().any(|host| host.trim() == "*") {
         return Vec::new();
     }
@@ -350,17 +352,20 @@ pub(crate) async fn run_stdio(state: AppState) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::ServerConfig;
+    use super::super::server::resolve_tool_access;
     use super::*;
     use axum::{
         body::Body,
         http::{header, Request, StatusCode},
     };
+    use codeweave_rust::manager::Application;
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
         AppState {
-            manager: Arc::new(crate::manager::Application::default()),
-            server: crate::ServerConfig {
+            manager: Arc::new(Application::default()),
+            server: ServerConfig {
                 host: "127.0.0.1".to_owned(),
                 port: 8813,
                 auth_mode: "bearer".to_owned(),
@@ -370,7 +375,7 @@ mod tests {
                 idle_timeout_ms: 5000,
             },
             token: Some(Arc::new(b"test-token".to_vec())),
-            tool_access: Arc::new(crate::resolve_tool_access()),
+            tool_access: Arc::new(resolve_tool_access()),
             instance_id: Arc::from("transport-test"),
         }
     }
@@ -476,7 +481,7 @@ mod tests {
 
     #[test]
     fn wildcard_allowed_host_disables_rmcp_host_guard_for_trusted_tunnels() {
-        let server = crate::ServerConfig {
+        let server = ServerConfig {
             host: "127.0.0.1".to_owned(),
             port: 8813,
             auth_mode: "bearer".to_owned(),
@@ -491,7 +496,7 @@ mod tests {
 
     #[test]
     fn configured_allowed_hosts_keeps_loopback_defaults() {
-        let server = crate::ServerConfig {
+        let server = ServerConfig {
             host: "127.0.0.1".to_owned(),
             port: 8813,
             auth_mode: "bearer".to_owned(),
@@ -509,7 +514,7 @@ mod tests {
 
     #[test]
     fn configured_allowed_hosts_brackets_ipv6_loopback_authorities() {
-        let server = crate::ServerConfig {
+        let server = ServerConfig {
             host: "::1".to_owned(),
             port: 8813,
             auth_mode: "bearer".to_owned(),
