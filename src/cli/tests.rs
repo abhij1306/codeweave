@@ -21,10 +21,9 @@ fn test_bash_executable() -> String {
 }
 
 use super::args::Transport;
-use super::config::{
-    config_relative_path, default_port, load_config, load_or_create_bearer_token,
-    validate_token_permissions,
-};
+#[cfg(windows)]
+use super::config::validate_token_permissions;
+use super::config::{config_relative_path, default_port, load_config, load_or_create_bearer_token};
 use super::doctor::doctor_checks;
 use super::install::{run_init, run_install_with_io};
 use super::server::{live, resolve_tool_access, AppState};
@@ -36,10 +35,11 @@ use codeweave_rust::{
     model, tools,
 };
 use serde_json::{json, Value};
+#[cfg(windows)]
+use std::process::Command as ProcessCommand;
 use std::{
     io,
     path::{Path, PathBuf},
-    process::Command as ProcessCommand,
     sync::Arc,
 };
 

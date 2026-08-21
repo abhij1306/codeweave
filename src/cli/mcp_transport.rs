@@ -10,8 +10,8 @@ use axum::{
 };
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
     transport::{
@@ -83,7 +83,7 @@ impl ServerHandler for CodeWeaveMcp {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let name = request.name.as_ref();
         let args = request
             .arguments
@@ -104,7 +104,8 @@ impl ServerHandler for CodeWeaveMcp {
             Ok(value) => tool_result(value),
             Err(error) => tool_failure(error),
         };
-        serde_json::from_value(value)
+        serde_json::from_value::<CallToolResult>(value)
+            .map(Into::into)
             .map_err(|error| McpError::internal_error(error.to_string(), None))
     }
 }
@@ -184,7 +185,7 @@ fn build_http_app_with_body_budget(state: AppState, body_budget: McpBodyBudget) 
     let allowed_hosts = configured_allowed_hosts(&state.server);
 
     let mut config = StreamableHttpServerConfig::default();
-    config.stateful_mode = false;
+    config.legacy_session_mode = false;
     config.json_response = true;
     config.sse_retry = None;
     config.allowed_hosts = allowed_hosts;

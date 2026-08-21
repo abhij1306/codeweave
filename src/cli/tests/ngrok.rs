@@ -1,4 +1,5 @@
-use super::*;
+#[cfg(windows)]
+use super::{json, Path, ProcessCommand};
 
 #[cfg(windows)]
 fn powershell_literal(value: &str) -> String {
