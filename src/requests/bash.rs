@@ -3,7 +3,7 @@
 use super::contract::Rejection;
 use crate::bash::OutputStream;
 use crate::bash::StartRequest;
-use crate::model::AppResult;
+use crate::error::AppResult;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;

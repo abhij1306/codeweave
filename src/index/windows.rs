@@ -5,7 +5,7 @@
 //! windows merge. Each file contributes at most a fixed number of windows, and
 //! files then take turns so one noisy file cannot fill the whole result.
 
-use crate::model::AppResult;
+use crate::error::AppResult;
 use std::collections::VecDeque;
 
 /// Hits of one file merged into a line range.

@@ -1,4 +1,4 @@
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::process_runtime::ProcessTree;
 use serde::Serialize;
 use serde_json::json;
@@ -69,10 +69,10 @@ impl CliGitBackend {
         let output = Self
             .run_raw_with_timeout(root, &args, GIT_DEFAULT_TIMEOUT, executable)
             .map_err(|error| {
-                if error.0.code == "GIT_UNAVAILABLE" {
-                    AppError::details(
-                        "GIT_UNAVAILABLE",
-                        error.0.message,
+                if error.code() == ErrorCode::GitUnavailable {
+                    AppError::with_details(
+                        ErrorCode::GitUnavailable,
+                        error.message(),
                         json!({"command": "git rev-parse --is-inside-work-tree"}),
                     )
                 } else {
@@ -82,8 +82,8 @@ impl CliGitBackend {
         if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true" {
             Ok(())
         } else {
-            Err(AppError::details(
-                "NOT_GIT_REPOSITORY",
+            Err(AppError::with_details(
+                ErrorCode::NotGitRepository,
                 "workspace.path must be a Git worktree",
                 json!({
                     "path": root,
@@ -128,7 +128,11 @@ impl CliGitBackend {
         let child = Self::command(root, args, executable)
             .spawn()
             .map_err(|error| {
-                AppError::details("GIT_UNAVAILABLE", error.to_string(), json!({"args": args}))
+                AppError::with_details(
+                    ErrorCode::GitUnavailable,
+                    error.to_string(),
+                    json!({"args": args}),
+                )
             })?;
         wait_for_output(child, args, timeout)
     }
@@ -218,8 +222,8 @@ fn checked_output(output: Output, args: &[String], max_chars: usize) -> AppResul
     let text = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        return Err(AppError::details(
-            "GIT_FAILED",
+        return Err(AppError::with_details(
+            ErrorCode::GitFailed,
             stderr.trim().to_owned(),
             json!({"args": args, "exit_code": output.status.code()}),
         ));
@@ -260,8 +264,8 @@ fn wait_for_output(mut child: Child, args: &[String], timeout: Duration) -> AppR
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(AppError::details(
-                    "GIT_TIMEOUT",
+                return Err(AppError::with_details(
+                    ErrorCode::GitTimeout,
                     "Git operation timed out",
                     json!({"args": args, "timeout_ms": timeout.as_millis() as u64}),
                 ));
@@ -271,8 +275,8 @@ fn wait_for_output(mut child: Child, args: &[String], timeout: Duration) -> AppR
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(AppError::details(
-                    "GIT_FAILED",
+                return Err(AppError::with_details(
+                    ErrorCode::GitFailed,
                     error.to_string(),
                     json!({"args": args}),
                 ));
@@ -465,8 +469,8 @@ impl RepositoryBackend for CliGitBackend {
             if stderr.contains("not a git repository") {
                 return Ok(RepoStatus::default());
             }
-            return Err(AppError::details(
-                "GIT_FAILED",
+            return Err(AppError::with_details(
+                ErrorCode::GitFailed,
                 stderr.trim().to_owned(),
                 json!({"args": args, "exit_code": output.status.code()}),
             ));
@@ -599,10 +603,10 @@ mod tests {
         let unavailable =
             CliGitBackend::require_worktree_with(root.path(), "definitely-missing-codeweave-git")
                 .unwrap_err();
-        assert_eq!(unavailable.0.code, "GIT_UNAVAILABLE");
+        assert_eq!(unavailable.code(), ErrorCode::GitUnavailable);
 
         let not_repository = CliGitBackend::require_worktree(root.path()).unwrap_err();
-        assert_eq!(not_repository.0.code, "NOT_GIT_REPOSITORY");
+        assert_eq!(not_repository.code(), ErrorCode::NotGitRepository);
     }
 
     #[test]
@@ -628,7 +632,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error.0.code, "GIT_TIMEOUT");
+        assert_eq!(error.code(), ErrorCode::GitTimeout);
     }
 
     #[test]

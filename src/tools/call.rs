@@ -6,8 +6,8 @@
 //! retry. Only an unknown tool name is a JSON-RPC error.
 
 use super::{find, mcp_tools};
+use crate::error::AppError;
 use crate::manager::Application;
-use crate::model::{AppError, ErrorBody};
 use rmcp::model::{CallToolResult, ContentBlock, ListToolsResult};
 use rmcp::ErrorData;
 use serde_json::{json, Map, Value};
@@ -46,15 +46,14 @@ fn success(value: Value) -> CallToolResult {
 }
 
 fn failure(error: AppError) -> CallToolResult {
-    let body = error.0;
-    let retry = Retry::of(&body);
+    let retry = Retry::of(&error);
     let structured = json!({
         "error": {
-            "code": body.code,
-            "message": body.message,
+            "code": error.code(),
+            "message": error.message(),
             "retryable": retry.retryable,
             "retry_kind": retry.kind,
-            "details": body.details
+            "details": error.details()
         }
     });
     result(structured, Some(true))
@@ -70,26 +69,18 @@ fn result(structured: Value, is_error: Option<bool>) -> CallToolResult {
     result
 }
 
-/// Errors whose request may be retried unchanged: the state it was checked
-/// against moved on, and a fresh attempt re-reads it.
-const RETRY_SAME_REQUEST: [&str; 4] = [
-    "STALE_SNAPSHOT",
-    "STALE_FILE",
-    "STALE_HANDLE",
-    "STALE_CONTINUATION",
-];
-
 /// How a client may retry a failed call. An error's own `details.retryable`
-/// and `details.retry_kind` take precedence over the code-based default.
+/// and `details.retry_kind` take precedence over the code-based default
+/// ([`crate::error::ErrorCode::retries_same_request`]).
 struct Retry {
     retryable: bool,
     kind: String,
 }
 
 impl Retry {
-    fn of(body: &ErrorBody) -> Self {
-        let details = body.details.as_ref();
-        let stale = RETRY_SAME_REQUEST.contains(&body.code.as_str());
+    fn of(error: &AppError) -> Self {
+        let details = error.details();
+        let stale = error.code().retries_same_request();
         let retryable = stale
             || details
                 .and_then(|details| details.get("retryable"))
@@ -116,6 +107,7 @@ impl Retry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorCode;
 
     fn wire(result: &CallToolResult) -> Value {
         serde_json::to_value(result).unwrap()
@@ -138,7 +130,7 @@ mod tests {
 
     #[test]
     fn a_stale_error_is_retryable_unchanged() {
-        let result = failure(AppError::new("STALE_FILE", "file changed"));
+        let result = failure(AppError::new(ErrorCode::StaleFile, "file changed"));
 
         assert_eq!(
             wire(&result),
@@ -162,10 +154,10 @@ mod tests {
     #[test]
     fn error_details_decide_retryability_for_other_codes() {
         let kinds = [
-            AppError::new("GIT_FAILED", "failed"),
-            AppError::details("BUSY", "busy", json!({"retryable": true})),
-            AppError::details(
-                "BUSY",
+            AppError::new(ErrorCode::GitFailed, "failed"),
+            AppError::with_details(ErrorCode::RunBusy, "busy", json!({"retryable": true})),
+            AppError::with_details(
+                ErrorCode::RunBusy,
                 "busy",
                 json!({"retryable": true, "retry_kind": "retry_after_poll"}),
             ),

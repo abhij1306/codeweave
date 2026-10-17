@@ -1,6 +1,6 @@
 //! Starting a command: the seam between the run supervisor and the operating
 //! system. The shell launcher spawns real Bash; tests use a scripted fake.
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::process_runtime::{ProcessGroup, SpawnedGroup};
 use serde_json::json;
 use std::fmt;
@@ -63,15 +63,15 @@ impl Launcher for ShellLauncher {
             group,
             warning,
         } = ProcessGroup::spawn(&mut process).map_err(|error| {
-            AppError::details(
-                "BASH_START_FAILED",
+            AppError::with_details(
+                ErrorCode::BashStartFailed,
                 error.to_string(),
                 json!({"bash_executable": self.executable, "command": command, "cwd": cwd}),
             )
         })?;
         let pipe = |missing: &str| {
             AppError::new(
-                "BASH_PIPE_FAILED",
+                ErrorCode::BashPipeFailed,
                 format!("Bash {missing} pipe is unavailable"),
             )
         };
@@ -95,7 +95,7 @@ impl Launcher for ShellLauncher {
 #[cfg(test)]
 pub(crate) mod fake {
     use super::{Launched, Launcher, ProcessExit};
-    use crate::model::AppResult;
+    use crate::error::AppResult;
     use crate::process_runtime::fake::{fake_group, FakeEvents, FakeReaction};
     use std::path::Path;
 

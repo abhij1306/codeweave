@@ -1,5 +1,5 @@
 use super::super::transport::TransportError;
-use crate::model::AppError;
+use crate::error::{AppError, ErrorCode};
 use serde_json::{json, Value};
 
 /// Why a semantic request did not produce a response. The restart policy and
@@ -104,62 +104,65 @@ impl WorkerError {
     pub(crate) fn to_app_error(&self) -> AppError {
         match self {
             WorkerError::Disabled { language } => AppError::new(
-                "SEMANTIC_BACKEND_UNAVAILABLE",
+                ErrorCode::SemanticBackendUnavailable,
                 format!("{language} language server is disabled"),
             ),
-            WorkerError::Busy { language } => AppError::details(
-                "LSP_BUSY",
+            WorkerError::Busy { language } => AppError::with_details(
+                ErrorCode::LspBusy,
                 "Language-server request queue is full",
                 json!({"language": language}),
             ),
-            WorkerError::Stopped => {
-                AppError::new("LSP_WORKER_STOPPED", "Language-server worker has stopped")
-            }
-            WorkerError::StartFailed { language, message } => AppError::details(
-                "LSP_START_FAILED",
+            WorkerError::Stopped => AppError::new(
+                ErrorCode::LspWorkerStopped,
+                "Language-server worker has stopped",
+            ),
+            WorkerError::StartFailed { language, message } => AppError::with_details(
+                ErrorCode::LspStartFailed,
                 message.clone(),
                 json!({"language": language}),
             ),
             WorkerError::TimedOut {
                 language,
                 stderr_tail,
-            } => AppError::details(
-                "LSP_TIMEOUT",
+            } => AppError::with_details(
+                ErrorCode::LspTimeout,
                 "Language-server response timed out",
                 json!({"language": language, "stderr_tail": stderr_tail}),
             ),
             WorkerError::ServerExited {
                 language,
                 stderr_tail,
-            } => AppError::details(
-                "LSP_TRANSPORT_ERROR",
+            } => AppError::with_details(
+                ErrorCode::LspTransportError,
                 "Language server exited or closed its connection",
                 json!({"language": language, "cause": "server_exited", "stderr_tail": stderr_tail}),
             ),
             WorkerError::Transport { message } => {
-                AppError::new("LSP_TRANSPORT_ERROR", message.clone())
+                AppError::new(ErrorCode::LspTransportError, message.clone())
             }
             WorkerError::Protocol { message, details } => match details {
-                Some(details) => {
-                    AppError::details("LSP_PROTOCOL_ERROR", message.clone(), details.clone())
-                }
-                None => AppError::new("LSP_PROTOCOL_ERROR", message.clone()),
+                Some(details) => AppError::with_details(
+                    ErrorCode::LspProtocolError,
+                    message.clone(),
+                    details.clone(),
+                ),
+                None => AppError::new(ErrorCode::LspProtocolError, message.clone()),
             },
-            WorkerError::Server { language, error } => AppError::details(
-                "LSP_ERROR",
+            WorkerError::Server { language, error } => AppError::with_details(
+                ErrorCode::LspError,
                 format!("{language} language-server request failed"),
                 error.clone(),
             ),
-            WorkerError::Unsupported { operation } => AppError::details(
-                "LSP_UNSUPPORTED",
+            WorkerError::Unsupported { operation } => AppError::with_details(
+                ErrorCode::LspUnsupported,
                 format!("Language server does not advertise {operation} support"),
                 json!({"operation": operation}),
             ),
             WorkerError::SyncUnsupported => AppError::new(
-                "LSP_SYNC_UNSUPPORTED",
+                ErrorCode::LspSyncUnsupported,
                 "Language server does not advertise document synchronization",
             ),
-            WorkerError::Request(error) => AppError(error.0.clone()),
+            WorkerError::Request(error) => error.clone(),
         }
     }
 }

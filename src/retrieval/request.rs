@@ -1,8 +1,8 @@
 //! Parsing `code_retrieve` operations into typed requests, once.
 
-use crate::contracts::{self, ErrorCode, READ_TARGETS};
+use crate::contracts::{self, READ_TARGETS};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::{FilenameQuery, SymbolQuery, TextQuery, TextSyntax};
-use crate::model::{AppError, AppResult};
 use crate::reference_service::{ReferenceQuery, ReferenceScope};
 use crate::symbols::ReferenceKind;
 use schemars::JsonSchema;
@@ -193,7 +193,8 @@ fn typed_operation(
         .collect::<Map<_, _>>();
     serde_path_to_error::deserialize(Value::Object(present)).map_err(|error| {
         let field = error.path().to_string();
-        ErrorCode::InvalidOperationField.error(
+        AppError::with_details(
+            ErrorCode::InvalidOperationField,
             format!(
                 "retrieval operation field '{field}' is invalid: {}",
                 error.inner()
@@ -228,7 +229,8 @@ fn parse_operation(
             let syntax = match input.syntax.as_deref() {
                 None => TextSyntax::Literal,
                 Some(value) => TextSyntax::parse(value).ok_or_else(|| {
-                    ErrorCode::InvalidOperationField.error(
+                    AppError::with_details(
+                        ErrorCode::InvalidOperationField,
                         "search_text syntax must be literal or regex",
                         json!({"operation": kind, "field": "syntax"}),
                     )
@@ -252,7 +254,8 @@ fn parse_operation(
         "repo_map" => SearchTarget::RepoMap,
         "read" => return read_operation(input).map(PreparedRetrievalOperation::Read),
         unsupported => {
-            return Err(ErrorCode::UnsupportedRetrievalOperation.error(
+            return Err(AppError::with_details(
+                ErrorCode::UnsupportedRetrievalOperation,
                 format!("unsupported retrieval operation '{unsupported}'"),
                 json!({
                     "operation": unsupported,
@@ -322,8 +325,8 @@ fn read_operation(input: RetrievalOperationInput) -> AppResult<ReadOperation> {
         "bash_log" => ReadTarget::BashLog(value),
         "continuation" => ReadTarget::Continuation(value),
         unsupported => {
-            return Err(AppError::details(
-                "UNSUPPORTED_READ_TARGET",
+            return Err(AppError::with_details(
+                ErrorCode::UnsupportedReadTarget,
                 format!("unsupported read target '{unsupported}'"),
                 json!({"target": unsupported, "supported": READ_TARGETS}),
             ))
@@ -344,7 +347,8 @@ fn required(field: &'static str, value: Option<String>) -> AppResult<String> {
     value
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            ErrorCode::InvalidOperationField.error(
+            AppError::with_details(
+                ErrorCode::InvalidOperationField,
                 format!("retrieval operation field '{field}' must be a non-empty string"),
                 json!({"field": field}),
             )
@@ -489,8 +493,8 @@ mod tests {
             ),
         ] {
             let error = prepare(operation).unwrap_err();
-            assert_eq!(error.0.code, "INVALID_ARGUMENT");
-            assert_eq!(error.0.message, message);
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert_eq!(error.message(), message);
         }
     }
 
@@ -503,8 +507,8 @@ mod tests {
         }))
         .unwrap_err();
 
-        assert_eq!(error.0.code, "INVALID_OPERATION_FIELD");
-        assert_eq!(error.0.details.unwrap()["field"], "max_results");
+        assert_eq!(error.code(), ErrorCode::InvalidOperationField);
+        assert_eq!(error.details().unwrap()["field"], "max_results");
     }
 
     #[test]

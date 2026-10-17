@@ -14,8 +14,9 @@ use super::util::{
     summarize_changed_paths, MAX_CHANGED_PATH_GROUPS, MAX_OBSERVED_CHANGED_PATHS,
 };
 use super::{validated_push_target, Workspace};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::content_hash;
-use crate::model::{AppError, AppResult, BashConfig, PolicyConfig, WorkspaceConfig};
+use crate::model::{BashConfig, PolicyConfig, WorkspaceConfig};
 use crate::repository::{RepoStatus, RepositoryBackend};
 use crate::requests::bash::{
     BashCancelRequest, BashOutputRequest, BashRequest, BashStartRequest, BashStatusRequest,
@@ -173,7 +174,7 @@ impl RepositoryBackend for ScriptedRepository {
         self.status
             .lock()
             .clone()
-            .ok_or_else(|| AppError::new("GIT_FAILED", "scripted status failure"))
+            .ok_or_else(|| AppError::new(ErrorCode::GitFailed, "scripted status failure"))
     }
     fn diff(&self, _: &Path, _: bool, _: &[String], _: usize) -> AppResult<String> {
         Ok(String::new())

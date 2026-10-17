@@ -12,8 +12,8 @@ mod call;
 
 pub use call::{call_tool, list_tools};
 
+use crate::error::AppResult;
 use crate::manager::Application;
-use crate::model::AppResult;
 use crate::requests::bash::{
     BashCancelRequest, BashOutputRequest, BashStartRequest, BashStatusRequest,
 };

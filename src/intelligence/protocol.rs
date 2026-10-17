@@ -1,4 +1,4 @@
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -167,7 +167,7 @@ pub(crate) fn parse_initialize_result(
 ) -> AppResult<ServerCapabilities> {
     let capabilities = result.get("capabilities").ok_or_else(|| {
         AppError::new(
-            "LSP_PROTOCOL_ERROR",
+            ErrorCode::LspProtocolError,
             "Initialize response does not contain capabilities",
         )
     })?;

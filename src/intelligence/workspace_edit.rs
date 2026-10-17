@@ -3,8 +3,8 @@
 use super::position::{lsp_position, offset_for_server_position};
 use super::protocol::PositionEncoding;
 use super::session::ResultFiles;
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::content_hash;
-use crate::model::{AppError, AppResult};
 use crate::requests::edit::Change;
 use serde_json::{json, Value};
 
@@ -44,7 +44,7 @@ impl RenameChange {
 }
 
 fn invalid_edit(message: &str) -> AppError {
-    AppError::new("INVALID_LSP_EDIT", message.to_owned())
+    AppError::new(ErrorCode::InvalidLspEdit, message.to_owned())
 }
 
 /// Compile `edit`. Every file is read through `files`, so each change's
@@ -62,7 +62,7 @@ pub(crate) fn workspace_edit_changes(
         for item in items {
             if item.get("kind").is_some() {
                 return Err(AppError::new(
-                    "UNSUPPORTED_WORKSPACE_EDIT",
+                    ErrorCode::UnsupportedWorkspaceEdit,
                     "LSP resource create/rename/delete operations are not supported",
                 ));
             }
@@ -74,7 +74,7 @@ pub(crate) fn workspace_edit_changes(
     }
     if documents.is_empty() {
         return Err(AppError::new(
-            "UNSUPPORTED_WORKSPACE_EDIT",
+            ErrorCode::UnsupportedWorkspaceEdit,
             "WorkspaceEdit contains no supported text edits",
         ));
     }
@@ -103,7 +103,7 @@ pub(crate) fn workspace_edit_changes(
         ranges.sort_by_key(|range| range.0);
         if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
             return Err(AppError::new(
-                "OVERLAPPING_LSP_EDITS",
+                ErrorCode::OverlappingLspEdits,
                 "LSP returned overlapping edits",
             ));
         }

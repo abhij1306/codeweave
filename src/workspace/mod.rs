@@ -21,8 +21,9 @@ use util::{char_boundary_at_or_before, summarize_changed_paths, ChangedPathSumma
 use state::ReconciledState;
 
 use crate::bash::BashSupervisor;
+use crate::error::{AppError, AppResult};
 use crate::index::{content_hash, CodeIndex, WorkspaceExclusions};
-use crate::model::{AppError, AppResult, PolicyConfig, WorkspaceConfig};
+use crate::model::{PolicyConfig, WorkspaceConfig};
 use crate::repository::{CliGitBackend, RepositoryBackend};
 use crate::retrieval::{execute_index_search, SearchRequest};
 use crate::security::canonical_root;

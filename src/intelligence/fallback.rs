@@ -2,7 +2,7 @@
 //! semantic backend is absent or its result cannot be trusted.
 use super::live_index::LiveIndex;
 use super::session::{FallbackReason, Session};
-use crate::model::AppResult;
+use crate::error::AppResult;
 use crate::symbols::{extract_symbols, parse_has_error};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -114,7 +114,7 @@ fn insert_reason(response: &mut Value, reason: Option<FallbackReason>, with_back
     let (Some(object), Some(reason)) = (response.as_object_mut(), reason) else {
         return;
     };
-    object.insert("fallback_reason".to_owned(), json!(reason.error.0));
+    object.insert("fallback_reason".to_owned(), json!(reason.error));
     if with_backend {
         object.insert("semantic_backend".to_owned(), reason.backend_status);
     }

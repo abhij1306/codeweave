@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::ErrorCode;
 
 #[test]
 fn fetch_batches_return_successes_and_item_errors() {
@@ -353,7 +354,7 @@ fn code_retrieve_rejects_a_stale_snapshot() {
         })))
         .unwrap_err();
 
-    assert_eq!(error.0.code, "STALE_SNAPSHOT");
+    assert_eq!(error.code(), ErrorCode::StaleSnapshot);
 }
 
 #[test]
@@ -367,7 +368,7 @@ fn fetch_rejects_a_stale_snapshot() {
             "items": [{"kind": "path", "value": "valid.rs"}]
         }))
         .unwrap_err();
-    assert_eq!(error.0.code, "STALE_SNAPSHOT");
+    assert_eq!(error.code(), ErrorCode::StaleSnapshot);
 }
 
 #[test]

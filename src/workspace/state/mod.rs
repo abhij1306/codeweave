@@ -31,8 +31,8 @@ mod ledger;
 
 pub(crate) use ledger::{temp_file_name, ChangeLedger, RunWindow};
 
+use crate::error::{AppError, AppResult};
 use crate::index::{CodeIndex, WorkspaceExclusions};
-use crate::model::{AppError, AppResult};
 use crate::repository::RepoStatus;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::path::PathBuf;

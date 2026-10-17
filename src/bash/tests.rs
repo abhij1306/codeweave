@@ -1,5 +1,6 @@
 use super::launch::fake::FakeLauncher;
 use super::*;
+use crate::error::ErrorCode;
 use crate::model::BashConfig;
 use crate::process_runtime::fake::FakeReaction;
 use crate::test_bash_executable;
@@ -54,7 +55,7 @@ async fn explicit_invalid_bash_path_reports_unavailable_before_starting() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.0.code, "BASH_UNAVAILABLE");
+    assert_eq!(error.code(), ErrorCode::BashUnavailable);
     assert!(supervisor.runs.records().is_empty());
 }
 
@@ -87,7 +88,7 @@ async fn cwd_must_exist_inside_workspace() {
         .await
         .unwrap_err();
     assert!(matches!(
-        missing.0.code.as_str(),
+        missing.code().as_str(),
         "PATH_NOT_FOUND" | "INVALID_CWD"
     ));
 
@@ -103,7 +104,7 @@ async fn cwd_must_exist_inside_workspace() {
         )
         .await
         .unwrap_err();
-    assert_eq!(escaped.0.code, "OUTSIDE_ROOT");
+    assert_eq!(escaped.code(), ErrorCode::OutsideRoot);
 }
 
 #[tokio::test]
@@ -122,7 +123,7 @@ async fn timeout_above_policy_maximum_is_rejected() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error.0.code, "INVALID_TIMEOUT");
+    assert_eq!(error.code(), ErrorCode::InvalidTimeout);
 }
 
 #[tokio::test]
@@ -383,7 +384,7 @@ async fn client_abort_keeps_the_detached_run_alive() {
         )
         .await
         .unwrap_err();
-    assert_eq!(retry.0.code, "RUN_BUSY");
+    assert_eq!(retry.code(), ErrorCode::RunBusy);
 
     // Wait for the abandoned command to finish and free the permit.
     for _ in 0..100 {
@@ -457,11 +458,8 @@ async fn identical_command_is_not_deduplicated() {
     let run_id = first["run_id"].as_str().unwrap().to_owned();
 
     let retry = supervisor.start(root.path(), request()).await.unwrap_err();
-    assert_eq!(retry.0.code, "RUN_BUSY");
-    assert_eq!(
-        retry.0.details.as_ref().unwrap()["active_run"]["run_id"],
-        run_id
-    );
+    assert_eq!(retry.code(), ErrorCode::RunBusy);
+    assert_eq!(retry.details().unwrap()["active_run"]["run_id"], run_id);
 
     // A genuinely different command still gets a busy error carrying the
     // active run so the model can poll or cancel.
@@ -477,8 +475,8 @@ async fn identical_command_is_not_deduplicated() {
         )
         .await
         .unwrap_err();
-    assert_eq!(busy.0.code, "RUN_BUSY");
-    let details = busy.0.details.unwrap();
+    assert_eq!(busy.code(), ErrorCode::RunBusy);
+    let details = busy.details().unwrap();
     assert_eq!(details["active_run"]["run_id"], run_id);
     assert!(supervisor.cancel(&run_id).is_ok());
 }
@@ -712,7 +710,7 @@ async fn only_the_newest_completed_runs_are_retained() {
     }
 
     let evicted = supervisor.status(&run_ids[0]).unwrap_err();
-    assert_eq!(evicted.0.code, "RUN_NOT_FOUND");
+    assert_eq!(evicted.code(), ErrorCode::RunNotFound);
     assert_eq!(
         supervisor.status(&run_ids[1]).unwrap()["status"],
         "succeeded"

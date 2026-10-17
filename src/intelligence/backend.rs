@@ -4,7 +4,8 @@
 use super::preset::LspPreset;
 use super::sync::DocumentSnapshot;
 use super::worker::{LspWorker, WorkerError, WorkerOperation, WorkerResponse};
-use crate::model::{AppResult, IntelligenceSettings};
+use crate::error::AppResult;
+use crate::model::IntelligenceSettings;
 use serde_json::{Map, Value};
 use std::path::Path;
 use std::sync::Arc;

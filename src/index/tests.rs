@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::ErrorCode;
 use crate::symbols::extract_symbols;
 use std::collections::HashSet;
 use std::fs;
@@ -242,7 +243,7 @@ fn exclusion_patterns_reject_reinclusion_rules() {
     let workspace = tempfile::tempdir().unwrap();
     let error =
         WorkspaceExclusions::new(workspace.path(), &["!generated/keep.rs".to_owned()]).unwrap_err();
-    assert_eq!(error.0.code, "INVALID_EXCLUDE_PATTERN");
+    assert_eq!(error.code(), ErrorCode::InvalidExcludePattern);
 }
 
 #[test]
@@ -295,7 +296,7 @@ fn decoding_rejects_reversed_ranges_and_paths_outside_the_workspace() {
         })
         .unwrap();
         let error = decode_handle(&encoded).unwrap_err();
-        assert_eq!(error.0.code, "INVALID_HANDLE", "path: {path}");
+        assert_eq!(error.code(), ErrorCode::InvalidHandle, "path: {path}");
     }
 }
 
@@ -429,7 +430,7 @@ fn invalid_regex_reports_its_error_code() {
         .search_text(&scope(&[]), &text("(unclosed", TextSyntax::Regex, false, 0))
         .unwrap_err();
 
-    assert_eq!(error.0.code, "INVALID_REGEX");
+    assert_eq!(error.code(), ErrorCode::InvalidRegex);
 }
 
 #[test]
@@ -518,7 +519,7 @@ fn outline_of_a_missing_path_is_path_not_indexed() {
         "a"
     );
     assert_eq!(
-        index.outline("src/missing.rs").unwrap_err().0.code,
-        "PATH_NOT_INDEXED"
+        index.outline("src/missing.rs").unwrap_err().code(),
+        ErrorCode::PathNotIndexed
     );
 }

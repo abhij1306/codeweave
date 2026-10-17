@@ -88,8 +88,8 @@ pub fn load_config(path: &Path) -> Result<Config> {
     });
     object.remove("server");
     object.remove("rust");
-    let daemon =
-        model::parse_daemon_config(&root).map_err(|error| anyhow::anyhow!(error.0.message))?;
+    let daemon = model::parse_daemon_config(&root)
+        .map_err(|error| anyhow::anyhow!(error.message().to_owned()))?;
     if daemon.config_version != 2 {
         anyhow::bail!(
             "unsupported configVersion {}; configVersion must be 2",

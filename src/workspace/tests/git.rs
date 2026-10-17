@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::ErrorCode;
 
 #[tokio::test]
 async fn git_diff_continuation_preserves_the_original_scope() {
@@ -76,7 +77,7 @@ async fn git_diff_continuation_preserves_the_original_scope() {
         })))
         .await
         .unwrap_err();
-    assert_eq!(error.0.code, "CONTINUATION_SCOPE_MISMATCH");
+    assert_eq!(error.code(), ErrorCode::ContinuationScopeMismatch);
 }
 
 #[tokio::test]

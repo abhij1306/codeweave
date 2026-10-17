@@ -19,15 +19,14 @@ use super::live_index::LiveIndex;
 use super::sync::DocumentSnapshot;
 use super::uri::UriCodec;
 use super::worker::{WorkerOperation, WorkerResponse};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::content_hash;
-use crate::model::{AppError, AppResult};
 use crate::security::read_workspace_file;
 use serde_json::{json, Value};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::path::Path;
 
-pub(crate) const STALE: &str = "INTELLIGENCE_STALE";
 /// Largest file a semantic result may point into.
 const MAX_RESULT_FILE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -181,8 +180,8 @@ impl ResultFiles<'_> {
 /// Read a result file and require it to match its live index entry, if any.
 fn read_current(workspace: Workspace<'_>, relative: &str) -> AppResult<String> {
     let text = read_text(workspace.root, relative, MAX_RESULT_FILE_BYTES)?.ok_or_else(|| {
-        AppError::details(
-            "INVALID_LSP_RESPONSE",
+        AppError::with_details(
+            ErrorCode::InvalidLspResponse,
             "LSP result does not name a readable regular workspace file",
             json!({"path": relative}),
         )
@@ -207,5 +206,5 @@ fn read_text(root: &Path, relative: &str, max_bytes: usize) -> AppResult<Option<
 
 fn stale(phase: &str, message: &str, mut details: Value) -> AppError {
     details["phase"] = json!(phase);
-    AppError::details(STALE, message, details)
+    AppError::with_details(ErrorCode::IntelligenceStale, message, details)
 }

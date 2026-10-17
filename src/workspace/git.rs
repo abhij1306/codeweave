@@ -1,7 +1,7 @@
 use super::state::MutationPermit;
 use super::{add_phase_metrics, Workspace};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::content_hash;
-use crate::model::{AppError, AppResult};
 use crate::requests::git::{GitAction, GitDiffRequest, GitPushRequest};
 use crate::security::validate_relative;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -297,7 +297,7 @@ impl Workspace {
             GitAction::Push(request) => {
                 if !request.confirm {
                     return Err(AppError::new(
-                        "CONFIRMATION_REQUIRED",
+                        ErrorCode::ConfirmationRequired,
                         "git push requires confirm=true",
                     ));
                 }
@@ -339,8 +339,8 @@ impl Workspace {
         let (scope, offset) = if let Some(token) = request.continuation.as_deref() {
             let continuation = decode_git_diff_continuation(token)?;
             if continuation.snapshot_id != snapshot {
-                return Err(AppError::details(
-                    "STALE_CONTINUATION",
+                return Err(AppError::with_details(
+                    ErrorCode::StaleContinuation,
                     "Repository changed after the diff continuation was created",
                     json!({
                         "expected_snapshot": continuation.snapshot_id,
@@ -349,8 +349,8 @@ impl Workspace {
                 ));
             }
             if request.has_scope() && requested_scope != continuation.scope {
-                return Err(AppError::details(
-                    "CONTINUATION_SCOPE_MISMATCH",
+                return Err(AppError::with_details(
+                    ErrorCode::ContinuationScopeMismatch,
                     "Git diff continuation scope does not match the supplied filters",
                     json!({
                         "continuation_scope": continuation.scope,
@@ -382,11 +382,11 @@ impl Workspace {
                 .index()
                 .find_symbols(scope.paths.first().map(String::as_str), symbol);
             if symbols.len() != 1 {
-                return Err(AppError::details(
+                return Err(AppError::with_details(
                     if symbols.is_empty() {
-                        "SYMBOL_NOT_FOUND"
+                        ErrorCode::SymbolNotFound
                     } else {
-                        "AMBIGUOUS_SYMBOL"
+                        ErrorCode::AmbiguousSymbol
                     },
                     "git_diff symbol focus requires one indexed declaration",
                     json!({"path": scope.paths[0], "symbol": symbol, "candidates": symbols.into_iter().map(|found| json!({"path": found.path, "symbol": found.symbol})).collect::<Vec<_>>() }),
@@ -456,7 +456,7 @@ impl Workspace {
                 validate_paths(&request.paths)?;
                 if !request.confirm {
                     return Err(AppError::new(
-                        "CONFIRMATION_REQUIRED",
+                        ErrorCode::ConfirmationRequired,
                         "git restore requires confirm=true",
                     ));
                 }
