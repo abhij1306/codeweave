@@ -8,6 +8,9 @@
 //! tool means adding one entry here plus its request type.
 
 mod bindings;
+mod call;
+
+pub use call::{call_tool, list_tools};
 
 use crate::manager::Application;
 use crate::model::AppResult;

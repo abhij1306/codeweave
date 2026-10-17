@@ -45,6 +45,14 @@ to the `Application` operation that serves it. JSON values exist only between
 the transport and the registry's parse step; the application, workspace, Git
 and Bash layers receive typed requests.
 
+Both transports (stdio and Streamable HTTP) serve `tools/list` and `tools/call`
+through one call module, `src/tools/call.rs`. It resolves the tool, runs it and
+shapes the MCP result. A tool error is a result with `isError: true` and
+`structuredContent.error` carrying `code`, `message`, `details`, `retryable` and
+`retry_kind`; the retry policy is defined there once. Only an unknown tool name
+is a JSON-RPC `invalid_params` error. Server and daemon settings are read from
+one config document into typed structs before the application initializes.
+
 Configuration requires `configVersion: 2` and rejects unknown fields at every
 level. Streamable HTTP is stateless and returns JSON. Stdio is available for
 local clients.

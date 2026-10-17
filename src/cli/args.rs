@@ -2,28 +2,28 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(super) enum Transport {
+pub enum Transport {
     Http,
     Stdio,
 }
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Rust-only CodeWeave MCP server")]
-pub(super) struct Cli {
+pub struct Cli {
     #[command(subcommand)]
-    pub(super) command: Option<Command>,
+    pub command: Option<Command>,
     #[arg(long, global = true, default_value = "config.json")]
-    pub(super) config: PathBuf,
+    pub config: PathBuf,
     #[arg(long, global = true, value_enum, default_value_t = Transport::Http)]
-    pub(super) transport: Transport,
+    pub transport: Transport,
     #[arg(long, global = true)]
-    pub(super) host: Option<String>,
+    pub host: Option<String>,
     #[arg(long, global = true)]
-    pub(super) port: Option<u16>,
+    pub port: Option<u16>,
 }
 
 #[derive(Subcommand, Debug)]
-pub(super) enum Command {
+pub enum Command {
     /// Run the MCP server.
     Serve,
     /// Create config.json and a bearer token for a project, then print the

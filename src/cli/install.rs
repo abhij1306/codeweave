@@ -8,7 +8,8 @@ use std::{
 
 use super::args::{Cli, Transport};
 use super::config::{
-    config_relative_path, default_port, load_config, load_or_create_bearer_token, ServerConfig,
+    config_relative_path, default_port, load_config, load_or_create_bearer_token, AuthMode,
+    ServerConfig,
 };
 use super::doctor::doctor_checks;
 
@@ -113,9 +114,9 @@ fn write_initial_config(
     std::fs::write(&cli.config, format!("{rendered}\n"))
         .with_context(|| format!("writing {}", cli.config.display()))?;
 
-    let (server, _) = load_config(&cli.config)?;
+    let server = load_config(&cli.config)?.server;
     let token_path = config_relative_path(&cli.config, &server.token_file);
-    if server.auth_mode == "bearer" {
+    if server.auth_mode == AuthMode::Bearer {
         load_or_create_bearer_token(&token_path)?;
     }
     Ok(InitializedConfig {
@@ -125,7 +126,7 @@ fn write_initial_config(
     })
 }
 
-pub(super) fn run_init(cli: &Cli, requested_path: Option<PathBuf>, force: bool) -> Result<()> {
+pub fn run_init(cli: &Cli, requested_path: Option<PathBuf>, force: bool) -> Result<()> {
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let stdout = io::stdout();
@@ -143,7 +144,7 @@ pub(super) fn run_init(cli: &Cli, requested_path: Option<PathBuf>, force: bool) 
         "Local MCP URL: http://{}:{}/mcp",
         initialized.server.host, initialized.server.port
     )?;
-    if initialized.server.auth_mode == "bearer" {
+    if initialized.server.auth_mode == AuthMode::Bearer {
         writeln!(
             output,
             "Origin bearer token: {}",
@@ -159,7 +160,7 @@ pub(super) fn run_init(cli: &Cli, requested_path: Option<PathBuf>, force: bool) 
     Ok(())
 }
 
-pub(super) async fn run_install_with_io(
+pub async fn run_install_with_io(
     cli: &Cli,
     requested_path: Option<PathBuf>,
     force: bool,
@@ -275,11 +276,7 @@ pub(super) async fn run_install_with_io(
     Ok(())
 }
 
-pub(super) async fn run_install(
-    cli: &Cli,
-    requested_path: Option<PathBuf>,
-    force: bool,
-) -> Result<()> {
+pub async fn run_install(cli: &Cli, requested_path: Option<PathBuf>, force: bool) -> Result<()> {
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let stdout = io::stdout();
