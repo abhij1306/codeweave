@@ -11,10 +11,13 @@ transport setup. A single eagerly initialized application owns the workspace
 index, intelligence service, Git backend, Bash supervisor, and process-local
 mutation history. All connected clients observe the same state.
 
-The workspace watcher only queues changed paths. Reconciliation and every
-mutation pass through the workspace mutation gate; the watcher never edits the
-index directly. Mutation events are bounded in memory, carry an instance-local
-generation, and disappear on restart. Git is the durable history.
+The workspace keeps its index, cached repository status, generation and snapshot
+id together as one reconciled state (`src/workspace/state`). The file watcher
+only queues changed paths in the change ledger; it never edits the index.
+Reconciliation, edit commits, forced refreshes and repository-status refreshes
+change the reconciled state only through its single writer. Mutation records are
+bounded in memory, carry an instance-local generation, and disappear on restart.
+Git is the durable history. `CONTEXT.md` defines these terms.
 
 Each Bash run owns its process, output buffers, change baseline, and frozen
 terminal changed-path result. Runs execute sequentially. A foreground request
@@ -46,11 +49,20 @@ filesystem commit.
 
 ## Concurrency invariants
 
-- A single async mutation gate serializes edits, mutating Git operations, and
-  reconciliation.
+- The mutation gate is an async permit. `code_edit` holds it from planning
+  through post-apply validation, and Git `stage`, `commit` and `restore` hold it
+  for the whole action, so these never overlap. Reads and the other Git actions
+  do not take it.
+- Lock order is mutation permit, then state writer, then the state lock; it is
+  documented once in `src/workspace/state/mod.rs` and the guard types make the
+  inverse order impossible across an `.await`.
+- Index, repository status, stale flag, generation and snapshot id sit under one
+  lock. A writer applies each change in one update, and every response takes its
+  generation and snapshot id from one read, so a stamp is never torn.
+- Every `git status` refresh goes through one setter: success stores the status
+  and clears `repo_status_stale`; failure keeps the previous status, sets the flag
+  and logs a warning.
 - File reads use canonical repository-relative paths and never escape the root.
-- Index, repository status, snapshot, generation, and mutation events represent
-  one reconciled workspace state.
 - Bash cancellation and timeout terminate the process tree and preserve bounded
   partial output.
 - Semantic results are current only when the synchronized document hash still
