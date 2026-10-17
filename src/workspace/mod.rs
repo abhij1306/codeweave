@@ -131,7 +131,7 @@ impl Workspace {
 
         let phase_started = Instant::now();
         let index_cache = workspace_cache.join("index.json");
-        let (mut index, index_cache_hit) = CodeIndex::scan_cached(
+        let (index, index_cache_hit) = CodeIndex::scan_cached(
             &root,
             policy.max_file_bytes,
             &config.artifact_paths,

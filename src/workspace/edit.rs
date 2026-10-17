@@ -371,7 +371,7 @@ impl Workspace {
                 continue;
             }
             let path = required_str(change, "path")?.replace('\\', "/");
-            let content = &index
+            let content = index
                 .get(&path)
                 .ok_or_else(|| {
                     AppError::details(
@@ -380,7 +380,7 @@ impl Workspace {
                         json!({"path": path}),
                     )
                 })?
-                .content;
+                .content();
             let handle = change
                 .get("handle")
                 .and_then(Value::as_str)
@@ -396,7 +396,7 @@ impl Workspace {
                 let (start, end) = line_range_bytes(content, handle.start_line, handle.end_line)?;
                 (start, &content[start..end])
             } else {
-                (0, content.as_str())
+                (0, content)
             };
             let found: Vec<_> = if kind == "replace_range" {
                 if handle.is_none() {
@@ -473,7 +473,7 @@ impl Workspace {
         let before = plan
             .get(&path)
             .map(|item| item.after.clone())
-            .unwrap_or_else(|| index.get(&path).map(|file| file.content.clone()));
+            .unwrap_or_else(|| index.get(&path).map(|file| file.content().to_owned()));
         let original_hash = plan
             .get(&path)
             .and_then(|item| item.before.as_ref())

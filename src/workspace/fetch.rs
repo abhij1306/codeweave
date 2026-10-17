@@ -300,7 +300,7 @@ impl Workspace {
                 json!({"path": path, "symbol": symbol_name}),
             )
         })?;
-        let line_count = file.content.lines().count().max(1);
+        let line_count = file.content().lines().count().max(1);
         let start_line = symbol.start_line.saturating_sub(context_lines).max(1);
         let end_line = symbol
             .end_line
@@ -338,13 +338,13 @@ impl Workspace {
         })?;
         Ok(json!({
             "kind": "metadata",
-            "path": file.path,
-            "hash": file.hash,
-            "size": file.size,
-            "language": file.language,
-            "document_type": file.document_type,
-            "line_count": file.content.lines().count().max(1),
-            "modified_ns": file.modified_ns
+            "path": file.path(),
+            "hash": file.hash(),
+            "size": file.size(),
+            "language": file.language(),
+            "document_type": file.document_type(),
+            "line_count": file.content().lines().count().max(1),
+            "modified_ns": file.modified_ns()
         }))
     }
 
@@ -370,14 +370,14 @@ impl Workspace {
             )
         })?;
         if let Some(condition) = precondition {
-            if file.hash != condition.expected_hash {
+            if file.hash() != condition.expected_hash {
                 return Err(AppError::details(
                     condition.stale_code,
                     condition.stale_message,
                     json!({
-                        "path": file.path,
+                        "path": file.path(),
                         "expected_hash": condition.expected_hash,
-                        "actual_hash": file.hash
+                        "actual_hash": file.hash()
                     }),
                 ));
             }
@@ -394,19 +394,19 @@ impl Workspace {
     ) -> AppResult<Value> {
         let (content, start_line, end_line): (Cow<'_, str>, usize, usize) = match scope {
             FetchScope::Full => (
-                Cow::Borrowed(file.content.as_str()),
+                Cow::Borrowed(file.content()),
                 1,
-                file.content.lines().count().max(1),
+                file.content().lines().count().max(1),
             ),
             FetchScope::Lines {
                 start_line,
                 end_line,
             } => {
-                let line_count = file.content.lines().count().max(1);
+                let line_count = file.content().lines().count().max(1);
                 let start_line = start_line.max(1).min(line_count);
                 let end_line = end_line.max(start_line).min(line_count);
                 (
-                    Cow::Owned(slice_lines(&file.content, start_line, end_line)),
+                    Cow::Owned(slice_lines(file.content(), start_line, end_line)),
                     start_line,
                     end_line,
                 )
@@ -414,15 +414,15 @@ impl Workspace {
         };
         let handle = encode_handle(&RangeHandle {
             workspace_id: self.id.clone(),
-            path: file.path.clone(),
+            path: file.path().to_owned(),
             start_line,
             end_line,
-            content_hash: file.hash.clone(),
+            content_hash: file.hash().to_owned(),
         })?;
         let base = json!({
-            "path": file.path,
-            "hash": file.hash,
-            "line_ending": line_ending_label(&file.content),
+            "path": file.path(),
+            "hash": file.hash(),
+            "line_ending": line_ending_label(file.content()),
             "start_line": start_line,
             "end_line": end_line,
             "handle": handle
@@ -431,9 +431,9 @@ impl Workspace {
         let continuation = |next_offset| {
             encode_fetch_continuation(&FetchContinuation {
                 workspace_id: self.id.clone(),
-                path: file.path.clone(),
+                path: file.path().to_owned(),
                 offset: next_offset,
-                content_hash: file.hash.clone(),
+                content_hash: file.hash().to_owned(),
                 scope: continuation_scope,
             })
             .ok()
@@ -485,7 +485,7 @@ pub(super) fn compact_fetch_result(result: &Value) -> Value {
 }
 
 fn lexical_import_prelude(file: &FileEntry, before_line: usize) -> Vec<Value> {
-    file.content
+    file.content()
         .lines()
         .take(before_line.saturating_sub(1))
         .enumerate()

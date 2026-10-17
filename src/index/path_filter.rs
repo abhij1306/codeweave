@@ -1,13 +1,5 @@
+use crate::security::normalize_path_text;
 use std::borrow::Cow;
-
-pub(super) fn normalize(path: &str) -> Cow<'_, str> {
-    if path.contains('\\') {
-        let normalized = path.replace('\\', "/");
-        Cow::Owned(normalized.trim_start_matches("./").to_owned())
-    } else {
-        Cow::Borrowed(path.trim_start_matches("./"))
-    }
-}
 
 pub(crate) struct PathFilterSet<'a> {
     normalized: Vec<Cow<'a, str>>,
@@ -17,7 +9,7 @@ impl<'a> PathFilterSet<'a> {
     pub(crate) fn new(filters: &'a [String]) -> Self {
         let normalized: Vec<_> = filters
             .iter()
-            .map(|filter| normalize(filter))
+            .map(|filter| normalize_path_text(filter))
             .filter(|filter| !filter.is_empty())
             .collect();
         Self { normalized }

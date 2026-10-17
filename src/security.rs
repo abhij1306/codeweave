@@ -1,5 +1,6 @@
 use crate::model::{AppError, AppResult};
 use cap_std::{ambient_authority, fs::Dir};
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -120,15 +121,29 @@ pub fn read_workspace_file(
 }
 
 pub fn relative_string(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    normalize_path_text(&path.strip_prefix(root).unwrap_or(path).to_string_lossy()).into_owned()
+}
+
+/// Canonical textual form of a path: forward slashes and no leading `./`.
+/// Index keys, path filters, Git porcelain paths, and exclusion matching all
+/// compare paths in this form.
+pub fn normalize_path_text(path: &str) -> Cow<'_, str> {
+    if path.contains('\\') {
+        Cow::Owned(path.replace('\\', "/").trim_start_matches("./").to_owned())
+    } else {
+        Cow::Borrowed(path.trim_start_matches("./"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn path_text_uses_forward_slashes_without_leading_dot_segments() {
+        assert_eq!(normalize_path_text(".\\src\\main.rs"), "src/main.rs");
+        assert_eq!(normalize_path_text("./src/lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_path_text("C:\\repo\\"), "C:/repo/");
+    }
     #[test]
     fn rejects_parent_traversal() {
         assert!(validate_relative("../secret").is_err());

@@ -25,8 +25,8 @@ impl LiveIndex {
 
     pub(crate) fn file(&self, relative: &str) -> Option<IndexedFile> {
         self.index.read().get(relative).map(|entry| IndexedFile {
-            content: entry.content.clone(),
-            hash: entry.hash.clone(),
+            content: entry.content().to_owned(),
+            hash: entry.hash().to_owned(),
         })
     }
 
@@ -34,7 +34,7 @@ impl LiveIndex {
         self.index
             .read()
             .get(relative)
-            .map(|entry| entry.hash.clone())
+            .map(|entry| entry.hash().to_owned())
     }
 
     pub(crate) fn snapshot_id(&self) -> String {
