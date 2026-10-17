@@ -11,7 +11,7 @@ use super::worker::{WorkerOperation, WorkerResponse};
 use super::workspace_edit::{preview_request, workspace_edit_changes, RenameChange};
 use crate::index::CodeIndex;
 use crate::model::{AppError, AppResult, IntelligenceSettings};
-use crate::reference_service::SemanticReferenceMetadata;
+use crate::reference_service::{Freshness, SemanticReferenceMetadata};
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -209,7 +209,7 @@ impl IntelligenceService {
                                 locations,
                                 max_results,
                                 SemanticReferenceMetadata {
-                                    freshness: "current",
+                                    freshness: Freshness::Current,
                                     evidence_caveat: REFERENCE_CAVEAT,
                                 },
                             )

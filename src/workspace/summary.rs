@@ -186,7 +186,7 @@ impl Workspace {
         self.summary()
     }
 
-    pub(super) fn search_index(&self, params: &Value) -> AppResult<Value> {
+    pub(super) fn search_index(&self, request: &SearchRequest) -> AppResult<Value> {
         let reconcile_pending = self.read_reconcile_pending();
         let snapshot = self.snapshot();
         let index = self.index.read();
@@ -194,7 +194,7 @@ impl Workspace {
             &index,
             &self.id,
             &snapshot,
-            params,
+            request,
             self.policy.max_search_results,
             reconcile_pending,
         )

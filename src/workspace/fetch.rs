@@ -1,6 +1,8 @@
 use super::util::line_ending_label;
 use super::Workspace;
-use crate::index::{decode_handle, encode_handle, slice_lines, FileEntry, RangeHandle};
+use crate::index::{
+    decode_handle, encode_handle, slice_lines, FileEntry, RangeHandle, SymbolDefinition,
+};
 use crate::model::{bool_value, required_str, usize_value, AppError, AppResult};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
@@ -266,7 +268,7 @@ impl Workspace {
             let candidates = candidates
                 .into_iter()
                 .take(20)
-                .map(|(path, symbol, hash)| {
+                .map(|SymbolDefinition { path, symbol, hash }| {
                     let handle = encode_handle(&RangeHandle {
                         workspace_id: self.id.clone(),
                         path: path.clone(),
@@ -292,7 +294,8 @@ impl Workspace {
                 json!({"symbol": symbol_name, "candidates": candidates}),
             ));
         }
-        let (path, symbol, _) = candidates.into_iter().next().expect("checked non-empty");
+        let SymbolDefinition { path, symbol, .. } =
+            candidates.into_iter().next().expect("checked non-empty");
         let file = index.get(&path).ok_or_else(|| {
             AppError::details(
                 "PATH_NOT_INDEXED",

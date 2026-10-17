@@ -22,7 +22,7 @@ use crate::model::{
     bool_value, required_str, usize_value, AppError, AppResult, PolicyConfig, WorkspaceConfig,
 };
 use crate::repository::{CliGitBackend, RepoStatus, RepositoryBackend};
-use crate::retrieval::execute_index_search;
+use crate::retrieval::{execute_index_search, SearchRequest};
 use crate::security::{canonical_root, relative_string};
 use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};

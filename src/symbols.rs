@@ -17,6 +17,59 @@ pub struct Symbol {
     pub signature: String,
 }
 
+/// How an identifier occurrence uses the identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceKind {
+    Declaration,
+    Call,
+    Import,
+    Type,
+    Read,
+    Write,
+    Other,
+}
+
+impl ReferenceKind {
+    pub const ALL: [Self; 7] = [
+        Self::Declaration,
+        Self::Call,
+        Self::Import,
+        Self::Type,
+        Self::Read,
+        Self::Write,
+        Self::Other,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Declaration => "declaration",
+            Self::Call => "call",
+            Self::Import => "import",
+            Self::Type => "type",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == value)
+    }
+}
+
+/// What a classification rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Evidence {
+    /// Exact identifier text match.
+    Lexical,
+    /// A Tree-sitter syntax node.
+    Syntactic,
+    /// A language server.
+    Semantic,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentifierOccurrence {
     pub start_byte: usize,
@@ -25,14 +78,14 @@ pub struct IdentifierOccurrence {
     pub start_column: usize,
     pub end_line: usize,
     pub end_column: usize,
-    pub role: &'static str,
-    pub evidence: &'static str,
+    pub role: ReferenceKind,
+    pub evidence: Evidence,
     pub enclosing_symbol: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct SyntaxContext {
-    role: &'static str,
+    role: ReferenceKind,
     enclosing_symbol: Option<String>,
 }
 
@@ -211,7 +264,7 @@ pub fn identifier_occurrences_with_symbols(
     for occurrence in &mut occurrences {
         if let Some(context) = syntax.get(&(occurrence.start_byte, occurrence.end_byte)) {
             occurrence.role = context.role;
-            occurrence.evidence = "syntactic";
+            occurrence.evidence = Evidence::Syntactic;
             if context.enclosing_symbol.is_some() {
                 occurrence.enclosing_symbol = context.enclosing_symbol.clone();
             }
@@ -242,8 +295,8 @@ fn lexical_identifier_occurrences(content: &str, identifier: &str) -> Vec<Identi
                 start_column,
                 end_line,
                 end_column,
-                role: "other",
-                evidence: "lexical",
+                role: ReferenceKind::Other,
+                evidence: Evidence::Lexical,
                 enclosing_symbol: None,
             })
         })
@@ -335,31 +388,31 @@ fn is_identifier_node(node: Node<'_>) -> bool {
     ) || kind.ends_with("_identifier")
 }
 
-fn classify_identifier_node(node: Node<'_>) -> &'static str {
+fn classify_identifier_node(node: Node<'_>) -> ReferenceKind {
     if is_declaration_name(node) {
-        return "declaration";
+        return ReferenceKind::Declaration;
     }
     if node.kind().contains("type_identifier") {
-        return "type";
+        return ReferenceKind::Type;
     }
     let mut current = node.parent();
     while let Some(parent) = current {
         let kind = parent.kind();
         if is_import_context(kind) {
-            return "import";
+            return ReferenceKind::Import;
         }
         if is_write_context(parent, node) {
-            return "write";
+            return ReferenceKind::Write;
         }
         if is_call_context(kind) {
-            return "call";
+            return ReferenceKind::Call;
         }
         if is_type_context(kind) {
-            return "type";
+            return ReferenceKind::Type;
         }
         current = parent.parent();
     }
-    "read"
+    ReferenceKind::Read
 }
 
 fn is_declaration_name(node: Node<'_>) -> bool {
@@ -563,7 +616,7 @@ mod tests {
         let occurrences = identifier_occurrences(Path::new("x.rs"), content, "run");
         assert_eq!(occurrences.len(), 2);
         assert_eq!(occurrences[0].start_column, 1);
-        assert_eq!(occurrences[1].role, "call");
+        assert_eq!(occurrences[1].role, ReferenceKind::Call);
     }
 
     #[test]
@@ -572,8 +625,8 @@ mod tests {
         let occurrences =
             identifier_occurrences(Path::new("validator.rs"), content, "run_edit_validation");
         assert_eq!(occurrences.len(), 1);
-        assert_eq!(occurrences[0].role, "call");
-        assert_eq!(occurrences[0].evidence, "syntactic");
+        assert_eq!(occurrences[0].role, ReferenceKind::Call);
+        assert_eq!(occurrences[0].evidence, Evidence::Syntactic);
         assert_eq!(occurrences[0].enclosing_symbol.as_deref(), Some("apply"));
     }
 
@@ -584,15 +637,15 @@ mod tests {
             "from owner import extract\n",
             "extract",
         );
-        assert_eq!(imported[0].role, "import");
-        assert_eq!(imported[0].evidence, "syntactic");
+        assert_eq!(imported[0].role, ReferenceKind::Import);
+        assert_eq!(imported[0].evidence, Evidence::Syntactic);
 
         let written = identifier_occurrences(
             Path::new("module.ts"),
             "function update() { value = 1; }\n",
             "value",
         );
-        assert_eq!(written[0].role, "write");
+        assert_eq!(written[0].role, ReferenceKind::Write);
         assert_eq!(written[0].enclosing_symbol.as_deref(), Some("update"));
     }
 }

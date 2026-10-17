@@ -154,18 +154,20 @@ fn outline_accepts_multiple_paths_and_reports_partial_errors() {
     fs::write(root.path().join("two.rs"), "pub fn two() {}\n").unwrap();
     let actor = test_actor(root.path());
 
-    let single = actor
-        .search_index(&json!({"mode": "outline", "paths": ["one.rs"]}))
-        .unwrap();
-    assert_eq!(single["path"], "one.rs");
-    assert!(single["symbols"].is_array());
+    let overview = |paths: serde_json::Value| {
+        let response = actor
+            .code_retrieve(&json!({
+                "operations": [{"operation": "symbols_overview", "paths": paths}]
+            }))
+            .unwrap();
+        response["results"][0]["result"].clone()
+    };
 
-    let batch = actor
-        .search_index(&json!({
-            "mode": "outline",
-            "paths": ["one.rs", "missing.rs", "two.rs"]
-        }))
-        .unwrap();
+    let single = overview(json!(["one.rs"]));
+    assert_eq!(single["path"], "one.rs");
+    assert_eq!(single["symbols"][0]["name"], "one");
+
+    let batch = overview(json!(["one.rs", "missing.rs", "two.rs"]));
     assert_eq!(batch["result_count"], 2);
     assert_eq!(batch["error_count"], 1);
     assert_eq!(batch["partial_success"], true);
@@ -347,23 +349,6 @@ fn code_retrieve_rejects_a_stale_snapshot() {
         .unwrap_err();
 
     assert_eq!(error.0.code, "STALE_SNAPSHOT");
-}
-
-#[test]
-fn search_accepts_multiple_queries() {
-    let root = tempdir().unwrap();
-    fs::write(root.path().join("alpha.rs"), "fn alpha() {}\n").unwrap();
-    fs::write(root.path().join("beta.rs"), "fn beta() {}\n").unwrap();
-    let actor = test_actor(root.path());
-    let result = actor
-        .search_index(&json!({
-            "mode": "literal",
-            "queries": ["alpha", "beta"]
-        }))
-        .unwrap();
-    assert_eq!(result["query_count"], 2);
-    assert_eq!(result["result_count"], 2);
-    assert_eq!(result["error_count"], 0);
 }
 
 #[test]
