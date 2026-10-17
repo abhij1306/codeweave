@@ -8,24 +8,29 @@ impl Workspace {
     /// `summarize_changed_paths`.
     pub fn summary_ids(&self) -> AppResult<Value> {
         self.reconcile_pending()?;
+        let stamp = self.state.read().stamp();
         Ok(json!({
             "workspace_id": self.id,
-            "snapshot_id": self.snapshot(),
-            "generation": self.generation(),
+            "snapshot_id": stamp.snapshot_id,
+            "generation": stamp.generation,
         }))
     }
 
     pub fn diagnostics(&self) -> AppResult<Value> {
-        let index = self.index.read();
+        let ledger = self.state.ledger();
+        let reconcile_pending = ledger.needs_reconcile();
+        let pending_path_count = ledger.pending_count();
+        let view = self.state.read();
+        let index = view.index();
         Ok(json!({
             "workspace_id": self.id,
             "root": self.root,
-            "generation": self.generation(),
-            "snapshot_id": self.snapshot(),
+            "generation": view.generation(),
+            "snapshot_id": view.snapshot_id(),
             "file_count": index.file_count(),
             "languages": index.languages(),
-            "reconcile_pending": self.read_reconcile_pending(),
-            "pending_path_count": self.pending_paths.lock().len(),
+            "reconcile_pending": reconcile_pending,
+            "pending_path_count": pending_path_count,
             "running_bash_count": self.bash.running_count(),
             "execution": {
                 "bash": self.bash.readiness()
@@ -44,28 +49,17 @@ impl Workspace {
         let reconcile_started = Instant::now();
         self.reconcile_pending()?;
         let reconcile_ms = reconcile_started.elapsed().as_millis();
-        let index = self.index.read();
-        let repo = self.repo_status.read().clone();
+        let view = self.state.read();
+        let index = view.index();
+        let repo = view.repo_status();
         let dirty_set: HashSet<String> = repo
             .dirty_files
             .iter()
             .filter(|path| !self.exclusions.is_ignored(Path::new(path), false))
             .cloned()
             .collect();
-        let mcp_paths: HashSet<String> = self
-            .mutations
-            .lock()
-            .iter()
-            .filter(|item| item.source == "mcp_edit" && dirty_set.contains(&item.path))
-            .map(|item| item.path.clone())
-            .collect();
-        let external: HashSet<String> = self
-            .external_changed
-            .lock()
-            .iter()
-            .filter(|path| dirty_set.contains(*path))
-            .cloned()
-            .collect();
+        let mcp_paths = self.state.ledger().edited_paths_within(&dirty_set);
+        let external = self.state.ledger().external_paths_within(&dirty_set);
         let preexisting = &self.opened_dirty_summary;
         let mcp_changed = summarize_changed_paths(mcp_paths);
         let external = summarize_changed_paths(external);
@@ -125,7 +119,7 @@ impl Workspace {
             )]
         };
         let mut result = json!({
-            "workspace_id": self.id, "name": self.name, "root": self.root, "generation": self.generation(), "snapshot_id": self.snapshot(),
+            "workspace_id": self.id, "name": self.name, "root": self.root, "generation": view.generation(), "snapshot_id": view.snapshot_id(),
             "file_count": index.file_count(), "languages": index.languages(), "repository": repository, "instructions": instructions,
             "capabilities": {
                 "bash_available": bash_available,
@@ -168,32 +162,42 @@ impl Workspace {
 
     pub fn refresh(&self, force: bool) -> AppResult<Value> {
         if force {
-            let _guard = self.reconcile_lock.lock();
-            self.pending_paths.lock().clear();
-            self.needs_reconcile.store(false, Ordering::Release);
-            *self.index.write() = CodeIndex::scan(
-                &self.root,
-                self.policy.max_file_bytes,
-                &self.artifact_paths,
-                &self.exclusions,
-            )?;
-            self.refresh_repo_status();
-            self.generation.fetch_add(1, Ordering::AcqRel);
-            self.recompute_snapshot();
+            self.rescan()?;
         } else {
             self.reconcile_pending()?;
         }
         self.summary()
     }
 
+    /// Rebuild the index from disk and refresh the repository status, superseding
+    /// any queued watcher paths.
+    pub(super) fn rescan(&self) -> AppResult<()> {
+        let mut writer = self.state.writer();
+        self.state.ledger().clear_pending();
+        let index = CodeIndex::scan(
+            &self.root,
+            self.policy.max_file_bytes,
+            &self.artifact_paths,
+            &self.exclusions,
+        )?;
+        let status = self.repository.status(&self.root);
+        writer.update(|state| {
+            *state.index_mut() = index;
+            // A failed `git status` keeps the previous status and marks it stale.
+            let _ = state.apply_repo_status(status);
+            state.bump_generation();
+            state.recompute_snapshot();
+        });
+        Ok(())
+    }
+
     pub(super) fn search_index(&self, request: &SearchRequest) -> AppResult<Value> {
-        let reconcile_pending = self.read_reconcile_pending();
-        let snapshot = self.snapshot();
-        let index = self.index.read();
+        let reconcile_pending = self.state.ledger().needs_reconcile();
+        let view = self.state.read();
         execute_index_search(
-            &index,
+            view.index(),
             &self.id,
-            &snapshot,
+            view.snapshot_id(),
             request,
             self.policy.max_search_results,
             reconcile_pending,
@@ -211,20 +215,12 @@ impl Workspace {
             .unwrap_or(0);
         let source = params.get("source").and_then(Value::as_str);
         let limit = usize_value(params, "limit", 200).min(2_000);
-        let records: Vec<_> = self
-            .mutations
-            .lock()
-            .iter()
-            .rev()
-            .filter(|item| item.generation > since)
-            .filter(|item| source.map(|value| item.source == value).unwrap_or(true))
-            .take(limit)
-            .cloned()
-            .collect();
+        let records = self.state.ledger().records_since(since, source, limit);
+        let stamp = self.state.read().stamp();
         let mut result = json!({
             "workspace_id": self.id,
-            "generation": self.generation(),
-            "snapshot_id": self.snapshot(),
+            "generation": stamp.generation,
+            "snapshot_id": stamp.snapshot_id,
             "mutations": records
         });
         add_phase_metrics(

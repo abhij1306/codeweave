@@ -1,4 +1,5 @@
 use super::edit::PlannedFile;
+use super::state::temp_file_name;
 use cap_std::{ambient_authority, fs::Dir};
 use similar::{ChangeTag, TextDiff};
 use std::io;
@@ -91,8 +92,7 @@ pub(super) fn atomic_write(root: &Path, relative: &str, content: &str) -> io::Re
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("file");
-    let temp =
-        relative.with_file_name(format!(".{name}.codeweave-{}.tmp", Uuid::new_v4().simple()));
+    let temp = relative.with_file_name(temp_file_name(name, &Uuid::new_v4().simple().to_string()));
     if let Err(error) = dir.write(&temp, content) {
         let _ = dir.remove_file(&temp);
         return Err(error);

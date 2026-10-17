@@ -1,5 +1,6 @@
 use super::events::MutationRecord;
 use super::io_helpers::{diff_stat, read_optional, render_diff};
+use super::state::MutationPermit;
 use super::util::{
     changes_without_independent_preconditions, char_boundary_at_or_before, line_offset,
     line_range_bytes, matching_old_text, normalize_line_endings_for_content,
@@ -26,7 +27,7 @@ pub(super) struct PlannedFile {
 }
 
 struct AppliedEdit {
-    write_guard: tokio::sync::OwnedMutexGuard<()>,
+    permit: MutationPermit,
     planned: Vec<PlannedFile>,
     apply_result: Vec<MutationRecord>,
     diff: String,
@@ -107,12 +108,14 @@ impl Workspace {
         if !validate.is_empty() {
             self.bash.ensure_available()?;
         }
-        let write_guard = self.write_lock.clone().lock_owned().await;
+        // The permit is held through post-apply validation so a mutating Git
+        // action cannot change the edited files while their validation runs.
+        let permit = self.state.exclusive().await;
         let actor = Arc::clone(self);
         let params_owned = params.clone();
         let prepare_started = Instant::now();
         let prepared =
-            tokio::task::spawn_blocking(move || actor.prepare_edit(&params_owned, write_guard))
+            tokio::task::spawn_blocking(move || actor.prepare_edit(&params_owned, permit))
                 .await
                 .map_err(AppError::internal)??;
         let prepare_ms = prepare_started.elapsed().as_millis();
@@ -122,7 +125,7 @@ impl Workspace {
             PreparedEdit::Applied(applied) => applied,
         };
         let AppliedEdit {
-            write_guard,
+            permit,
             planned,
             apply_result,
             diff,
@@ -130,7 +133,7 @@ impl Workspace {
             commit_ms,
             syntax_checks,
         } = applied;
-        let mut write_guard = Some(write_guard);
+        let mut permit = Some(permit);
 
         // Shape the diff payload by response_detail. `standard` (default) caps the
         // unified diff so a large edit cannot balloon the response; the per-file stat
@@ -164,8 +167,9 @@ impl Workspace {
             } else {
                 "Post-apply validation is running in the background. The edit remains applied. Poll bash_status with validation_run_id."
             };
-            drop(write_guard.take());
+            drop(permit.take());
             self.reconcile_pending_async().await?;
+            let stamp = self.state.read().stamp();
             let mut response = json!({
                 "applied": true,
                 "validation_failed": validation_failed,
@@ -181,8 +185,8 @@ impl Workspace {
                 "diff_omitted": diff_omitted,
                 "syntax_checks": syntax_checks,
                 "validation": validation,
-                "generation": self.generation(),
-                "snapshot_id": self.snapshot(),
+                "generation": stamp.generation,
+                "snapshot_id": stamp.snapshot_id,
                 "mutations": apply_result,
                 "phase_ms": {
                     "prepare_and_commit": prepare_ms,
@@ -198,8 +202,9 @@ impl Workspace {
             return Ok(response);
         }
 
-        drop(write_guard.take());
+        drop(permit.take());
         self.reconcile_pending_async().await?;
+        let stamp = self.state.read().stamp();
         let mut response = json!({
             "applied": true,
             "validation_failed": validation_failed,
@@ -211,8 +216,8 @@ impl Workspace {
             "diff_omitted": diff_omitted,
             "syntax_checks": syntax_checks,
             "validation": validation,
-            "generation": self.generation(),
-            "snapshot_id": self.snapshot(),
+            "generation": stamp.generation,
+            "snapshot_id": stamp.snapshot_id,
             "mutations": apply_result,
             "phase_ms": {
                 "prepare_and_commit": prepare_ms,
@@ -229,14 +234,11 @@ impl Workspace {
         Ok(response)
     }
 
-    fn prepare_edit(
-        &self,
-        params: &Value,
-        write_guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> AppResult<PreparedEdit> {
-        self.reconcile_pending()?;
-        let _reconcile_guard = self.reconcile_lock.lock();
-        let current_snapshot = self.snapshot();
+    fn prepare_edit(&self, params: &Value, permit: MutationPermit) -> AppResult<PreparedEdit> {
+        let mut writer = self.state.writer();
+        self.reconcile_with(&mut writer)?;
+        let stamp = writer.read().stamp();
+        let current_snapshot = stamp.snapshot_id;
         let requested_snapshot = params
             .get("snapshot_id")
             .and_then(Value::as_str)
@@ -265,18 +267,19 @@ impl Workspace {
                 ));
             }
         }
-        let index = self.index.read();
-        self.preflight_overlaps(changes, &index)?;
+        let view = writer.read();
+        let index = view.index();
+        self.preflight_overlaps(changes, index)?;
         let mut plan: HashMap<String, PlannedFile> = HashMap::new();
         for change in changes {
             self.plan_change(
                 change,
                 requested_snapshot.is_some() && snapshot_matches,
                 &mut plan,
-                &index,
+                index,
             )?;
         }
-        drop(index);
+        drop(view);
         let mut planned: Vec<PlannedFile> = plan.into_values().collect();
         planned.sort_by(|a, b| a.path.cmp(&b.path));
         // Per-file syntax preflight result. Tree-sitter validates languages with a
@@ -311,7 +314,7 @@ impl Workspace {
             return Ok(PreparedEdit::Preview(json!({
                 "preview": true,
                 "workspace_id": self.id,
-                "generation": self.generation(),
+                "generation": stamp.generation,
                 "snapshot_id": current_snapshot,
                 "snapshot_rebased_from": snapshot_rebased_from,
                 "diff": diff,
@@ -322,10 +325,10 @@ impl Workspace {
         self.recheck_preconditions(&planned)?;
         let request_id = format!("req_{}", Uuid::new_v4().simple());
         let commit_started = Instant::now();
-        let apply_result = self.commit_plan(&planned, &request_id)?;
+        let apply_result = self.commit_plan(&mut writer, &planned, &request_id)?;
         let commit_ms = commit_started.elapsed().as_millis();
         Ok(PreparedEdit::Applied(AppliedEdit {
-            write_guard,
+            permit,
             planned,
             apply_result,
             diff,

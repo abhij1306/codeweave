@@ -1,6 +1,7 @@
 use super::edit::PlannedFile;
-use super::events::{append_events, MutationRecord};
+use super::events::MutationRecord;
 use super::io_helpers::{atomic_write, remove_if_exists, restore_one};
+use super::state::StateWriter;
 use super::Workspace;
 use crate::index::content_hash;
 use crate::model::{AppError, AppResult};
@@ -8,7 +9,6 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 struct CommitProgress<'a> {
@@ -51,12 +51,16 @@ impl CompensationReport {
 }
 
 impl Workspace {
+    /// Write a planned edit and publish it as the next generation. The caller holds
+    /// the mutation permit and passes the writer it planned under.
     pub(super) fn commit_plan(
         &self,
+        writer: &mut StateWriter<'_>,
         plan: &[PlannedFile],
         request_id: &str,
     ) -> AppResult<Vec<MutationRecord>> {
-        let generation = self.generation() + 1;
+        let ledger = self.state.ledger();
+        let generation = writer.read().generation() + 1;
         let timestamp = Utc::now();
         let records: Vec<MutationRecord> = plan
             .iter()
@@ -74,16 +78,14 @@ impl Workspace {
         let mut progress = CommitProgress::new(plan);
         for item in plan {
             let absolute = self.root.join(&item.path);
-            self.internal_writes
-                .lock()
-                .insert(absolute.clone(), Instant::now());
+            ledger.record_internal(absolute.clone(), Instant::now());
             let result = match &item.after {
                 Some(content) => atomic_write(&self.root, &item.path, content),
                 None => remove_if_exists(&self.root, &item.path),
             };
             if let Err(error) = result {
-                self.internal_writes.lock().remove(&absolute);
-                let report = self.compensate(progress.completed(), false);
+                ledger.forget_internal(&absolute);
+                let report = self.compensate(writer, progress.completed(), false);
                 let manual_recovery_required = report.manual_recovery_required();
                 return Err(AppError::details(
                     if manual_recovery_required {
@@ -105,31 +107,40 @@ impl Workspace {
         }
 
         let paths: HashSet<PathBuf> = plan.iter().map(|item| self.root.join(&item.path)).collect();
-        self.index
-            .write()
-            .refresh_paths(
+        let status = self.repository.status(&self.root);
+        let refreshed = writer.update(|state| {
+            state.index_mut().refresh_paths(
                 &self.root,
                 &paths,
                 self.policy.max_file_bytes,
                 &self.exclusions,
-            )
-            .map_err(|error| {
-                self.failed_after_apply(&progress, "INDEX_REFRESH_FAILED", error.to_string())
-            })?;
-        self.refresh_repo_status();
-        self.generation.store(generation, Ordering::Release);
-        self.recompute_snapshot();
-        self.publish_mutations(&records);
+            )?;
+            // A failed `git status` keeps the previous status and marks it stale.
+            let _ = state.apply_repo_status(status);
+            state.bump_generation();
+            state.recompute_snapshot();
+            Ok::<(), AppError>(())
+        });
+        if let Err(error) = refreshed {
+            return Err(self.failed_after_apply(
+                writer,
+                &progress,
+                "INDEX_REFRESH_FAILED",
+                error.to_string(),
+            ));
+        }
+        ledger.record(&records);
         Ok(records)
     }
 
     fn failed_after_apply(
         &self,
+        writer: &mut StateWriter<'_>,
         progress: &CommitProgress<'_>,
         failure_code: &'static str,
         message: String,
     ) -> AppError {
-        let report = self.compensate(progress.completed(), true);
+        let report = self.compensate(writer, progress.completed(), true);
         let manual_recovery_required = report.manual_recovery_required();
         AppError::details(
             if manual_recovery_required {
@@ -148,16 +159,20 @@ impl Workspace {
         )
     }
 
-    fn compensate(&self, completed: &[PlannedFile], refresh_index: bool) -> CompensationReport {
+    fn compensate(
+        &self,
+        writer: &mut StateWriter<'_>,
+        completed: &[PlannedFile],
+        refresh_index: bool,
+    ) -> CompensationReport {
         if completed.is_empty() {
             return CompensationReport::default();
         }
-        {
-            let now = Instant::now();
-            let mut internal = self.internal_writes.lock();
-            for item in completed {
-                internal.insert(self.root.join(&item.path), now);
-            }
+        let now = Instant::now();
+        for item in completed {
+            self.state
+                .ledger()
+                .record_internal(self.root.join(&item.path), now);
         }
 
         let mut report = CompensationReport::default();
@@ -176,26 +191,19 @@ impl Workspace {
                 .iter()
                 .map(|item| self.root.join(&item.path))
                 .collect();
-            if let Err(error) = self.index.write().refresh_paths(
-                &self.root,
-                &paths,
-                self.policy.max_file_bytes,
-                &self.exclusions,
-            ) {
-                self.pending_paths.lock().extend(paths);
-                self.needs_reconcile.store(true, Ordering::Release);
+            let refreshed = writer.update(|state| {
+                state.index_mut().refresh_paths(
+                    &self.root,
+                    &paths,
+                    self.policy.max_file_bytes,
+                    &self.exclusions,
+                )
+            });
+            if let Err(error) = refreshed {
+                self.state.ledger().mark_pending(paths);
                 report.compensation_refresh_error = Some(json!(error.0));
             }
         }
         report
-    }
-
-    fn publish_mutations(&self, records: &[MutationRecord]) {
-        append_events(&mut self.mutations.lock(), records);
-    }
-
-    pub(super) fn record_mutations(&self, records: &[MutationRecord]) -> AppResult<()> {
-        self.publish_mutations(records);
-        Ok(())
     }
 }

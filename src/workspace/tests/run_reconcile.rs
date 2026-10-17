@@ -20,16 +20,11 @@ async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
     let actor = test_actor(root.path());
-    actor.mutations.lock().push_back(MutationRecord {
-        mutation_id: "event".to_owned(),
-        path: "unrelated/generated.txt".to_owned(),
-        before_hash: None,
-        after_hash: Some("hash".to_owned()),
-        source: "external".to_owned(),
-        request_id: "test".to_owned(),
-        timestamp: Utc::now(),
-        generation: actor.generation(),
-    });
+    let generation = actor.state.read().generation();
+    actor
+        .state
+        .ledger()
+        .record(&[mutation("unrelated/generated.txt", "external", generation)]);
 
     let started = actor
         .run(&json!({
@@ -97,6 +92,7 @@ async fn completed_bash_status_does_not_attribute_later_workspace_writes() {
 
     actor
         .commit_plan(
+            &mut actor.state.writer(),
             &[PlannedFile {
                 path: ".ai-bridge/codeweave-audit-success.md".to_owned(),
                 before: None,
@@ -136,28 +132,18 @@ fn run_change_detection_includes_new_mutations_to_already_dirty_files() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("existing.rs"), "fn existing() {}\n").unwrap();
     let actor = test_actor(root.path());
-    let generation = actor.generation();
+    let generation = actor.state.read().generation();
     let dirty_files = HashSet::from(["existing.rs".to_owned()]);
-    actor.mutations.lock().push_back(MutationRecord {
-        mutation_id: "during-run".to_owned(),
-        path: "existing.rs".to_owned(),
-        before_hash: Some("before".to_owned()),
-        after_hash: Some("after".to_owned()),
-        source: "external".to_owned(),
-        request_id: "watcher".to_owned(),
-        timestamp: Utc::now(),
-        generation: generation + 1,
-    });
+    let ledger = actor.state.ledger();
+    ledger.record(&[mutation("existing.rs", "external", generation + 1)]);
 
-    let mutations = actor.mutations.lock().iter().cloned().collect::<Vec<_>>();
-    let observed = actor.observed_run_changed_paths(
-        &mutations,
-        generation,
-        &dirty_files,
-        generation + 1,
-        None,
-        &dirty_files,
-    );
+    let observed = ledger.attribute_since(&RunWindow {
+        start_generation: generation,
+        end_generation: generation + 1,
+        ended_at: None,
+        baseline_dirty: &dirty_files,
+        current_dirty: &dirty_files,
+    });
 
     assert_eq!(observed, HashSet::from(["existing.rs".to_owned()]));
 }
@@ -168,30 +154,23 @@ fn delayed_reconcile_uses_file_modification_time_for_run_attribution() {
     let path = root.path().join("existing.rs");
     fs::write(&path, "fn existing() {}\n").unwrap();
     let actor = test_actor(root.path());
-    let generation = actor.generation();
+    let generation = actor.state.read().generation();
     let dirty_files = HashSet::from(["existing.rs".to_owned()]);
     fs::write(&path, "fn existing() { println!(\"changed\"); }\n").unwrap();
     let ended_at = Utc::now() + ChronoDuration::seconds(5);
-    actor.mutations.lock().push_back(MutationRecord {
-        mutation_id: "delayed-watcher".to_owned(),
-        path: "existing.rs".to_owned(),
-        before_hash: Some("before".to_owned()),
-        after_hash: Some("after".to_owned()),
-        source: "external".to_owned(),
-        request_id: "watcher".to_owned(),
+    let ledger = actor.state.ledger();
+    ledger.record(&[MutationRecord {
         timestamp: ended_at + ChronoDuration::seconds(1),
-        generation: generation + 1,
-    });
+        ..mutation("existing.rs", "external", generation + 1)
+    }]);
 
-    let mutations = actor.mutations.lock().iter().cloned().collect::<Vec<_>>();
-    let observed = actor.observed_run_changed_paths(
-        &mutations,
-        generation,
-        &dirty_files,
-        generation + 1,
-        Some(&ended_at),
-        &dirty_files,
-    );
+    let observed = ledger.attribute_since(&RunWindow {
+        start_generation: generation,
+        end_generation: generation + 1,
+        ended_at: Some(&ended_at),
+        baseline_dirty: &dirty_files,
+        current_dirty: &dirty_files,
+    });
 
     assert_eq!(observed, HashSet::from(["existing.rs".to_owned()]));
 }
@@ -203,12 +182,10 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
     let actor = test_actor(root.path());
     fs::write(root.path().join("pending.rs"), "fn pending_symbol() {}\n").unwrap();
     actor
-        .pending_paths
-        .lock()
-        .insert(root.path().join("pending.rs"));
-    actor
-        .needs_reconcile
-        .store(true, std::sync::atomic::Ordering::Release);
+        .state
+        .ledger()
+        .pending_handle()
+        .observe([actor.root.join("pending.rs")]);
 
     let fetch = actor
         .read_targets(&json!({"path": "existing.rs", "max_chars": 5_000}))
@@ -226,9 +203,7 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
     assert_eq!(search["result_count"], 0);
     assert!(search["phase_ms"]["index_search"].is_number());
 
-    assert!(actor
-        .needs_reconcile
-        .load(std::sync::atomic::Ordering::Acquire));
+    assert!(actor.state.ledger().needs_reconcile());
 }
 
 #[test]
@@ -245,32 +220,29 @@ fn reconciliation_discards_configured_excluded_paths() {
         root.path(),
         vec!["backend/artifacts/".to_owned(), "*.log".to_owned()],
     );
-    assert!(actor.index.read().get("source.rs").is_some());
+    assert!(actor.state.read().index().get("source.rs").is_some());
     assert!(actor
-        .index
+        .state
         .read()
+        .index()
         .get("backend/artifacts/existing.json")
         .is_none());
-    let generation = actor.generation();
+    let generation = actor.state.read().generation();
     let generated = root.path().join("backend/artifacts/new.json");
     fs::write(&generated, "generated").unwrap();
-    actor.pending_paths.lock().insert(generated);
-    actor
-        .needs_reconcile
-        .store(true, std::sync::atomic::Ordering::Release);
+    actor.state.ledger().mark_pending([generated]);
 
     let summary = actor.summary().unwrap();
 
-    assert_eq!(actor.generation(), generation);
+    assert_eq!(actor.state.read().generation(), generation);
     assert_eq!(summary["dirty_ownership"]["counts"]["observed_external"], 0);
     assert!(actor
-        .index
+        .state
         .read()
+        .index()
         .get("backend/artifacts/new.json")
         .is_none());
-    assert!(!actor
-        .needs_reconcile
-        .load(std::sync::atomic::Ordering::Acquire));
+    assert!(!actor.state.ledger().needs_reconcile());
 }
 
 #[tokio::test]
@@ -434,16 +406,10 @@ fn process_local_changes_include_external_mutations() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("value.rs"), "fn value() {}\n").unwrap();
     let actor = test_actor(root.path());
-    actor.mutations.lock().push_back(MutationRecord {
-        mutation_id: "old".to_owned(),
-        path: "value.rs".to_owned(),
-        before_hash: None,
-        after_hash: Some("hash".to_owned()),
-        source: "external".to_owned(),
-        request_id: "old-request".to_owned(),
-        timestamp: Utc::now(),
-        generation: 99,
-    });
+    actor
+        .state
+        .ledger()
+        .record(&[mutation("value.rs", "external", 99)]);
 
     let result = actor.changes(&json!({"since_generation": 0})).unwrap();
     assert_eq!(result["mutations"].as_array().unwrap().len(), 1);

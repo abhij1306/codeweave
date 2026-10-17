@@ -1,12 +1,26 @@
 use super::*;
 
+/// Publish a repository status with these dirty files through the state writer.
+fn set_dirty_files(actor: &Workspace, dirty_files: Vec<String>) {
+    actor
+        .state
+        .writer()
+        .update(|state| {
+            state.apply_repo_status(Ok(RepoStatus {
+                dirty_files,
+                ..RepoStatus::default()
+            }))
+        })
+        .unwrap();
+}
+
 #[tokio::test]
 async fn stale_snapshot_rebases_when_file_hash_is_current() {
     let root = tempdir().unwrap();
     let original = "fn value() -> i32 { 1 }\n";
     fs::write(root.path().join("value.rs"), original).unwrap();
     let actor = test_actor(root.path());
-    let old_snapshot = actor.snapshot();
+    let old_snapshot = actor.state.read().stamp().snapshot_id;
     fs::write(root.path().join("unrelated.rs"), "fn unrelated() {}\n").unwrap();
     actor.refresh(true).unwrap();
     let result = actor
@@ -61,30 +75,12 @@ fn dirty_ownership_tracks_only_current_dirty_mcp_paths() {
     fs::write(root.path().join("still_dirty.rs"), "fn dirty() {}\n").unwrap();
     fs::write(root.path().join("clean_now.rs"), "fn clean() {}\n").unwrap();
     let actor = test_actor(root.path());
-    let generation = actor.generation();
-    actor.mutations.lock().extend([
-        MutationRecord {
-            mutation_id: "dirty".to_owned(),
-            path: "still_dirty.rs".to_owned(),
-            before_hash: None,
-            after_hash: Some("dirty".to_owned()),
-            source: "mcp_edit".to_owned(),
-            request_id: "request".to_owned(),
-            timestamp: Utc::now(),
-            generation,
-        },
-        MutationRecord {
-            mutation_id: "clean".to_owned(),
-            path: "clean_now.rs".to_owned(),
-            before_hash: None,
-            after_hash: Some("clean".to_owned()),
-            source: "mcp_edit".to_owned(),
-            request_id: "request".to_owned(),
-            timestamp: Utc::now(),
-            generation,
-        },
+    let generation = actor.state.read().generation();
+    actor.state.ledger().record(&[
+        mutation("still_dirty.rs", "mcp_edit", generation),
+        mutation("clean_now.rs", "mcp_edit", generation),
     ]);
-    actor.repo_status.write().dirty_files = vec!["still_dirty.rs".to_owned()];
+    set_dirty_files(&actor, vec!["still_dirty.rs".to_owned()]);
 
     let summary = actor.summary().unwrap();
     let changed = summary["dirty_ownership"]["changed_by_mcp"]
@@ -100,16 +96,10 @@ fn changes_treats_since_generation_as_exclusive() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("value.rs"), "fn value() {}\n").unwrap();
     let actor = test_actor(root.path());
-    actor.mutations.lock().push_back(MutationRecord {
-        mutation_id: "current".to_owned(),
-        path: "value.rs".to_owned(),
-        before_hash: None,
-        after_hash: Some("hash".to_owned()),
-        source: "mcp_edit".to_owned(),
-        request_id: "request".to_owned(),
-        timestamp: Utc::now(),
-        generation: 7,
-    });
+    actor
+        .state
+        .ledger()
+        .record(&[mutation("value.rs", "mcp_edit", 7)]);
 
     let after_six = actor.changes(&json!({"since_generation": 6})).unwrap();
     assert_eq!(after_six["mutations"].as_array().unwrap().len(), 1);
@@ -123,17 +113,12 @@ fn changes_are_shared_across_clients() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("value.rs"), "fn value() {}\n").unwrap();
     let actor = test_actor(root.path());
+    let generation = actor.state.read().generation();
     for client in ["client-a", "client-b"] {
-        actor.mutations.lock().push_back(MutationRecord {
-            mutation_id: format!("mutation-{client}"),
-            path: format!("{client}.rs"),
-            before_hash: None,
-            after_hash: Some("hash".to_owned()),
-            source: "mcp_edit".to_owned(),
-            request_id: "request".to_owned(),
-            timestamp: Utc::now(),
-            generation: actor.generation(),
-        });
+        actor
+            .state
+            .ledger()
+            .record(&[mutation(&format!("{client}.rs"), "mcp_edit", generation)]);
     }
 
     let result = actor.changes(&json!({"since_generation": 0})).unwrap();
@@ -177,20 +162,24 @@ fn workspace_summary_caps_and_groups_large_change_sets() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("value.rs"), "fn value() {}\n").unwrap();
     let actor = test_actor(root.path());
-    actor.external_changed.lock().extend(
-        (0..45)
-            .map(|index| format!("backend/artifacts/result_{index}.json"))
-            .chain((0..5).map(|index| format!("src/feature_{index}.rs"))),
+    let external = (0..45)
+        .map(|index| format!("backend/artifacts/result_{index}.json"))
+        .chain((0..5).map(|index| format!("src/feature_{index}.rs")))
+        .map(|path| mutation(&path, "external", 1))
+        .collect::<Vec<_>>();
+    actor.state.ledger().record_external(&external);
+    set_dirty_files(
+        &actor,
+        (0..50)
+            .map(|index| {
+                if index < 45 {
+                    format!("backend/artifacts/result_{index}.json")
+                } else {
+                    format!("src/feature_{}.rs", index - 45)
+                }
+            })
+            .collect(),
     );
-    actor.repo_status.write().dirty_files = (0..50)
-        .map(|index| {
-            if index < 45 {
-                format!("backend/artifacts/result_{index}.json")
-            } else {
-                format!("src/feature_{}.rs", index - 45)
-            }
-        })
-        .collect();
 
     let summary = actor.summary().unwrap();
 

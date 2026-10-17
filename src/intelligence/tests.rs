@@ -294,7 +294,7 @@ fn reference_fallback_matches_code_retrieve_references() {
     let fixture = fixture();
     let service = fixture.service();
     let snapshot_id = fixture.live().snapshot_id();
-    let expected = ReferenceService::new(&fixture.index().read())
+    let expected = ReferenceService::new(fixture.state().read().index())
         .fallback(
             &SearchScope {
                 workspace_id: "fixture",

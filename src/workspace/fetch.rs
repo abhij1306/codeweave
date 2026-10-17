@@ -48,11 +48,11 @@ impl Workspace {
     #[cfg(test)]
     pub(super) fn read_targets_batch(&self, params: &Value) -> AppResult<Value> {
         let started = std::time::Instant::now();
-        let reconcile_pending = self.read_reconcile_pending();
+        let reconcile_pending = self.state.ledger().needs_reconcile();
+        let snapshot = self.state.read().stamp().snapshot_id;
         if let Some(expected) = params.get("snapshot_id").and_then(Value::as_str) {
-            let current = self.snapshot();
-            if expected != current {
-                return Err(super::util::stale_snapshot(expected, &current));
+            if expected != snapshot {
+                return Err(super::util::stale_snapshot(expected, &snapshot));
             }
         }
         let items: Vec<Value> = if let Some(path) = params.get("path").and_then(Value::as_str) {
@@ -111,7 +111,7 @@ impl Workspace {
                     .is_some_and(|(content, total)| content.len() < total as usize)
         });
         let mut result = json!({
-            "snapshot_id": self.snapshot(),
+            "snapshot_id": snapshot,
             "result_count": results.len(),
             "error_count": errors.len(),
             "partial_success": !results.is_empty() && !errors.is_empty(),
@@ -246,7 +246,8 @@ impl Workspace {
         context_lines: usize,
         include_imports: bool,
     ) -> AppResult<Value> {
-        let index = self.index.read();
+        let view = self.state.read();
+        let index = view.index();
         let (qualified_path, symbol_name) = if requested_path.is_none() {
             symbol_name
                 .split_once("::")
@@ -331,7 +332,8 @@ impl Workspace {
     }
 
     fn fetch_metadata(&self, path: &str) -> AppResult<Value> {
-        let index = self.index.read();
+        let view = self.state.read();
+        let index = view.index();
         let file = index.get(path).ok_or_else(|| {
             AppError::details(
                 "PATH_NOT_INDEXED",
@@ -359,7 +361,8 @@ impl Workspace {
         limit: usize,
         precondition: Option<FetchPrecondition<'_>>,
     ) -> AppResult<Value> {
-        let index = self.index.read();
+        let view = self.state.read();
+        let index = view.index();
         let file = index.get(path).ok_or_else(|| {
             precondition.map_or_else(
                 || {

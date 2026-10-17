@@ -9,13 +9,11 @@ use super::session::{Attempt, Semantic, Session, Workspace};
 use super::uri::UriCodec;
 use super::worker::{WorkerOperation, WorkerResponse};
 use super::workspace_edit::{preview_request, workspace_edit_changes, RenameChange};
-use crate::index::CodeIndex;
 use crate::model::{AppError, AppResult, IntelligenceSettings};
 use crate::reference_service::{Freshness, SemanticReferenceMetadata};
-use parking_lot::RwLock;
+use crate::workspace::StateReader;
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 const REFERENCE_CAVEAT: &str = "Language-server locations were produced from a full-text synchronized document hash that still matches disk and the live index.";
 
@@ -64,14 +62,13 @@ impl IntelligenceService {
         root: PathBuf,
         settings: IntelligenceSettings,
         workspace_id: String,
-        index: Arc<RwLock<CodeIndex>>,
-        snapshot_id: Arc<RwLock<String>>,
+        state: StateReader,
     ) -> AppResult<Self> {
         let backends = Backends::spawn(&root, &settings)?;
         Ok(Self::with_backends(
             root,
             workspace_id,
-            LiveIndex::new(index, snapshot_id),
+            LiveIndex::new(state),
             backends,
         ))
     }

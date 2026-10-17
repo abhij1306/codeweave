@@ -9,7 +9,8 @@ use super::uri::{path_uri, UriCodec};
 use super::worker::LspWorker;
 use crate::index::{CodeIndex, WorkspaceExclusions};
 use crate::model::IntelligenceSettings;
-use parking_lot::{Mutex, RwLock};
+use crate::workspace::StateReader;
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::fs;
@@ -192,8 +193,7 @@ impl RpcTransport for FakeTransport {
 /// A temporary workspace with a scanned live index.
 pub(crate) struct Fixture {
     pub(crate) root: tempfile::TempDir,
-    index: Arc<RwLock<CodeIndex>>,
-    snapshot: Arc<RwLock<String>>,
+    state: StateReader,
 }
 
 impl Fixture {
@@ -208,8 +208,7 @@ impl Fixture {
         let index = CodeIndex::scan(root.path(), 1_000_000, &[], &exclusions).unwrap();
         Self {
             root,
-            index: Arc::new(RwLock::new(index)),
-            snapshot: Arc::new(RwLock::new("snap_fixture".to_owned())),
+            state: StateReader::detached(index, "snap_fixture"),
         }
     }
 
@@ -225,12 +224,12 @@ impl Fixture {
         fs::write(self.path(relative), content).unwrap();
     }
 
-    pub(crate) fn index(&self) -> &Arc<RwLock<CodeIndex>> {
-        &self.index
+    pub(crate) fn state(&self) -> &StateReader {
+        &self.state
     }
 
     pub(crate) fn live(&self) -> LiveIndex {
-        LiveIndex::new(Arc::clone(&self.index), Arc::clone(&self.snapshot))
+        LiveIndex::new(self.state.clone())
     }
 
     /// A service whose only backend is `server` serving `preset`.
@@ -261,8 +260,7 @@ impl Fixture {
             self.root.path().to_path_buf(),
             IntelligenceSettings::default(),
             "fixture".to_owned(),
-            Arc::clone(&self.index),
-            Arc::clone(&self.snapshot),
+            self.state.clone(),
         )
         .unwrap()
     }
