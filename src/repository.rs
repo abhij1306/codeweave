@@ -346,8 +346,8 @@ fn truncate_output(mut text: String, max_chars: usize) -> String {
 }
 
 fn normalized_path(path: &str) -> Option<String> {
-    let path = path.replace('\\', "/");
-    (!path.is_empty()).then_some(path)
+    let path = crate::security::normalize_path_text(path);
+    (!path.is_empty()).then(|| path.into_owned())
 }
 
 fn porcelain_path(record: &str, field_count: usize) -> Option<String> {
