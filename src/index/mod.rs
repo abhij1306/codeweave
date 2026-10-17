@@ -29,4 +29,6 @@ pub use search::SearchParams;
 pub use store::CodeIndex;
 
 #[cfg(test)]
+mod cache_tests;
+#[cfg(test)]
 mod tests;
