@@ -61,7 +61,7 @@ impl WorkerError {
         )
     }
 
-    pub(crate) fn from_transport(
+    pub(super) fn from_transport(
         error: TransportError,
         language: &'static str,
         stderr_tail: Option<String>,

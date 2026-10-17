@@ -49,6 +49,7 @@ impl Backends {
         Ok(Self { backends })
     }
 
+    #[cfg(test)]
     pub(crate) fn new(backends: Vec<Arc<dyn SemanticBackend>>) -> Self {
         Self { backends }
     }

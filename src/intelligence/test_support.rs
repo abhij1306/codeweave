@@ -29,6 +29,7 @@ pub(crate) enum Reply {
 }
 
 type Responder = dyn Fn(&str, &Value) -> Reply + Send + Sync;
+type Publisher = dyn Fn(&str) -> Value + Send + Sync;
 
 /// A scripted language server. Every transport it creates shares the
 /// responder and the record of messages sent to it.
@@ -37,7 +38,7 @@ pub(crate) struct FakeServer {
     sent: Arc<Mutex<Vec<Value>>>,
     capabilities: Value,
     responder: Arc<Responder>,
-    publish: Option<Arc<dyn Fn(&str) -> Value + Send + Sync>>,
+    publish: Option<Arc<Publisher>>,
     spawned: Arc<AtomicUsize>,
     alive: Arc<AtomicUsize>,
 }
