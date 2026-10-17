@@ -1,9 +1,33 @@
 # Tool reference
 
-The registry is fixed at 25 tools. Every top-level request schema rejects
-unknown fields. Preview and transaction changes publish a discriminated union
-keyed by `kind`; operation-specific DTO validation enforces the same required
-and allowed fields at runtime.
+The registry is fixed at 25 tools. Every top-level request rejects unknown
+fields. Preview and transaction changes publish a discriminated union keyed by
+`kind`; operation-specific DTO validation enforces the same required and
+allowed fields at runtime.
+
+## Request validation
+
+Each tool has one typed request (`src/requests`). The published input schema
+is generated from that type, and the same schema supplies the field contract
+checked before the request is parsed, so the advertised schema and the
+accepted input cannot drift. `tests/fixtures/tools_list.json` pins the
+`tools/list` payload clients see.
+
+- JSON `null` counts as an omitted field.
+- An unknown top-level field is `UNKNOWN_TOOL_FIELD`, with `details.unknown`
+  and `details.allowed`.
+- A missing required field, a field of the wrong type, and an integer outside
+  its published `minimum`/`maximum` are errors: `INVALID_ARGUMENT` for most
+  tools, `INVALID_BASH_REQUEST` for the `bash*` tools, and
+  `MISSING_CHANGE_FIELD` / `INVALID_CHANGE_FIELD` for the narrow edit tools.
+  A wrongly typed value is never replaced by a default, and an out-of-range
+  integer is never clamped. For example, `workspace` `limit` above 2000,
+  `git_log` `limit` above 200 and `git_diff` `max_chars` above 200000 are
+  rejected.
+- Items of a `changes` array report `UNKNOWN_CHANGE_FIELD`,
+  `MISSING_CHANGE_FIELD`, `INVALID_CHANGE_FIELD` or `UNSUPPORTED_CHANGE_KIND`.
+- A `code_retrieve` operation field of the wrong type is
+  `INVALID_OPERATION_FIELD`.
 
 ## Workspace and reads
 
@@ -81,6 +105,9 @@ Inspection: `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, and
 
 Mutation: `git_stage`, `git_commit`, `git_restore`, and `git_push`. Destructive
 or externally visible operations retain explicit confirmation/preflight rules.
+
+`git_show` and `git_blame` honor `max_chars`, capped by the policy's context
+budget, in the same way as `git_diff`.
 
 ## Bash
 

@@ -28,8 +28,7 @@ use super::args::Cli;
 use super::config::ServerConfig;
 use super::server::{authorized, health, is_loopback, live, tool_failure, tool_result, AppState};
 use super::SERVER_NAME;
-use codeweave_rust::manager;
-use codeweave_rust::tools::ToolAccess;
+use codeweave_rust::tools;
 
 const INSTRUCTIONS: &str = "Use code_retrieve for repository discovery and exact reads, code_intelligence for semantic operations, the narrow edit tools for one-file changes, and code_preview/code_transaction for coordinated changes. Run commands with bash and use the narrowly scoped Git tools for repository operations. CodeWeave serves one shared repository fixed in config.json.";
 const MAX_MCP_REQUEST_BYTES: usize = 4 * 1024 * 1024;
@@ -73,10 +72,7 @@ impl ServerHandler for CodeWeaveMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        serde_json::from_value(
-            serde_json::json!({ "tools": self.state.tool_access.list_payload() }),
-        )
-        .map_err(|error| McpError::internal_error(error.to_string(), None))
+        Ok(ListToolsResult::with_all_items(tools::mcp_tools().to_vec()))
     }
 
     async fn call_tool(
@@ -90,16 +86,13 @@ impl ServerHandler for CodeWeaveMcp {
             .map(Value::Object)
             .unwrap_or_else(|| serde_json::json!({}));
 
-        if !ToolAccess::is_known_tool(name) {
+        let Some(tool) = tools::find(name) else {
             return Err(McpError::invalid_params(
                 format!("Unknown tool: {name}"),
                 None,
             ));
-        }
-        let result = match manager::prepare_tool_request(name, args) {
-            Ok(prepared) => self.state.manager.dispatch(name, &prepared).await,
-            Err(error) => Err(error),
         };
+        let result = tool.call(Arc::clone(&self.state.manager), args).await;
         let value = match result {
             Ok(value) => tool_result(value),
             Err(error) => tool_failure(error),
@@ -354,7 +347,6 @@ pub(crate) async fn run_stdio(state: AppState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::config::ServerConfig;
-    use super::super::server::resolve_tool_access;
     use super::*;
     use axum::{
         body::Body,
@@ -376,7 +368,6 @@ mod tests {
                 idle_timeout_ms: 5000,
             },
             token: Some(Arc::new(b"test-token".to_vec())),
-            tool_access: Arc::new(resolve_tool_access()),
             instance_id: Arc::from("transport-test"),
         }
     }

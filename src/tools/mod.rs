@@ -1,18 +1,50 @@
-//! The tool registry: the single source of truth for CodeWeave's advertised
-//! tools. It drives four things that used to be hand-maintained in three places
-//! (D6 triple-pinning):
+//! The tool registry: the one place a public tool is defined.
 //!
-//! 1. the `tools/list` payload (was `main.rs::tools()`),
-//! 2. the transport's callable-name set (was a hardcoded allowlist in
-//!    `mcp_transport.rs`),
-//! 3. startup and request schema validation.
-//!
-//! Add or change a tool in exactly one place — `registry()` — and every
-//! consumer updates with it.
+//! Each entry names a tool, its title, description and safety class, and its
+//! request type. The request type (see `crate::requests`) generates the
+//! published input schema, defines the field contract checked at the boundary,
+//! and through `ToolRequest::handle` binds the tool to its `Application`
+//! method. `tools/list` and `tools/call` both read this registry, so adding a
+//! tool means adding one entry here plus its request type.
 
-pub mod schemas;
+mod bindings;
 
-use serde_json::{json, Value};
+use crate::manager::Application;
+use crate::model::AppResult;
+use crate::requests::bash::{
+    BashCancelRequest, BashOutputRequest, BashStartRequest, BashStatusRequest,
+};
+use crate::requests::edit::{
+    CodeDeleteRequest, CodeInsertRequest, CodePreviewRequest, CodeRenameRequest,
+    CodeReplaceRangeRequest, CodeReplaceRequest, CodeTransactionRequest, CodeWriteRequest,
+};
+use crate::requests::git::{
+    GitBlameRequest, GitCommitRequest, GitDiffRequest, GitLogRequest, GitPreflightRequest,
+    GitPushRequest, GitRestoreRequest, GitShowRequest, GitStageRequest, GitStatusRequest,
+};
+use crate::requests::intelligence::CodeIntelligenceRequest;
+use crate::requests::retrieval::CodeRetrieveRequest;
+use crate::requests::workspace::WorkspaceRequest;
+use crate::requests::{input_schema, Contract, Rejection};
+use rmcp::model::{Tool, ToolAnnotations};
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+
+/// The future a tool handler returns.
+pub type ToolFuture = Pin<Box<dyn Future<Output = AppResult<Value>> + Send>>;
+
+/// A tool's typed request, bound to the operation that serves it.
+pub trait ToolRequest: DeserializeOwned + JsonSchema + Send + 'static {
+    /// How the request reports a rejected field.
+    const REJECTION: Rejection = Rejection::Argument;
+
+    fn handle(self, app: Arc<Application>) -> ToolFuture;
+}
 
 /// Hosted-client safety classification. Each tool maps to exactly one level; the
 /// level determines the advertised MCP annotation hints.
@@ -31,7 +63,7 @@ pub enum ToolSafety {
 }
 
 impl ToolSafety {
-    fn annotations(self) -> Value {
+    fn annotations(self) -> ToolAnnotations {
         let (read_only, destructive, idempotent, open_world) = match self {
             ToolSafety::Read => (true, false, true, false),
             ToolSafety::WriteClosed => (false, false, false, false),
@@ -39,360 +71,249 @@ impl ToolSafety {
             ToolSafety::WriteOpen => (false, false, false, true),
             ToolSafety::DestructiveOpen => (false, true, false, true),
         };
-        json!({
-            "readOnlyHint": read_only,
-            "destructiveHint": destructive,
-            "idempotentHint": idempotent,
-            "openWorldHint": open_world
-        })
+        ToolAnnotations::new()
+            .read_only(read_only)
+            .destructive(destructive)
+            .idempotent(idempotent)
+            .open_world(open_world)
     }
 }
 
-/// One advertised tool. `input_schema` is a function pointer into
-/// `tools::schemas::*` so the schema has a single definition.
+/// One advertised tool.
 pub struct ToolDefinition {
     pub name: &'static str,
     pub title: &'static str,
     pub description: &'static str,
     pub safety: ToolSafety,
-    pub input_schema: fn() -> Value,
+    schema: fn() -> Map<String, Value>,
+    call: fn(&'static ToolDefinition, Arc<Application>, Value) -> ToolFuture,
+    contract: OnceLock<Contract>,
 }
 
 impl ToolDefinition {
-    fn to_payload(&self) -> Value {
-        json!({
-            "name": self.name,
-            "title": self.title,
-            "description": self.description,
-            "annotations": self.safety.annotations(),
-            "execution": {"taskSupport": "forbidden"},
-            "inputSchema": (self.input_schema)()
-        })
+    const fn of<R: ToolRequest>(
+        name: &'static str,
+        title: &'static str,
+        description: &'static str,
+        safety: ToolSafety,
+    ) -> Self {
+        Self {
+            name,
+            title,
+            description,
+            safety,
+            schema: input_schema::<R>,
+            call: call::<R>,
+            contract: OnceLock::new(),
+        }
+    }
+
+    /// The published input schema.
+    pub fn input_schema(&self) -> Map<String, Value> {
+        (self.schema)()
+    }
+
+    /// The field contract read from the input schema, built once.
+    pub fn contract(&self) -> &Contract {
+        self.contract
+            .get_or_init(|| Contract::from_schema(self.name, &self.input_schema()))
+    }
+
+    /// Parse `arguments` into the tool's request and run its handler.
+    pub fn call(&'static self, app: Arc<Application>, arguments: Value) -> ToolFuture {
+        (self.call)(self, app, arguments)
+    }
+
+    fn to_mcp(&self) -> Tool {
+        Tool::new(self.name, self.description, Arc::new(self.input_schema()))
+            .with_title(self.title)
+            .with_annotations(self.safety.annotations())
     }
 }
 
-use schemas::{bash, edits, git, intelligence, retrieval, workspace};
-
-/// The complete `tools/list` payload in registry order.
-#[allow(dead_code)]
-pub fn full_list_payload() -> Value {
-    Value::Array(registry().iter().map(ToolDefinition::to_payload).collect())
-}
-
-/// Build the fixed tool surface.
-pub fn fixed_access() -> ToolAccess {
-    ToolAccess {
-        list_payload: full_list_payload(),
-    }
-}
-
-/// Reject fields that are not advertised by the selected public tool. Runtime
-/// operation/change validators handle discriminator-specific fields inside
-/// arrays; this closes the top-level silent-ignore path.
-pub fn validate_input_fields(name: &str, input: &Value) -> crate::model::AppResult<()> {
-    let object = input
-        .as_object()
-        .ok_or_else(|| crate::model::AppError::invalid("tool input must be an object"))?;
-    let tool = registry()
-        .iter()
-        .find(|tool| tool.name == name)
-        .ok_or_else(|| crate::model::AppError::invalid(format!("unknown tool '{name}'")))?;
-    let schema = (tool.input_schema)();
-    let allowed = schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .map(|properties| {
-            properties
-                .keys()
-                .map(String::as_str)
-                .collect::<std::collections::BTreeSet<_>>()
-        })
-        .unwrap_or_default();
-    let unknown = object
-        .keys()
-        .filter(|field| !allowed.contains(field.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if unknown.is_empty() {
-        Ok(())
-    } else {
-        Err(crate::model::AppError::details(
-            "UNKNOWN_TOOL_FIELD",
-            format!("tool '{name}' received unsupported fields"),
-            json!({"unknown": unknown, "allowed": allowed}),
-        ))
+fn call<R: ToolRequest>(
+    tool: &'static ToolDefinition,
+    app: Arc<Application>,
+    arguments: Value,
+) -> ToolFuture {
+    match tool.contract().parse::<R>(arguments, R::REJECTION) {
+        Ok(request) => request.handle(app),
+        Err(error) => Box::pin(std::future::ready(Err(error))),
     }
 }
 
 /// The complete, ordered tool set. Order is preserved in `tools/list`.
 pub fn registry() -> &'static [ToolDefinition] {
-    &[
-        ToolDefinition {
-            name: "workspace",
-            title: "Workspace",
-            description: "View this server's repository summary or process-local changes, refresh its index, or inspect diagnostics. The repository is fixed for the server's lifetime.",
-            safety: ToolSafety::Read,
-            input_schema: workspace::workspace,
-        },
-        ToolDefinition {
-            name: "code_retrieve",
-            title: "Code Retrieval",
-            description: "Use this single tool for all repository discovery and exact reads. Submit one or more explicit operations: find_file, find_symbol, search_text, find_references, symbols_overview, repo_map, or read.",
-            safety: ToolSafety::Read,
-            input_schema: retrieval::code_retrieve,
-        },
-        ToolDefinition {
-            name: "code_intelligence",
-            title: "Code Intelligence",
-            description: "Resolve definitions, references, diagnostics, or a rename preview through the optional semantic backend. Results always label semantic, syntactic, or lexical evidence.",
-            safety: ToolSafety::Read,
-            input_schema: intelligence::code_intelligence,
-        },
-        ToolDefinition {
-            name: "code_write",
-            title: "Write One File",
-            description: "Create or overwrite exactly one file. Use expected_hash when replacing an existing file.",
-            safety: ToolSafety::WriteClosed,
-            input_schema: edits::code_write,
-        },
-        ToolDefinition {
-            name: "code_replace",
-            title: "Replace Text in One File",
-            description: "Replace exact text in exactly one file. The replacement count is checked before writing.",
-            safety: ToolSafety::WriteClosed,
-            input_schema: edits::code_replace,
-        },
-        ToolDefinition {
-            name: "code_replace_range",
-            title: "Replace Fetched Range in One File",
-            description: "Replace the complete line range selected by a code_retrieve read handle in exactly one file.",
-            safety: ToolSafety::WriteClosed,
-            input_schema: edits::code_replace_range,
-        },
-        ToolDefinition {
-            name: "code_insert",
-            title: "Insert Text in One File",
-            description: "Insert text before, after, or inside one named symbol in exactly one file.",
-            safety: ToolSafety::WriteClosed,
-            input_schema: edits::code_insert,
-        },
-        ToolDefinition {
-            name: "code_delete",
-            title: "Delete One File",
-            description: "Delete exactly one file with an optional content-hash precondition.",
-            safety: ToolSafety::DestructiveClosed,
-            input_schema: edits::code_delete,
-        },
-        ToolDefinition {
-            name: "code_rename",
-            title: "Rename One File",
-            description: "Rename exactly one file with an optional content-hash precondition.",
-            safety: ToolSafety::WriteClosed,
-            input_schema: edits::code_rename,
-        },
-        ToolDefinition {
-            name: "code_preview",
-            title: "Preview Code Transaction",
-            description: "Preview a multi-file edit transaction and return the diff without writing files.",
-            safety: ToolSafety::Read,
-            input_schema: edits::code_preview,
-        },
-        ToolDefinition {
-            name: "code_transaction",
-            title: "Apply Code Transaction",
-            description: "Apply a multi-file edit transaction through the same precondition, non-destructive validation reporting, diff, and internal atomic-recovery engine as the narrow write tools.",
-            safety: ToolSafety::WriteClosed,
-            input_schema: edits::code_transaction,
-        },
-        ToolDefinition {
-            name: "git_status",
-            title: "Git Status",
-            description: "Show the working tree status: staged, unstaged, untracked, and partially staged files.",
-            safety: ToolSafety::Read,
-            input_schema: git::git_status,
-        },
-        ToolDefinition {
-            name: "git_diff",
-            title: "Git Diff",
-            description: "Show the diff for the working tree or, with staged=true, the staged index. Limit to specific paths when given.",
-            safety: ToolSafety::Read,
-            input_schema: git::git_diff,
-        },
-        ToolDefinition {
-            name: "git_log",
-            title: "Git Log",
-            description: "Show recent commit history.",
-            safety: ToolSafety::Read,
-            input_schema: git::git_log,
-        },
-        ToolDefinition {
-            name: "git_show",
-            title: "Git Show",
-            description: "Show the patch for one commit ref (default HEAD).",
-            safety: ToolSafety::Read,
-            input_schema: git::git_show,
-        },
-        ToolDefinition {
-            name: "git_blame",
-            title: "Git Blame",
-            description: "Show line-by-line authorship for one path, optionally bounded by start_line and end_line.",
-            safety: ToolSafety::Read,
-            input_schema: git::git_blame,
-        },
-        ToolDefinition {
-            name: "git_preflight",
-            title: "Git Preflight",
-            description: "Return staged_files, partially_staged_files, and the cached staged diff without committing.",
-            safety: ToolSafety::Read,
-            input_schema: git::git_preflight,
-        },
-        ToolDefinition {
-            name: "git_stage",
-            title: "Git Stage",
-            description: "Stage the given paths into the index.",
-            safety: ToolSafety::WriteClosed,
-            input_schema: git::git_stage,
-        },
-        ToolDefinition {
-            name: "git_commit",
-            title: "Git Commit",
-            description: "Commit the currently staged changes with the given message.",
-            safety: ToolSafety::WriteClosed,
-            input_schema: git::git_commit,
-        },
-        ToolDefinition {
-            name: "git_restore",
-            title: "Git Restore",
-            description: "Discard changes for the given paths, restoring them from the index or HEAD. Requires confirm=true because it overwrites local changes.",
-            safety: ToolSafety::DestructiveClosed,
-            input_schema: git::git_restore,
-        },
-        ToolDefinition {
-            name: "git_push",
-            title: "Git Push",
-            description: "Push commits to a remote (default origin) and optional branch. This reaches the network and requires confirm=true, matching git_restore, because it is the only network-facing write.",
-            safety: ToolSafety::WriteOpen,
-            input_schema: git::git_push,
-        },
-        ToolDefinition {
-            name: "bash",
-            title: "Run Bash Command",
-            description: "Run one Bash process as the CodeWeave OS user. This is trusted-client functionality, not a sandbox. Commands exceeding the foreground budget continue as the same background run; poll bash_status with its run_id instead of reissuing the command. Output is bounded and timeout terminates the process tree.",
-            safety: ToolSafety::DestructiveOpen,
-            input_schema: bash::bash,
-        },
-        ToolDefinition {
-            name: "bash_status",
-            title: "Bash Run Status",
-            description: "Return live or completed state and the retained output tail for a Bash run, including how many prefix characters were discarded.",
-            safety: ToolSafety::Read,
-            input_schema: bash::bash_status,
-        },
-        ToolDefinition {
-            name: "bash_output",
-            title: "Bash Run Output",
-            description: "Page retained combined, stdout, or stderr output for a Bash run. Continuations cover only the bounded tail; retention metadata reports any discarded prefix.",
-            safety: ToolSafety::Read,
-            input_schema: bash::bash_output,
-        },
-        ToolDefinition {
-            name: "bash_cancel",
-            title: "Cancel Bash Run",
-            description: "Cancel a running background Bash run. Partial output is retained.",
-            safety: ToolSafety::WriteClosed,
-            input_schema: bash::bash_cancel,
-        },
-    ]
-}
-/// Immutable fixed tool payload shared through `AppState`.
-#[derive(Debug, Clone)]
-pub struct ToolAccess {
-    list_payload: Value,
+    &TOOLS
 }
 
-impl ToolAccess {
-    pub fn list_payload(&self) -> &Value {
-        &self.list_payload
-    }
-
-    pub fn is_known_tool(name: &str) -> bool {
-        registry().iter().any(|tool| tool.name == name)
-    }
+/// The tool called `name`.
+pub fn find(name: &str) -> Option<&'static ToolDefinition> {
+    static BY_NAME: OnceLock<HashMap<&'static str, &'static ToolDefinition>> = OnceLock::new();
+    BY_NAME
+        .get_or_init(|| TOOLS.iter().map(|tool| (tool.name, tool)).collect())
+        .get(name)
+        .copied()
 }
+
+/// The `tools/list` entries in registry order, built once.
+pub fn mcp_tools() -> &'static [Tool] {
+    static TOOL_LIST: OnceLock<Vec<Tool>> = OnceLock::new();
+    TOOL_LIST.get_or_init(|| TOOLS.iter().map(ToolDefinition::to_mcp).collect())
+}
+
+static TOOLS: [ToolDefinition; 25] = [
+    ToolDefinition::of::<WorkspaceRequest>(
+        "workspace",
+        "Workspace",
+        "View this server's repository summary or process-local changes, refresh its index, or inspect diagnostics. The repository is fixed for the server's lifetime.",
+        ToolSafety::Read,
+    ),
+    ToolDefinition::of::<CodeRetrieveRequest>(
+        "code_retrieve",
+        "Code Retrieval",
+        "Use this single tool for all repository discovery and exact reads. Submit one or more explicit operations: find_file, find_symbol, search_text, find_references, symbols_overview, repo_map, or read.",
+        ToolSafety::Read,
+    ),
+    ToolDefinition::of::<CodeIntelligenceRequest>(
+        "code_intelligence",
+        "Code Intelligence",
+        "Resolve definitions, references, diagnostics, or a rename preview through the optional semantic backend. Results always label semantic, syntactic, or lexical evidence.",
+        ToolSafety::Read,
+    ),
+    ToolDefinition::of::<CodeWriteRequest>(
+        "code_write",
+        "Write One File",
+        "Create or overwrite exactly one file. Use expected_hash when replacing an existing file.",
+        ToolSafety::WriteClosed,
+    ),
+    ToolDefinition::of::<CodeReplaceRequest>(
+        "code_replace",
+        "Replace Text in One File",
+        "Replace exact text in exactly one file. The replacement count is checked before writing.",
+        ToolSafety::WriteClosed,
+    ),
+    ToolDefinition::of::<CodeReplaceRangeRequest>(
+        "code_replace_range",
+        "Replace Fetched Range in One File",
+        "Replace the complete line range selected by a code_retrieve read handle in exactly one file.",
+        ToolSafety::WriteClosed,
+    ),
+    ToolDefinition::of::<CodeInsertRequest>(
+        "code_insert",
+        "Insert Text in One File",
+        "Insert text before, after, or inside one named symbol in exactly one file.",
+        ToolSafety::WriteClosed,
+    ),
+    ToolDefinition::of::<CodeDeleteRequest>(
+        "code_delete",
+        "Delete One File",
+        "Delete exactly one file with an optional content-hash precondition.",
+        ToolSafety::DestructiveClosed,
+    ),
+    ToolDefinition::of::<CodeRenameRequest>(
+        "code_rename",
+        "Rename One File",
+        "Rename exactly one file with an optional content-hash precondition.",
+        ToolSafety::WriteClosed,
+    ),
+    ToolDefinition::of::<CodePreviewRequest>(
+        "code_preview",
+        "Preview Code Transaction",
+        "Preview a multi-file edit transaction and return the diff without writing files.",
+        ToolSafety::Read,
+    ),
+    ToolDefinition::of::<CodeTransactionRequest>(
+        "code_transaction",
+        "Apply Code Transaction",
+        "Apply a multi-file edit transaction through the same precondition, non-destructive validation reporting, diff, and internal atomic-recovery engine as the narrow write tools.",
+        ToolSafety::WriteClosed,
+    ),
+    ToolDefinition::of::<GitStatusRequest>(
+        "git_status",
+        "Git Status",
+        "Show the working tree status: staged, unstaged, untracked, and partially staged files.",
+        ToolSafety::Read,
+    ),
+    ToolDefinition::of::<GitDiffRequest>(
+        "git_diff",
+        "Git Diff",
+        "Show the diff for the working tree or, with staged=true, the staged index. Limit to specific paths when given.",
+        ToolSafety::Read,
+    ),
+    ToolDefinition::of::<GitLogRequest>(
+        "git_log",
+        "Git Log",
+        "Show recent commit history.",
+        ToolSafety::Read,
+    ),
+    ToolDefinition::of::<GitShowRequest>(
+        "git_show",
+        "Git Show",
+        "Show the patch for one commit ref (default HEAD).",
+        ToolSafety::Read,
+    ),
+    ToolDefinition::of::<GitBlameRequest>(
+        "git_blame",
+        "Git Blame",
+        "Show line-by-line authorship for one path, optionally bounded by start_line and end_line.",
+        ToolSafety::Read,
+    ),
+    ToolDefinition::of::<GitPreflightRequest>(
+        "git_preflight",
+        "Git Preflight",
+        "Return staged_files, partially_staged_files, and the cached staged diff without committing.",
+        ToolSafety::Read,
+    ),
+    ToolDefinition::of::<GitStageRequest>(
+        "git_stage",
+        "Git Stage",
+        "Stage the given paths into the index.",
+        ToolSafety::WriteClosed,
+    ),
+    ToolDefinition::of::<GitCommitRequest>(
+        "git_commit",
+        "Git Commit",
+        "Commit the currently staged changes with the given message.",
+        ToolSafety::WriteClosed,
+    ),
+    ToolDefinition::of::<GitRestoreRequest>(
+        "git_restore",
+        "Git Restore",
+        "Discard changes for the given paths, restoring them from the index or HEAD. Requires confirm=true because it overwrites local changes.",
+        ToolSafety::DestructiveClosed,
+    ),
+    ToolDefinition::of::<GitPushRequest>(
+        "git_push",
+        "Git Push",
+        "Push commits to a remote (default origin) and optional branch. This reaches the network and requires confirm=true, matching git_restore, because it is the only network-facing write.",
+        ToolSafety::WriteOpen,
+    ),
+    ToolDefinition::of::<BashStartRequest>(
+        "bash",
+        "Run Bash Command",
+        "Run one Bash process as the CodeWeave OS user. This is trusted-client functionality, not a sandbox. Commands exceeding the foreground budget continue as the same background run; poll bash_status with its run_id instead of reissuing the command. Output is bounded and timeout terminates the process tree.",
+        ToolSafety::DestructiveOpen,
+    ),
+    ToolDefinition::of::<BashStatusRequest>(
+        "bash_status",
+        "Bash Run Status",
+        "Return live or completed state and the retained output tail for a Bash run, including how many prefix characters were discarded.",
+        ToolSafety::Read,
+    ),
+    ToolDefinition::of::<BashOutputRequest>(
+        "bash_output",
+        "Bash Run Output",
+        "Page retained combined, stdout, or stderr output for a Bash run. Continuations cover only the bounded tail; retention metadata reports any discarded prefix.",
+        ToolSafety::Read,
+    ),
+    ToolDefinition::of::<BashCancelRequest>(
+        "bash_cancel",
+        "Cancel Bash Run",
+        "Cancel a running background Bash run. Partial output is retained.",
+        ToolSafety::WriteClosed,
+    ),
+];
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fixed_surface_contains_exactly_25_tools() {
-        let names = registry().iter().map(|tool| tool.name).collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                "workspace",
-                "code_retrieve",
-                "code_intelligence",
-                "code_write",
-                "code_replace",
-                "code_replace_range",
-                "code_insert",
-                "code_delete",
-                "code_rename",
-                "code_preview",
-                "code_transaction",
-                "git_status",
-                "git_diff",
-                "git_log",
-                "git_show",
-                "git_blame",
-                "git_preflight",
-                "git_stage",
-                "git_commit",
-                "git_restore",
-                "git_push",
-                "bash",
-                "bash_status",
-                "bash_output",
-                "bash_cancel",
-            ]
-        );
-    }
-
-    #[test]
-    fn advertised_tools_match_the_published_wire_fixture() {
-        let wire: rmcp::model::ListToolsResult =
-            serde_json::from_value(json!({ "tools": full_list_payload() })).unwrap();
-        let expected: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/tools_list.json")).unwrap();
-
-        assert_eq!(serde_json::to_value(&wire.tools).unwrap(), expected);
-    }
-
-    #[test]
-    fn list_payload_shape_uses_only_the_edit_discriminator_union() {
-        let access = fixed_access();
-        let items = access.list_payload().as_array().unwrap();
-        assert_eq!(items.len(), 25);
-        for item in items {
-            let schema = &item["inputSchema"];
-            assert_eq!(schema["type"], "object");
-            assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
-            assert_eq!(item["execution"]["taskSupport"], "forbidden");
-            let encoded = schema.to_string();
-            for forbidden in ["\"allOf\"", "\"not\"", "\"const\""] {
-                assert!(
-                    !encoded.contains(forbidden),
-                    "{} in {}",
-                    forbidden,
-                    item["name"]
-                );
-            }
-            let allows_change_union = matches!(
-                item["name"].as_str(),
-                Some("code_preview" | "code_transaction")
-            );
-            assert_eq!(encoded.contains("\"oneOf\""), allows_change_union);
-        }
-    }
-}
+mod tests;
