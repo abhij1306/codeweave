@@ -86,23 +86,23 @@ impl Workspace {
             .into_iter()
             .filter_map(|path| {
                 index.get(path).map(|file| {
-                    let full_len = file.content.len();
+                    let full_len = file.content().len();
                     if full_len > INSTRUCTION_INLINE_CAP {
                         let safe_cap =
-                            char_boundary_at_or_before(&file.content, INSTRUCTION_INLINE_CAP);
-                        let end = file.content[..safe_cap]
+                            char_boundary_at_or_before(file.content(), INSTRUCTION_INLINE_CAP);
+                        let end = file.content()[..safe_cap]
                             .rfind('\n')
                             .map(|idx| idx + 1)
                             .unwrap_or(safe_cap);
                         json!({
                             "path": path,
-                            "content": &file.content[..end],
+                            "content": &file.content()[..end],
                             "content_truncated": true,
                             "content_bytes": full_len,
                             "guidance": "Instruction file truncated; use code_retrieve with operation=read and target=path."
                         })
                     } else {
-                        json!({"path": path, "content": file.content})
+                        json!({"path": path, "content": file.content()})
                     }
                 })
             })

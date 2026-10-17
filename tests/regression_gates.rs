@@ -59,7 +59,7 @@ fn receiver_qualified_reference_scan_has_complete_recall() {
     )
     .unwrap();
     let exclusions = WorkspaceExclusions::new(root.path(), &[]).unwrap();
-    let mut index = CodeIndex::scan(root.path(), 2_000_000, &[], &exclusions).unwrap();
+    let index = CodeIndex::scan(root.path(), 2_000_000, &[], &exclusions).unwrap();
     let snapshot = index.snapshot_id("gate");
     let response = execute(
         &index,
@@ -94,7 +94,7 @@ fn fallback_reference_300k_returns_one_reference_and_meets_opt_in_timing_gate() 
         std::fs::write(root.path().join(format!("src/file_{file:03}.rs")), content).unwrap();
     }
     let exclusions = WorkspaceExclusions::new(root.path(), &[]).unwrap();
-    let mut index = CodeIndex::scan(root.path(), 2_000_000, &[], &exclusions).unwrap();
+    let index = CodeIndex::scan(root.path(), 2_000_000, &[], &exclusions).unwrap();
     assert_eq!(index.metrics().indexed_source_loc, FILES * LINES);
     let snapshot = index.snapshot_id("scale");
     let operation = json!({"operation":"find_references","symbol":"scale_target","definition_path":"src/file_000.rs","max_results":20});

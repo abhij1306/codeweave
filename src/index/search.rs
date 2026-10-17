@@ -1,11 +1,10 @@
-use super::metadata::query_terms;
 use super::path_filter::PathFilterSet;
 use super::{encode_handle, slice_lines, CodeIndex, FileEntry, RangeHandle};
 use crate::model::{AppError, AppResult};
 use crate::reference_service::{FallbackReferenceRequest, ReferenceService};
 use regex::{Regex, RegexBuilder};
 use serde_json::json;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub struct SearchParams<'a> {
     pub workspace_id: &'a str,
@@ -87,29 +86,26 @@ impl CodeIndex {
             }
             "filename" => {
                 let matcher = FilenameMatcher::new(query, case_sensitive)?;
-                let mut paths: Vec<_> = self
-                    .files
-                    .values()
-                    .filter(|file| path_filters.allows(&file.path))
+                let mut matched: Vec<&str> = self
+                    .files()
+                    .filter(|file| path_filters.allows(file.path()))
                     .filter(|file| matcher.matches(file))
-                    .map(|file| {
+                    .map(FileEntry::path)
+                    .collect();
+                matched.sort_unstable();
+                let total = matched.len();
+                let paths: Vec<_> = matched
+                    .into_iter()
+                    .take(max_results)
+                    .map(|path| {
                         json!({
-                            "path": file.path,
+                            "path": path,
                             "match_type": matcher.semantics(),
                             "score": 1.0,
                             "reason_codes": ["filename_match"]
                         })
                     })
                     .collect();
-                paths.sort_by_key(|value| {
-                    value
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_owned()
-                });
-                let total = paths.len();
-                paths.truncate(max_results);
                 Ok(json!({
                     "mode": mode,
                     "match_semantics": matcher.semantics(),
@@ -121,7 +117,7 @@ impl CodeIndex {
             }
             "symbol" => {
                 let results =
-                    self.symbol_results(workspace_id, query, &path_filters, max_results, false);
+                    self.symbol_results(workspace_id, query, &path_filters, max_results)?;
                 Ok(
                     json!({"mode": mode, "snapshot_id": snapshot_id, "result_count": results.len(), "results": results}),
                 )
@@ -147,7 +143,7 @@ impl CodeIndex {
                     )
                 })?;
                 Ok(
-                    json!({"mode": mode, "path": file.path, "hash": file.hash, "symbols": file.symbols}),
+                    json!({"mode": mode, "path": file.path(), "hash": file.hash(), "symbols": file.symbols()}),
                 )
             }
             "repo_map" => Ok(self.repo_map(snapshot_id, max_results, &path_filters)),
@@ -178,17 +174,19 @@ impl CodeIndex {
         } else {
             query.to_ascii_lowercase()
         };
-        let terms = if regex.is_none() {
-            query_terms(query)
-        } else {
-            Vec::new()
-        };
-        let mut files = if regex.is_some() {
-            self.files.values().collect::<Vec<_>>()
-        } else {
-            self.candidate_files(&terms)
-        };
-        files.sort_by(|left, right| left.path.cmp(&right.path));
+        // Every file in scope is scanned. Literal search first checks the
+        // whole file for the substring, which is exact, so it keeps full
+        // substring recall for partial identifiers and stop words alike.
+        let mut files = self
+            .files()
+            .filter(|file| path_filters.allows(file.path()))
+            .filter(|file| match regex {
+                Some(_) => true,
+                None if case_sensitive => file.content().contains(&needle),
+                None => file.search_content().contains(&needle),
+            })
+            .collect::<Vec<_>>();
+        files.sort_unstable_by(|left, right| left.path().cmp(right.path()));
 
         let per_file_limit = if path_filters.len() == 1 {
             max_results
@@ -198,13 +196,10 @@ impl CodeIndex {
         let mut groups: Vec<VecDeque<serde_json::Value>> = Vec::new();
         let mut total_windows = 0usize;
         for file in files {
-            if !path_filters.allows(&file.path) {
-                continue;
-            }
             let mut windows: Vec<(usize, usize, usize)> = Vec::new();
             let mut record_match = |index: usize| {
                 let start = index.saturating_sub(context_lines) + 1;
-                let end = (index + context_lines + 1).min(file.line_count);
+                let end = (index + context_lines + 1).min(file.line_count());
                 if let Some((_, _, previous_end)) = windows.last_mut() {
                     if start <= previous_end.saturating_add(1) {
                         *previous_end = (*previous_end).max(end);
@@ -214,19 +209,19 @@ impl CodeIndex {
                 windows.push((index + 1, start, end));
             };
             if let Some(regex) = regex {
-                for (index, line) in file.content.lines().enumerate() {
+                for (index, line) in file.content().lines().enumerate() {
                     if regex.is_match(line) {
                         record_match(index);
                     }
                 }
             } else if case_sensitive {
-                for (index, line) in file.content.lines().enumerate() {
+                for (index, line) in file.content().lines().enumerate() {
                     if line.contains(&needle) {
                         record_match(index);
                     }
                 }
             } else {
-                for (index, line) in file.search_content.lines().enumerate() {
+                for (index, line) in file.search_content().lines().enumerate() {
                     if line.contains(&needle) {
                         record_match(index);
                     }
@@ -237,17 +232,17 @@ impl CodeIndex {
             for (line, start, end) in windows.into_iter().take(per_file_limit) {
                 let handle = encode_handle(&RangeHandle {
                     workspace_id: workspace_id.to_owned(),
-                    path: file.path.clone(),
+                    path: file.path().to_owned(),
                     start_line: start,
                     end_line: end,
-                    content_hash: file.hash.clone(),
+                    content_hash: file.hash().to_owned(),
                 })?;
                 file_results.push(json!({
-                    "path": file.path,
+                    "path": file.path(),
                     "line": line,
                     "start_line": start,
                     "end_line": end,
-                    "preview": slice_lines(&file.content, start, end),
+                    "preview": slice_lines(file.content(), start, end),
                     "handle": handle,
                     "match_type": if regex.is_some() {"regex"} else {"literal"},
                     "score": 1.0,
@@ -290,15 +285,12 @@ impl CodeIndex {
         query: &str,
         path_filters: &PathFilterSet<'_>,
         max_results: usize,
-        exact: bool,
-    ) -> Vec<serde_json::Value> {
+    ) -> AppResult<Vec<serde_json::Value>> {
         let needle = query.to_ascii_lowercase();
         let mut results = Vec::new();
-        for name in self.symbol_index.keys() {
+        for name in self.symbol_names() {
             let normalized_name = name.to_ascii_lowercase();
-            if (exact && normalized_name != needle)
-                || (!exact && !normalized_name.contains(&needle))
-            {
+            if !normalized_name.contains(&needle) {
                 continue;
             }
             let rank = if normalized_name == needle {
@@ -309,23 +301,22 @@ impl CodeIndex {
                 2
             };
             for (file, symbol) in self.indexed_symbols(name) {
-                if !path_filters.allows(&file.path) {
+                if !path_filters.allows(file.path()) {
                     continue;
                 }
                 let handle = encode_handle(&RangeHandle {
                     workspace_id: workspace_id.to_owned(),
-                    path: file.path.clone(),
+                    path: file.path().to_owned(),
                     start_line: symbol.start_line,
                     end_line: symbol.end_line,
-                    content_hash: file.hash.clone(),
-                })
-                .unwrap_or_default();
+                    content_hash: file.hash().to_owned(),
+                })?;
                 results.push((
                     rank,
-                    file.path.clone(),
+                    file.path(),
                     symbol.start_line,
                     json!({
-                        "path": file.path,
+                        "path": file.path(),
                         "symbol": symbol,
                         "handle": handle,
                         "match_type": if rank == 0 {"exact_symbol"} else if rank == 1 {"prefix_symbol"} else {"contains_symbol"},
@@ -342,14 +333,14 @@ impl CodeIndex {
         results.sort_by(|left, right| {
             left.0
                 .cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.1.cmp(right.1))
                 .then_with(|| left.2.cmp(&right.2))
         });
-        results
+        Ok(results
             .into_iter()
             .take(max_results)
             .map(|(_, _, _, value)| value)
-            .collect()
+            .collect())
     }
 
     fn repo_map(
@@ -358,31 +349,26 @@ impl CodeIndex {
         limit: usize,
         path_filters: &PathFilterSet<'_>,
     ) -> serde_json::Value {
-        let mut directories: BTreeMap<String, (usize, HashSet<String>)> = BTreeMap::new();
+        let mut directories: BTreeMap<&str, (usize, BTreeSet<&str>)> = BTreeMap::new();
         let mut scoped_file_count = 0usize;
-        for file in self.files.values() {
-            if !path_filters.allows(&file.path) {
+        for file in self.files() {
+            if !path_filters.allows(file.path()) {
                 continue;
             }
             scoped_file_count += 1;
             let directory = file
-                .path
+                .path()
                 .rsplit_once('/')
                 .map(|(dir, _)| dir)
-                .unwrap_or(".")
-                .to_owned();
-            let value = directories
-                .entry(directory)
-                .or_insert_with(|| (0, HashSet::new()));
+                .unwrap_or(".");
+            let value = directories.entry(directory).or_default();
             value.0 += 1;
-            value.1.insert(file.language.clone());
+            value.1.insert(file.language());
         }
         let entries: Vec<_> = directories
             .into_iter()
             .take(limit)
             .map(|(path, (files, languages))| {
-                let mut languages: Vec<_> = languages.into_iter().collect();
-                languages.sort();
                 json!({"path": path, "files": files, "languages": languages})
             })
             .collect();
@@ -434,13 +420,13 @@ impl FilenameMatcher {
                 case_sensitive,
             } => {
                 let hay = if *case_sensitive {
-                    &file.path
+                    file.path()
                 } else {
-                    &file.path_lower
+                    file.path_lower()
                 };
-                hay.contains(needle)
+                hay.contains(needle.as_str())
             }
-            Self::Glob { regex } => regex.is_match(&file.path),
+            Self::Glob { regex } => regex.is_match(file.path()),
         }
     }
 

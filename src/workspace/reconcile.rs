@@ -147,7 +147,7 @@ impl Workspace {
                         mutation_id: MutationRecord::new_id(),
                         path: path.clone(),
                         before_hash: None,
-                        after_hash: index.get(path).map(|file| file.hash.clone()),
+                        after_hash: index.get(path).map(|file| file.hash().to_owned()),
                         source: "external".to_owned(),
                         request_id: "watcher".to_owned(),
                         timestamp: Utc::now(),
@@ -200,7 +200,7 @@ impl Workspace {
 
     pub(super) fn recompute_snapshot(&self) {
         let head = self.repo_status.read().head.clone();
-        let snapshot = self.index.write().snapshot_id(&head);
+        let snapshot = self.index.read().snapshot_id(&head);
         *self.snapshot_id.write() = snapshot;
     }
 

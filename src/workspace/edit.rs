@@ -473,7 +473,7 @@ impl Workspace {
         let before = plan
             .get(&path)
             .map(|item| item.after.clone())
-            .unwrap_or_else(|| index.get(&path).map(|file| file.content.clone()));
+            .unwrap_or_else(|| index.get(&path).map(|file| file.content().to_owned()));
         let original_hash = plan
             .get(&path)
             .and_then(|item| item.before.as_ref())

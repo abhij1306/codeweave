@@ -1,4 +1,6 @@
-use crate::index::{encode_handle, slice_lines, CodeIndex, FileEntry, PathFilterSet, RangeHandle};
+use crate::index::{
+    encode_handle, slice_lines, CodeIndex, DocumentType, FileEntry, PathFilterSet, RangeHandle,
+};
 use crate::model::{AppError, AppResult};
 use crate::symbols::{identifier_occurrences_with_symbols, IdentifierOccurrence, Symbol};
 use serde::Serialize;
@@ -190,7 +192,7 @@ impl<'a> ReferenceService<'a> {
             )
         })?;
         let mut candidates = file
-            .symbols
+            .symbols()
             .iter()
             .filter(|symbol| symbol.start_line <= line && symbol.end_line >= line)
             .cloned()
@@ -244,7 +246,7 @@ impl<'a> ReferenceService<'a> {
             let indexed = self.index.get(&location.path);
             let preview = indexed.map(|file| {
                 slice_lines(
-                    &file.content,
+                    file.content(),
                     location.range.start.line,
                     location.range.end.line,
                 )
@@ -256,7 +258,7 @@ impl<'a> ReferenceService<'a> {
                         path: location.path.clone(),
                         start_line: location.range.start.line,
                         end_line: location.range.end.line,
-                        content_hash: file.hash.clone(),
+                        content_hash: file.hash().to_owned(),
                     })
                 })
                 .transpose()?;
@@ -326,13 +328,13 @@ impl<'a> ReferenceService<'a> {
         let mut files = self
             .index
             .files()
-            .filter(|file| path_filters.allows(&file.path))
+            .filter(|file| path_filters.allows(file.path()))
             .filter(|file| reference_scope_allows(request.reference_scope, file))
             .collect::<Vec<_>>();
         files.sort_by(|left, right| left.path.cmp(&right.path));
         let scanned_scope = ScannedScope {
             file_count: files.len(),
-            byte_count: files.iter().map(|file| file.content.len()).sum(),
+            byte_count: files.iter().map(|file| file.content().len()).sum(),
         };
 
         let per_file_limit = request.max_results.clamp(1, 3);
@@ -357,17 +359,17 @@ impl<'a> ReferenceService<'a> {
         let mut total_occurrences = 0usize;
         for file in files {
             let occurrences = identifier_occurrences_with_symbols(
-                Path::new(&file.path),
-                &file.content,
+                Path::new(file.path()),
+                file.content(),
                 &target.symbol.name,
-                &file.symbols,
+                file.symbols(),
             );
             if occurrences.is_empty() {
                 continue;
             }
             let mut windows: Vec<ReferenceWindow> = Vec::new();
             for occurrence in occurrences {
-                if file.path == target_path
+                if file.path() == target_path
                     && target.selected_declaration.is_some_and(|selected| {
                         selected == (occurrence.start_byte, occurrence.end_byte)
                     })
@@ -387,7 +389,7 @@ impl<'a> ReferenceService<'a> {
                     .start_line
                     .saturating_sub(request.context_lines)
                     .max(1);
-                let end_line = (occurrence.end_line + request.context_lines).min(file.line_count);
+                let end_line = (occurrence.end_line + request.context_lines).min(file.line_count());
                 if let Some(previous) = windows.last_mut() {
                     if start_line <= previous.end_line.saturating_add(1)
                         && previous.occurrences.len() < 3
@@ -535,9 +537,9 @@ impl<'a> ReferenceService<'a> {
         })?;
         let occurrences = identifier_occurrences_with_symbols(
             Path::new(&path),
-            &file.content,
+            file.content(),
             &symbol.name,
-            &file.symbols,
+            file.symbols(),
         );
         let declaration_occurrence = occurrences
             .iter()
@@ -601,10 +603,10 @@ fn reference_location(
 ) -> AppResult<ReferenceLocation> {
     let handle = encode_handle(&RangeHandle {
         workspace_id: workspace_id.to_owned(),
-        path: file.path.clone(),
+        path: file.path().to_owned(),
         start_line: window.start_line,
         end_line: window.end_line,
-        content_hash: file.hash.clone(),
+        content_hash: file.hash().to_owned(),
     })?;
     let occurrences = window
         .occurrences
@@ -616,13 +618,13 @@ fn reference_location(
         .map(|occurrence| occurrence.range.clone())
         .expect("reference window contains an occurrence");
     Ok(ReferenceLocation {
-        path: file.path.clone(),
+        path: file.path().to_owned(),
         line: window.line_number,
         start_line: window.start_line,
         end_line: window.end_line,
         range,
         preview: Some(slice_lines(
-            &file.content,
+            file.content(),
             window.start_line,
             window.end_line,
         )),
@@ -659,7 +661,7 @@ fn declaration_location(
         path: path.to_owned(),
         start_line: symbol.start_line,
         end_line: symbol.end_line,
-        content_hash: file.hash.clone(),
+        content_hash: file.hash().to_owned(),
     })?;
     Ok(ReferenceLocation {
         path: path.to_owned(),
@@ -668,7 +670,7 @@ fn declaration_location(
         end_line: symbol.end_line,
         range,
         preview: Some(slice_lines(
-            &file.content,
+            file.content(),
             symbol.start_line,
             symbol.end_line,
         )),
@@ -728,11 +730,11 @@ fn symbol_range(symbol: &Symbol) -> ReferenceRange {
 fn reference_scope_allows(scope: &str, file: &FileEntry) -> bool {
     match scope {
         "all" | "" => true,
-        "tests" => file.document_type == "test",
+        "tests" => file.document_type() == DocumentType::Test,
         "production" => {
-            file.document_type == "source"
-                && !file.path.starts_with("docs/")
-                && !file.path.starts_with("examples/")
+            file.document_type() == DocumentType::Source
+                && !file.path().starts_with("docs/")
+                && !file.path().starts_with("examples/")
         }
         _ => false,
     }

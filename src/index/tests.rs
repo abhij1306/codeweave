@@ -1,29 +1,23 @@
 use super::*;
+use crate::symbols::extract_symbols;
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 
 fn test_entry(path: &str, content: &str) -> FileEntry {
-    let path_lower = path.to_ascii_lowercase();
-    let symbols = extract_symbols(Path::new(path), content);
-    FileEntry {
-        path: path.to_owned(),
-        path_lower: path_lower.clone(),
-        content: content.to_owned(),
-        search_content: content.to_ascii_lowercase(),
-        line_count: content.lines().count().max(1),
-        line_starts: line_starts(content),
-        indexed_terms: build_indexed_terms(content, path, &symbols),
-        hash: content_hash(content),
-        language: language_name(Path::new(path)).to_owned(),
-        document_type: classify_document(path),
-        symbols,
-        size: content.len() as u64,
-        modified_ns: 0,
-    }
+    FileEntry::with_symbols(
+        path.to_owned(),
+        content.to_owned(),
+        content_hash(content),
+        extract_symbols(Path::new(path), content),
+        content.len() as u64,
+        0,
+    )
 }
 
 #[cfg(unix)]
 #[test]
 fn incremental_refresh_does_not_follow_symlinks_outside_workspace() {
-    use std::collections::HashSet;
     use std::os::unix::fs::symlink;
 
     let root = tempfile::tempdir().unwrap();
@@ -57,18 +51,21 @@ fn handles_round_trip() {
     assert!(!encoded.contains("snapshot_id"));
 }
 #[test]
-fn hashes_are_stable() {
-    assert_eq!(content_hash("x"), content_hash("x"));
+fn content_hash_is_lowercase_hex_sha256() {
+    assert_eq!(
+        content_hash("x"),
+        "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+    );
 }
 
 #[test]
 fn index_metrics_report_loc_postings_symbols_and_memory_floor() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry(
+    index.insert(test_entry(
         "src/lib.rs",
         "pub fn alpha() {}\npub fn beta() { alpha(); }\n",
     ));
-    index.insert_entry(test_entry("README.md", "# Fixture\nalpha docs\n"));
+    index.insert(test_entry("README.md", "# Fixture\nalpha docs\n"));
 
     let metrics = index.metrics();
     assert_eq!(metrics.indexed_file_count, 2);
@@ -76,117 +73,40 @@ fn index_metrics_report_loc_postings_symbols_and_memory_floor() {
     assert_eq!(metrics.indexed_source_loc, 4);
     assert!(metrics.indexed_content_bytes > 0);
     assert!(metrics.estimated_heap_bytes_lower_bound >= metrics.indexed_content_bytes);
-    assert!(metrics.token_count > 0);
-    assert!(metrics.token_posting_count >= metrics.token_count);
     assert!(metrics.symbol_name_count >= 2);
     assert!(metrics.symbol_declaration_count >= 2);
 }
 
 #[test]
-fn token_miss_has_no_full_corpus_fallback() {
-    let mut index = CodeIndex::default();
-    index.insert_entry(test_entry("lib.rs", "pub fn indexed_symbol() {}\n"));
-
-    assert!(index
-        .candidate_files(&["definitely_missing_token".to_owned()])
-        .is_empty());
-}
-
-#[test]
-fn warm_cache_reuses_persisted_indexed_terms() {
-    let workspace = tempfile::tempdir().unwrap();
-    let cache_dir = tempfile::tempdir().unwrap();
-    let source = workspace.path().join("lib.rs");
-    fs::write(&source, "pub fn warm_cache_symbol() {}\n").unwrap();
-    let cache_file = cache_dir.path().join("index.json");
-    let exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
-
-    let (first, first_hit) =
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
-    assert!(!first_hit);
-    assert_eq!(
-        first
-            .candidate_files(&["warm_cache_symbol".to_owned()])
-            .len(),
-        1
-    );
-
-    let cached: CachedIndex = serde_json::from_slice(&fs::read(&cache_file).unwrap()).unwrap();
-    assert!(cached.files[0]
-        .indexed_terms
-        .iter()
-        .any(|term| term == "warm_cache_symbol"));
-
-    let (second, second_hit) =
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
-    assert!(second_hit);
-    assert_eq!(
-        second
-            .candidate_files(&["warm_cache_symbol".to_owned()])
-            .len(),
-        1
-    );
-}
-
-#[test]
-fn cache_metadata_match_does_not_override_changed_content() {
-    let workspace = tempfile::tempdir().unwrap();
-    let source = workspace.path().join("lib.rs");
-    let current = "fn new() {}\n";
-    fs::write(&source, current).unwrap();
-    let metadata = fs::metadata(&source).unwrap();
-    let modified_ns = metadata
-        .modified()
-        .unwrap()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let mut stale = test_entry("lib.rs", "fn old() {}\n");
-    assert_eq!(stale.content.len(), current.len());
-    stale.size = metadata.len();
-    stale.modified_ns = modified_ns;
-    let cached = HashMap::from([("lib.rs".to_owned(), stale)]);
-
-    let entry = read_entry(workspace.path(), &source, 1_000_000, &cached)
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(entry.content, current);
-    assert_eq!(entry.hash, content_hash(current));
-    assert!(entry.symbols.iter().any(|symbol| symbol.name == "new"));
-    assert!(!entry.symbols.iter().any(|symbol| symbol.name == "old"));
-}
-
-#[test]
 fn incremental_snapshots_are_order_independent_and_update_on_change() {
     let mut first = CodeIndex::default();
-    first.insert_entry(test_entry("src/a.rs", "fn a() {}\n"));
-    first.insert_entry(test_entry("src/b.rs", "fn b() {}\n"));
+    first.insert(test_entry("src/a.rs", "fn a() {}\n"));
+    first.insert(test_entry("src/b.rs", "fn b() {}\n"));
 
     let mut second = CodeIndex::default();
-    second.insert_entry(test_entry("src/b.rs", "fn b() {}\n"));
-    second.insert_entry(test_entry("src/a.rs", "fn a() {}\n"));
+    second.insert(test_entry("src/b.rs", "fn b() {}\n"));
+    second.insert(test_entry("src/a.rs", "fn a() {}\n"));
 
     assert_eq!(first.snapshot_id("head"), second.snapshot_id("head"));
     let original = first.snapshot_id("head");
     assert_ne!(first.snapshot_id("other-head"), original);
     assert_eq!(first.snapshot_id("head"), original);
-    first.insert_entry(test_entry(
+    first.insert(test_entry(
         "src/a.rs",
         "fn a() { println!(\"changed\"); }\n",
     ));
     assert_ne!(first.snapshot_id("head"), original);
-    first.insert_entry(test_entry("src/a.rs", "fn a() {}\n"));
+    first.insert(test_entry("src/a.rs", "fn a() {}\n"));
     assert_eq!(first.snapshot_id("head"), original);
 }
 
 #[test]
 fn symbol_index_replaces_stale_definitions() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry("src/a.rs", "fn old_name() {}\n"));
+    index.insert(test_entry("src/a.rs", "fn old_name() {}\n"));
     assert!(index.find_symbol(None, "old_name").is_some());
 
-    index.insert_entry(test_entry("src/a.rs", "fn new_name() {}\n"));
+    index.insert(test_entry("src/a.rs", "fn new_name() {}\n"));
     assert!(index.find_symbol(None, "old_name").is_none());
     assert_eq!(index.find_symbol(None, "new_name").unwrap().0, "src/a.rs");
 }
@@ -203,7 +123,7 @@ fn reference_search_is_explicit_and_excludes_the_declaration() {
         ("src/workspace.rs", "pub fn open_workspace() {}\n"),
         ("src/main.rs", "fn main() { open_workspace(); }\n"),
     ] {
-        index.insert_entry(test_entry(path, content));
+        index.insert(test_entry(path, content));
     }
     let result = index
         .search(SearchParams {
@@ -227,24 +147,16 @@ fn reference_search_is_explicit_and_excludes_the_declaration() {
 }
 
 #[test]
-fn reference_search_scans_all_allowed_files_when_general_postings_are_incomplete() {
+fn reference_search_scans_every_allowed_file() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry(
+    index.insert(test_entry(
         "src/owner.rs",
         "pub struct Validator;\nimpl Validator { pub fn run_edit_validation(&self) {} }\n",
     ));
-    let mut caller = test_entry(
+    index.insert(test_entry(
         "src/caller.rs",
         "impl Validator {\n    fn apply(&self) {\n        self.run_edit_validation();\n    }\n}\n",
-    );
-    caller
-        .indexed_terms
-        .retain(|term| term != "run_edit_validation");
-    assert!(!caller
-        .indexed_terms
-        .iter()
-        .any(|term| term == "run_edit_validation"));
-    index.insert_entry(caller);
+    ));
 
     let result = index
         .search(SearchParams {
@@ -283,8 +195,8 @@ fn reference_search_scans_all_allowed_files_when_general_postings_are_incomplete
 #[test]
 fn reference_search_finds_usages_for_single_character_symbols() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry("src/owner.rs", "pub fn x() {}\n"));
-    index.insert_entry(test_entry("src/caller.rs", "fn call() { x(); }\n"));
+    index.insert(test_entry("src/owner.rs", "pub fn x() {}\n"));
+    index.insert(test_entry("src/caller.rs", "fn call() { x(); }\n"));
 
     let result = index
         .search(SearchParams {
@@ -310,11 +222,11 @@ fn reference_search_finds_usages_for_single_character_symbols() {
 #[test]
 fn symbol_search_orders_exact_matches_before_contains_matches() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry(
+    index.insert(test_entry(
         "src/settings.rs",
         "pub struct CrawlRunSettings;\n",
     ));
-    index.insert_entry(test_entry("src/model.rs", "pub struct CrawlRun;\n"));
+    index.insert(test_entry("src/model.rs", "pub struct CrawlRun;\n"));
 
     let result = index
         .search(SearchParams {
@@ -340,9 +252,9 @@ fn symbol_search_orders_exact_matches_before_contains_matches() {
 #[test]
 fn reference_search_distributes_results_across_files() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry("src/owner.rs", "pub fn process_run() {}\n"));
-    index.insert_entry(test_entry("tests/noisy.rs", &"process_run();\n".repeat(12)));
-    index.insert_entry(test_entry(
+    index.insert(test_entry("src/owner.rs", "pub fn process_run() {}\n"));
+    index.insert(test_entry("tests/noisy.rs", &"process_run();\n".repeat(12)));
+    index.insert(test_entry(
         "src/caller.rs",
         "fn call() { process_run(); }\n",
     ));
@@ -382,8 +294,8 @@ fn reference_search_distributes_results_across_files() {
 #[test]
 fn reference_search_merges_adjacent_matches_into_bounded_windows() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry("src/owner.rs", "pub fn process_run() {}\n"));
-    index.insert_entry(test_entry(
+    index.insert(test_entry("src/owner.rs", "pub fn process_run() {}\n"));
+    index.insert(test_entry(
         "src/caller.rs",
         "fn call() {\n    process_run();\n    process_run();\n    process_run();\n}\n",
     ));
@@ -418,30 +330,13 @@ fn reference_search_merges_adjacent_matches_into_bounded_windows() {
 }
 
 #[test]
-fn document_classification_uses_path_segments_not_substrings() {
-    assert_eq!(classify_document("src/testament.rs"), "source");
-    assert_eq!(classify_document("src/fixtures_parser.rs"), "source");
-    assert_eq!(classify_document("tests/unit/test_output.py"), "test");
-    assert_eq!(classify_document("src/value_test.rs"), "test");
-    assert_eq!(classify_document("fixtures/http_response.json"), "artifact");
-    assert_eq!(
-        classify_document("recordings/login.recording.json"),
-        "artifact"
-    );
-    assert_eq!(classify_document("runtime/state.json"), "runtime_evidence");
-    assert_eq!(classify_document("evidence/state.txt"), "source");
-    assert_eq!(classify_document("runtime/state.txt"), "source");
-    assert_eq!(classify_document("logs/server.log"), "log");
-}
-
-#[test]
 fn literal_search_merges_overlapping_hits_and_distributes_files() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry(
+    index.insert(test_entry(
         "src/alpha.rs",
         "needle one\nneedle two\nneedle three\n",
     ));
-    index.insert_entry(test_entry("src/beta.rs", "prefix\nneedle beta\nsuffix\n"));
+    index.insert(test_entry("src/beta.rs", "prefix\nneedle beta\nsuffix\n"));
 
     let result = index
         .search(SearchParams {
@@ -474,7 +369,7 @@ fn literal_search_merges_overlapping_hits_and_distributes_files() {
 #[test]
 fn literal_search_scans_for_short_and_stop_word_queries() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry("src/value.rs", "let x = to();\n"));
+    index.insert(test_entry("src/value.rs", "let x = to();\n"));
 
     for query in ["x", "to"] {
         let result = index
@@ -502,7 +397,7 @@ fn literal_search_scans_for_short_and_stop_word_queries() {
 #[test]
 fn regex_search_honors_case_sensitivity() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry("src/value.rs", "Alpha\nmiddle\nalpha\n"));
+    index.insert(test_entry("src/value.rs", "Alpha\nmiddle\nalpha\n"));
 
     let insensitive = index
         .search(SearchParams {
@@ -545,11 +440,11 @@ fn regex_search_honors_case_sensitivity() {
 #[test]
 fn filename_search_supports_glob_wildcards() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry(
+    index.insert(test_entry(
         "backend/app/core/records/output_safety.py",
         "def sanitize_output():\n    pass\n",
     ));
-    index.insert_entry(test_entry(
+    index.insert(test_entry(
         "backend/app/core/other.py",
         "def other():\n    pass\n",
     ));
@@ -582,12 +477,12 @@ fn filename_search_supports_glob_wildcards() {
 #[test]
 fn repo_map_honors_path_filters_as_strict_scope() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry("backend/app/main.py", "def main():\n    pass\n"));
-    index.insert_entry(test_entry(
+    index.insert(test_entry("backend/app/main.py", "def main():\n    pass\n"));
+    index.insert(test_entry(
         "backend/tests/test_main.py",
         "def test_main():\n    pass\n",
     ));
-    index.insert_entry(test_entry("README.md", "backend app docs\n"));
+    index.insert(test_entry("README.md", "backend app docs\n"));
 
     let result = index
         .search(SearchParams {
@@ -762,12 +657,12 @@ fn exclusion_patterns_reject_reinclusion_rules() {
 #[test]
 fn lexical_reference_search_prioritizes_calls_over_imports() {
     let mut index = CodeIndex::default();
-    index.insert_entry(test_entry("src/owner.rs", "pub fn extract() {}\n"));
-    index.insert_entry(test_entry(
+    index.insert(test_entry("src/owner.rs", "pub fn extract() {}\n"));
+    index.insert(test_entry(
         "src/a_import.rs",
         "use crate::owner::extract;\n",
     ));
-    index.insert_entry(test_entry("src/z_call.rs", "fn run() { extract(); }\n"));
+    index.insert(test_entry("src/z_call.rs", "fn run() { extract(); }\n"));
 
     let result = index
         .search(SearchParams {
@@ -792,4 +687,156 @@ fn lexical_reference_search_prioritizes_calls_over_imports() {
         result["results"][0]["score"].as_f64().unwrap()
             > result["results"][1]["score"].as_f64().unwrap()
     );
+}
+
+#[test]
+fn document_classification_uses_path_segments_not_substrings() {
+    for (path, expected) in [
+        ("src/testament.rs", DocumentType::Source),
+        ("src/fixtures_parser.rs", DocumentType::Source),
+        ("tests/unit/test_output.py", DocumentType::Test),
+        ("src/value_test.rs", DocumentType::Test),
+        ("web/app.spec.tsx", DocumentType::Test),
+        ("fixtures/http_response.json", DocumentType::Artifact),
+        ("recordings/login.recording.json", DocumentType::Artifact),
+        ("runtime/state.json", DocumentType::RuntimeEvidence),
+        ("evidence/state.txt", DocumentType::Source),
+        ("runtime/state.txt", DocumentType::Source),
+        ("logs/server.log", DocumentType::Log),
+        ("docs/CLAUDE.md", DocumentType::Instruction),
+    ] {
+        assert_eq!(DocumentType::classify(path), expected, "path: {path}");
+    }
+    assert_eq!(
+        serde_json::to_value(DocumentType::RuntimeEvidence).unwrap(),
+        "runtime_evidence"
+    );
+}
+
+#[test]
+fn lookups_accept_backslash_and_dot_prefixed_paths() {
+    let mut index = CodeIndex::default();
+    index.insert(test_entry("src/a.rs", "fn a() {}\n"));
+
+    assert_eq!(index.get(".\\src\\a.rs").unwrap().path(), "src/a.rs");
+    assert_eq!(index.get("./src/a.rs").unwrap().path(), "src/a.rs");
+}
+
+#[test]
+fn warm_cache_scan_reports_a_hit_and_indexes_the_same_symbols() {
+    let workspace = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        workspace.path().join("lib.rs"),
+        "pub fn warm_cache_symbol() {}\n",
+    )
+    .unwrap();
+    let cache_file = cache_dir.path().join("index.json");
+    let exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
+
+    let (_, first_hit) =
+        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+    let (second, second_hit) =
+        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+
+    assert!(!first_hit);
+    assert!(second_hit);
+    assert_eq!(
+        second.find_symbol(None, "warm_cache_symbol").unwrap().0,
+        "lib.rs"
+    );
+}
+
+#[test]
+fn cache_hit_never_serves_symbols_or_content_of_changed_files() {
+    let workspace = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let source = workspace.path().join("lib.rs");
+    let cache_file = cache_dir.path().join("index.json");
+    let exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
+    fs::write(&source, "fn old() {}\n").unwrap();
+    CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+    fs::write(&source, "fn new() {}\n").unwrap();
+
+    let (index, cache_hit) =
+        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+
+    assert!(cache_hit);
+    assert_eq!(index.get("lib.rs").unwrap().content(), "fn new() {}\n");
+    assert_eq!(index.find_symbol(None, "new").unwrap().0, "lib.rs");
+    assert!(index.find_symbol(None, "old").is_none());
+}
+
+#[test]
+fn corrupt_cache_is_a_miss_and_is_rewritten() {
+    let workspace = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_file = cache_dir.path().join("index.json");
+    fs::write(workspace.path().join("value.rs"), "fn value() {}\n").unwrap();
+    fs::write(&cache_file, b"{\"schema\": truncated").unwrap();
+    let exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
+
+    let (index, corrupt_hit) =
+        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+    let (_, rewritten_hit) =
+        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+
+    assert!(!corrupt_hit);
+    assert_eq!(index.find_symbol(None, "value").unwrap().0, "value.rs");
+    assert!(rewritten_hit);
+}
+
+#[test]
+fn cache_rewrite_replaces_the_previous_file_without_leftovers() {
+    let workspace = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_file = cache_dir.path().join("index.json");
+    fs::write(workspace.path().join("value.rs"), "fn value() {}\n").unwrap();
+    let exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
+
+    for _ in 0..2 {
+        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+    }
+
+    let names: Vec<_> = fs::read_dir(cache_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec!["index.json".to_owned()]);
+}
+
+#[test]
+fn decoding_rejects_reversed_ranges_and_paths_outside_the_workspace() {
+    for (path, start_line, end_line) in [
+        ("a.rs", 5, 2),
+        ("../secret.rs", 1, 1),
+        ("src/..\\..\\secret.rs", 1, 1),
+        ("", 1, 1),
+    ] {
+        let encoded = encode_handle(&RangeHandle {
+            workspace_id: "w".into(),
+            path: path.into(),
+            start_line,
+            end_line,
+            content_hash: "h".into(),
+        })
+        .unwrap();
+        let error = decode_handle(&encoded).unwrap_err();
+        assert_eq!(error.0.code, "INVALID_HANDLE", "path: {path}");
+    }
+}
+
+#[test]
+fn removal_restores_the_previous_snapshot_and_lookups() {
+    let mut index = CodeIndex::default();
+    index.insert(test_entry("src/a.rs", "fn a() {}\n"));
+    let before = index.snapshot_id("head");
+    index.insert(test_entry("src/b.rs", "fn b() {}\n"));
+    assert_ne!(index.snapshot_id("head"), before);
+
+    assert_eq!(index.remove("src/b.rs").unwrap().path(), "src/b.rs");
+
+    assert_eq!(index.snapshot_id("head"), before);
+    assert!(index.find_symbol(None, "b").is_none());
+    assert_eq!(index.file_count(), 1);
 }
