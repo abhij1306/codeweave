@@ -1,5 +1,7 @@
+use super::launch::fake::FakeLauncher;
 use super::*;
 use crate::model::BashConfig;
+use crate::process_runtime::fake::FakeReaction;
 use crate::test_bash_executable;
 use std::fs;
 use tempfile::tempdir;
@@ -25,42 +27,14 @@ fn policy_with_executable(executable: String) -> PolicyConfig {
     policy
 }
 
-fn record(cache: &Path, run_id: &str, status: &str, output: &str) -> RunRecord {
-    RunRecord {
-        run_id: run_id.to_owned(),
-        sequence: 0,
-        status: status.to_owned(),
-        command: "printf test".to_owned(),
-        cwd: cache.to_path_buf(),
-        started_at: Utc::now(),
-        ended_at: Some(Utc::now()),
-        exit_code: (status == "succeeded").then_some(0),
-        output: output.to_owned(),
-        stdout: output.to_owned(),
-        stderr: String::new(),
-        combined: output.to_owned(),
-        output_truncated: false,
-        stdout_dropped_chars: 0,
-        stderr_dropped_chars: 0,
-        combined_dropped_chars: 0,
-        pid: None,
-        cancel_requested: false,
-        job: None,
-        baseline_generation: None,
-        baseline_dirty: HashSet::new(),
-        frozen_changes: None,
-    }
-}
-
 #[tokio::test]
 async fn explicit_invalid_bash_path_reports_unavailable_before_starting() {
     let root = tempdir().unwrap();
-    let cache = tempdir().unwrap();
-    let missing = cache.path().join("not-a-bash.exe");
-    let supervisor = BashSupervisor::new(
-        cache.path().to_path_buf(),
-        policy_with_executable(missing.to_string_lossy().into_owned()),
-    )
+    let elsewhere = tempdir().unwrap();
+    let missing = elsewhere.path().join("not-a-bash.exe");
+    let supervisor = BashSupervisor::new(policy_with_executable(
+        missing.to_string_lossy().into_owned(),
+    ))
     .unwrap();
     let readiness = supervisor.readiness();
     assert!(readiness.configured);
@@ -81,16 +55,13 @@ async fn explicit_invalid_bash_path_reports_unavailable_before_starting() {
         .unwrap_err();
 
     assert_eq!(error.0.code, "BASH_UNAVAILABLE");
-    assert!(supervisor.runs.lock().is_empty());
+    assert!(supervisor.runs.records().is_empty());
 }
 
 #[test]
 fn non_default_relative_bash_name_fails_closed_after_probe_failure() {
-    let supervisor = BashSupervisor::new(
-        tempdir().unwrap().path().to_path_buf(),
-        policy_with_executable("missing-codeweave-bash".to_owned()),
-    )
-    .unwrap();
+    let supervisor =
+        BashSupervisor::new(policy_with_executable("missing-codeweave-bash".to_owned())).unwrap();
 
     let readiness = supervisor.readiness();
 
@@ -98,31 +69,10 @@ fn non_default_relative_bash_name_fails_closed_after_probe_failure() {
     assert_eq!(readiness.resolved_executable, None);
 }
 
-#[test]
-fn trim_runs_evicts_only_the_oldest_completed_run() {
-    let cache = tempdir().unwrap();
-    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
-    for index in 0..=MAX_RETAINED_RUNS {
-        let run_id = format!("run-{index:03}");
-        let mut completed = record(cache.path(), &run_id, "succeeded", "");
-        completed.ended_at = Some(Utc::now() + chrono::Duration::milliseconds(index as i64));
-        supervisor
-            .runs
-            .lock()
-            .insert(run_id, Arc::new(Mutex::new(completed)));
-    }
-
-    supervisor.trim_runs();
-
-    assert!(!supervisor.runs.lock().contains_key("run-000"));
-    assert_eq!(supervisor.runs.lock().len(), MAX_RETAINED_RUNS);
-}
-
 #[tokio::test]
 async fn cwd_must_exist_inside_workspace() {
     let root = tempdir().unwrap();
-    let cache = tempdir().unwrap();
-    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
+    let supervisor = BashSupervisor::new(policy()).unwrap();
 
     let missing = supervisor
         .start(
@@ -159,8 +109,7 @@ async fn cwd_must_exist_inside_workspace() {
 #[tokio::test]
 async fn timeout_above_policy_maximum_is_rejected() {
     let root = tempdir().unwrap();
-    let cache = tempdir().unwrap();
-    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
+    let supervisor = BashSupervisor::new(policy()).unwrap();
     let error = supervisor
         .start(
             root.path(),
@@ -179,8 +128,7 @@ async fn timeout_above_policy_maximum_is_rejected() {
 #[tokio::test]
 async fn foreground_commands_capture_stdout_stderr_and_failures() {
     let root = tempdir().unwrap();
-    let cache = tempdir().unwrap();
-    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
+    let supervisor = BashSupervisor::new(policy()).unwrap();
     let succeeded = supervisor
         .start(
             root.path(),
@@ -217,8 +165,7 @@ async fn foreground_commands_capture_stdout_stderr_and_failures() {
 #[tokio::test]
 async fn foreground_process_preserves_quotes_and_non_utf8_output() {
     let root = tempdir().unwrap();
-    let cache = tempdir().unwrap();
-    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
+    let supervisor = BashSupervisor::new(policy()).unwrap();
 
     let quoted = supervisor
         .start(
@@ -267,10 +214,9 @@ async fn foreground_wsl_bash_maps_windows_working_directory() {
     }
 
     let root = std::env::current_dir().unwrap().canonicalize().unwrap();
-    let cache = tempdir().unwrap();
     let mut wsl_policy = policy();
     wsl_policy.bash.executable = wsl_bash.to_string_lossy().into_owned();
-    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), wsl_policy).unwrap();
+    let supervisor = BashSupervisor::new(wsl_policy).unwrap();
     let result = supervisor
         .start(
             &root,
@@ -295,8 +241,7 @@ async fn foreground_wsl_bash_maps_windows_working_directory() {
 #[tokio::test]
 async fn background_commands_can_be_polled_paged_and_cancelled() {
     let root = tempdir().unwrap();
-    let cache = tempdir().unwrap();
-    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
+    let supervisor = BashSupervisor::new(policy()).unwrap();
     let started = supervisor
         .start(
             root.path(),
@@ -344,8 +289,7 @@ async fn background_commands_can_be_polled_paged_and_cancelled() {
 #[tokio::test]
 async fn queued_command_waits_for_the_active_run() {
     let root = tempdir().unwrap();
-    let cache = tempdir().unwrap();
-    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
+    let supervisor = BashSupervisor::new(policy()).unwrap();
     let active = supervisor
         .start(
             root.path(),
@@ -401,12 +345,10 @@ async fn client_abort_keeps_the_detached_run_alive() {
     // the permit must free once it finishes, and the next warm run must be
     // clean (not interleaved with the abandoned command's output).
     let root = tempdir().unwrap();
-    let cache = tempdir().unwrap();
     let mut abort_policy = policy();
     abort_policy.bash.foreground_budget_ms = 20_000;
     abort_policy.bash.default_timeout_ms = 10_000;
-    let supervisor =
-        Arc::new(BashSupervisor::new(cache.path().to_path_buf(), abort_policy).unwrap());
+    let supervisor = Arc::new(BashSupervisor::new(abort_policy).unwrap());
 
     // Start a slow command on a task we then abort, mirroring a dropped
     // request future.
@@ -474,11 +416,10 @@ async fn client_abort_keeps_the_detached_run_alive() {
 #[tokio::test]
 async fn foreground_budget_auto_promotes_long_command() {
     let root = tempdir().unwrap();
-    let cache = tempdir().unwrap();
     let mut promote_policy = policy();
     promote_policy.bash.foreground_budget_ms = 200;
     promote_policy.bash.default_timeout_ms = 10_000;
-    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), promote_policy).unwrap();
+    let supervisor = BashSupervisor::new(promote_policy).unwrap();
     let result = supervisor
         .start(
             root.path(),
@@ -501,11 +442,10 @@ async fn foreground_budget_auto_promotes_long_command() {
 #[tokio::test]
 async fn identical_command_is_not_deduplicated() {
     let root = tempdir().unwrap();
-    let cache = tempdir().unwrap();
     let mut dedupe_policy = policy();
     dedupe_policy.bash.foreground_budget_ms = 200;
     dedupe_policy.bash.default_timeout_ms = 10_000;
-    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), dedupe_policy).unwrap();
+    let supervisor = BashSupervisor::new(dedupe_policy).unwrap();
     let request = || StartRequest {
         command: "sleep 30".to_owned(),
         cwd: None,
@@ -546,10 +486,9 @@ async fn identical_command_is_not_deduplicated() {
 #[tokio::test]
 async fn timeout_retains_partial_output() {
     let root = tempdir().unwrap();
-    let cache = tempdir().unwrap();
     let mut timeout_policy = policy();
     timeout_policy.bash.default_timeout_ms = 100;
-    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), timeout_policy).unwrap();
+    let supervisor = BashSupervisor::new(timeout_policy).unwrap();
     let result = supervisor
         .start(
             root.path(),
@@ -566,32 +505,249 @@ async fn timeout_retains_partial_output() {
     assert!(result["output"].as_str().unwrap().contains("partial"));
 }
 
+// Scripted-process tests: deterministic cancel, timeout and abandonment
+// behaviour without a real shell.
+
+fn fake_supervisor(launcher: Arc<FakeLauncher>, policy: PolicyConfig) -> BashSupervisor {
+    let readiness = BashReadiness {
+        configured: true,
+        configured_executable: "bash".to_owned(),
+        resolved_executable: Some("bash".to_owned()),
+        shell_type: "bash".to_owned(),
+        readiness: "ready".to_owned(),
+        failure_reason: None,
+    };
+    BashSupervisor::with_parts(policy, readiness, Some(launcher))
+}
+
+fn request(background: Option<bool>, timeout_ms: Option<u64>) -> StartRequest {
+    StartRequest {
+        command: "scripted".to_owned(),
+        cwd: None,
+        background,
+        timeout_ms,
+    }
+}
+
+async fn wait_until(mut ready: impl FnMut() -> bool) {
+    for _ in 0..250 {
+        if ready() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("condition not reached within five seconds");
+}
+
+#[tokio::test]
+async fn cancel_stops_the_process_group_and_keeps_partial_output() {
+    let root = tempdir().unwrap();
+    let launcher = Arc::new(FakeLauncher::new("partial", FakeReaction::StopsOnTerminate));
+    let supervisor = fake_supervisor(launcher.clone(), policy());
+    let started = supervisor
+        .start(root.path(), request(Some(true), None))
+        .await
+        .unwrap();
+    let run_id = started["run_id"].as_str().unwrap();
+    wait_until(|| supervisor.status(run_id).unwrap()["status"] == "running").await;
+    assert_eq!(supervisor.status(run_id).unwrap()["pid"], 4242);
+
+    assert_eq!(
+        supervisor.cancel(run_id).unwrap(),
+        json!({"run_id": run_id, "status": "cancelling"})
+    );
+    wait_until(|| launcher.events().contains(&"dropped")).await;
+
+    let status = supervisor.status(run_id).unwrap();
+    assert_eq!(status["status"], "cancelled");
+    assert_eq!(
+        status["output"],
+        "partial\n\nBash run was cancelled; partial output was retained."
+    );
+    assert_eq!(status["pid"], Value::Null);
+    assert_eq!(launcher.events(), ["launch", "terminate", "dropped"]);
+}
+
+#[tokio::test]
+async fn timeout_stops_the_process_and_reports_timed_out() {
+    let root = tempdir().unwrap();
+    let launcher = Arc::new(FakeLauncher::new("partial", FakeReaction::StopsOnTerminate));
+    let supervisor = fake_supervisor(launcher.clone(), policy());
+
+    let result = supervisor
+        .start(root.path(), request(None, Some(50)))
+        .await
+        .unwrap();
+
+    assert_eq!(result["status"], "timed_out");
+    assert_eq!(result["exit_code"], Value::Null);
+    assert_eq!(
+        result["output"],
+        "partial\n\nBash run exceeded timeout of 50 ms; partial output was retained."
+    );
+    assert_eq!(launcher.events(), ["launch", "terminate", "dropped"]);
+}
+
+#[tokio::test]
+async fn a_process_that_ignores_terminate_is_killed_after_the_grace_period() {
+    let root = tempdir().unwrap();
+    let launcher = Arc::new(FakeLauncher::new("", FakeReaction::IgnoresTerminate));
+    let supervisor = fake_supervisor(launcher.clone(), policy());
+
+    let result = supervisor
+        .start(root.path(), request(None, Some(50)))
+        .await
+        .unwrap();
+
+    assert_eq!(result["status"], "timed_out");
+    assert_eq!(
+        launcher.events(),
+        ["launch", "terminate", "kill", "dropped"]
+    );
+}
+
 #[test]
-fn output_action_selects_stdout_and_stderr_streams() {
-    let cache = tempdir().unwrap();
-    let supervisor = BashSupervisor::new(cache.path().to_path_buf(), policy()).unwrap();
-    let mut item = record(cache.path(), "streams", "failed", "combined");
-    item.stdout = "stdout-only".to_owned();
-    item.stderr = "stderr-only".to_owned();
-    item.stdout_dropped_chars = 17;
-    supervisor
-        .runs
-        .lock()
-        .insert("streams".to_owned(), Arc::new(Mutex::new(item)));
+fn an_abandoned_run_is_cancelled_and_its_process_group_killed() {
+    let root = tempdir().unwrap();
+    let launcher = Arc::new(FakeLauncher::new("", FakeReaction::IgnoresTerminate));
+    let supervisor = fake_supervisor(launcher.clone(), policy());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let run_id = runtime.block_on(async {
+        let started = supervisor
+            .start(root.path(), request(Some(true), None))
+            .await
+            .unwrap();
+        let run_id = started["run_id"].as_str().unwrap().to_owned();
+        wait_until(|| supervisor.status(&run_id).unwrap()["status"] == "running").await;
+        run_id
+    });
+
+    // Shutting the runtime down drops the execution task mid-run.
+    drop(runtime);
+
+    let status = supervisor.status(&run_id).unwrap();
+    assert_eq!(status["status"], "cancelled");
+    assert_eq!(
+        status["output"],
+        "Bash run was abandoned; the process tree was terminated."
+    );
+    assert_eq!(launcher.events(), ["launch", "dropped"]);
+    assert_eq!(supervisor.running_count(), 0);
+}
+
+#[tokio::test]
+async fn a_queued_run_cancelled_before_it_starts_is_never_launched() {
+    let root = tempdir().unwrap();
+    let launcher = Arc::new(FakeLauncher::new("", FakeReaction::StopsOnTerminate));
+    let supervisor = fake_supervisor(launcher.clone(), policy());
+    let active = supervisor
+        .start(root.path(), request(Some(true), None))
+        .await
+        .unwrap();
+    let active_id = active["run_id"].as_str().unwrap();
+    wait_until(|| supervisor.status(active_id).unwrap()["status"] == "running").await;
+    let queued = supervisor
+        .queue(root.path(), request(None, None))
+        .await
+        .unwrap();
+    let queued_id = queued["run_id"].as_str().unwrap();
+    assert_eq!(queued["status"], "queued");
+
+    assert_eq!(
+        supervisor.cancel(queued_id).unwrap()["status"],
+        "cancelling"
+    );
+    supervisor.cancel(active_id).unwrap();
+    wait_until(|| supervisor.status(queued_id).unwrap()["ended_at"].is_string()).await;
+
+    let status = supervisor.status(queued_id).unwrap();
+    assert_eq!(status["status"], "cancelled");
+    assert_eq!(
+        status["output"],
+        "Bash run was cancelled before the process started."
+    );
+    let launches = launcher
+        .events()
+        .into_iter()
+        .filter(|event| *event == "launch")
+        .count();
+    assert_eq!(launches, 1);
+}
+
+#[tokio::test]
+async fn cancelling_a_finished_run_leaves_it_unchanged() {
+    let root = tempdir().unwrap();
+    let launcher = Arc::new(FakeLauncher::new("out", FakeReaction::ExitsWith(3)));
+    let supervisor = fake_supervisor(launcher, policy());
+    let finished = supervisor
+        .start(root.path(), request(None, None))
+        .await
+        .unwrap();
+    assert_eq!(finished["status"], "failed");
+
+    let cancelled = supervisor
+        .cancel(finished["run_id"].as_str().unwrap())
+        .unwrap();
+
+    assert_eq!(cancelled["status"], "failed");
+    assert_eq!(cancelled["exit_code"], 3);
+    assert_eq!(cancelled["output"], "out");
+}
+
+#[tokio::test]
+async fn only_the_newest_completed_runs_are_retained() {
+    let root = tempdir().unwrap();
+    let launcher = Arc::new(FakeLauncher::new("", FakeReaction::ExitsWith(0)));
+    let supervisor = fake_supervisor(launcher, policy());
+    let mut run_ids = Vec::new();
+    for _ in 0..=MAX_RETAINED_RUNS {
+        let finished = supervisor
+            .start(root.path(), request(None, None))
+            .await
+            .unwrap();
+        run_ids.push(finished["run_id"].as_str().unwrap().to_owned());
+    }
+
+    let evicted = supervisor.status(&run_ids[0]).unwrap_err();
+    assert_eq!(evicted.0.code, "RUN_NOT_FOUND");
+    assert_eq!(
+        supervisor.status(&run_ids[1]).unwrap()["status"],
+        "succeeded"
+    );
+}
+
+#[tokio::test]
+async fn output_streams_are_kept_apart_and_report_dropped_prefixes() {
+    let root = tempdir().unwrap();
+    let mut launcher = FakeLauncher::new("stdout-only", FakeReaction::ExitsWith(0));
+    launcher.stderr = "stderr-only";
+    let mut small = policy();
+    small.bash.max_output_chars = 8;
+    let supervisor = fake_supervisor(Arc::new(launcher), small);
+    let finished = supervisor
+        .start(root.path(), request(None, None))
+        .await
+        .unwrap();
+    let run_id = finished["run_id"].as_str().unwrap();
 
     let stdout = supervisor
-        .output_stream("streams", None, Some("stdout"))
+        .output_stream(run_id, None, Some("stdout"))
         .unwrap();
-    assert_eq!(stdout["output"], "stdout-only");
+    assert_eq!(stdout["output"], "out-only");
+    assert_eq!(stdout["total_chars"], 11);
+    assert_eq!(stdout["dropped_prefix_chars"], 3);
+    assert_eq!(stdout["retained_start_offset"], 3);
     assert_eq!(stdout["output_truncated"], true);
-    assert_eq!(stdout["retention_policy"], "tail");
-    assert_eq!(stdout["dropped_prefix_chars"], 17);
-    assert_eq!(stdout["retained_start_offset"], 17);
-    assert_eq!(stdout["continuation_scope"], "retained_buffer");
-    assert_eq!(
-        supervisor
-            .output_stream("streams", None, Some("stderr"))
-            .unwrap()["output"],
-        "stderr-only"
-    );
+    assert_eq!(stdout["continuation"], Value::Null);
+    let stderr = supervisor
+        .output_stream(run_id, None, Some("stderr"))
+        .unwrap();
+    assert_eq!(stderr["output"], "err-only");
+    let invalid = supervisor
+        .output_stream(run_id, None, Some("both"))
+        .unwrap_err();
+    assert_eq!(invalid.0.code, "INVALID_ARGUMENT");
 }

@@ -1,17 +1,27 @@
+//! The Bash supervisor: starts runs one at a time, tracks each run's record, and
+//! serves status, output and cancellation for them.
 mod execution;
+mod launch;
+mod lifecycle;
+mod output;
 mod readiness;
 
 use crate::model::{AppError, AppResult, PolicyConfig};
-use crate::process_runtime::{strip_ansi, terminate_process_tree, OutputStream, WindowsJob};
 use crate::security::resolve_existing;
 use chrono::{DateTime, Utc};
-use execution::{execute, finalize_run_error};
+use execution::{execute, finalize_run_error, AbandonGuard, ExecutionRequest, TERMINATE_GRACE};
+use launch::{Launcher, ShellLauncher};
+pub use lifecycle::RunStatus;
+use lifecycle::{CancelRequest, RunRecord};
+pub(crate) use lifecycle::{ChangeBaseline, FrozenChanges, RunChangeWindow};
+pub use output::OutputStream;
+use output::{clamp_chars, continuation_offset, continuation_token};
 use parking_lot::Mutex;
 use readiness::resolve_bash;
 pub use readiness::BashReadiness;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -24,7 +34,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize)]
 pub struct BashRunView {
     pub run_id: String,
-    pub status: String,
+    pub status: RunStatus,
     pub command: String,
     pub cwd: String,
     pub started_at: DateTime<Utc>,
@@ -40,84 +50,74 @@ pub struct BashRunView {
     pub pid: Option<u32>,
 }
 
-#[derive(Debug)]
-pub(crate) struct RunRecord {
-    run_id: String,
-    sequence: u64,
-    status: String,
-    command: String,
-    cwd: PathBuf,
-    started_at: DateTime<Utc>,
-    ended_at: Option<DateTime<Utc>>,
-    exit_code: Option<i32>,
-    pub(crate) output: String,
-    pub(crate) stdout: String,
-    pub(crate) stderr: String,
-    pub(crate) combined: String,
-    pub(crate) output_truncated: bool,
-    pub(crate) stdout_dropped_chars: usize,
-    pub(crate) stderr_dropped_chars: usize,
-    pub(crate) combined_dropped_chars: usize,
-    pid: Option<u32>,
-    cancel_requested: bool,
-    job: Option<Arc<WindowsJob>>,
-    baseline_generation: Option<u64>,
-    baseline_dirty: HashSet<String>,
-    frozen_changes: Option<(u64, HashSet<String>)>,
+type SharedRecord = Arc<Mutex<RunRecord>>;
+
+/// Retained runs by id.
+///
+/// Lock order: the table lock is never held while a record lock is taken.
+/// Callers copy the record handles out, release the table, then lock records.
+/// (Record locks may be held while taking the table lock; nothing does that.)
+#[derive(Debug, Default)]
+struct RunTable {
+    runs: Mutex<HashMap<String, SharedRecord>>,
 }
 
-struct ExecutionGuard {
-    record: Arc<Mutex<RunRecord>>,
-    pid: Option<u32>,
-    job: Option<Arc<WindowsJob>>,
-    armed: bool,
-}
-
-impl ExecutionGuard {
-    fn new(record: Arc<Mutex<RunRecord>>, pid: Option<u32>, job: Option<Arc<WindowsJob>>) -> Self {
-        Self {
-            record,
-            pid,
-            job,
-            armed: true,
-        }
+impl RunTable {
+    fn get(&self, run_id: &str) -> AppResult<SharedRecord> {
+        self.runs.lock().get(run_id).cloned().ok_or_else(|| {
+            AppError::details(
+                "RUN_NOT_FOUND",
+                "Bash run not found",
+                json!({"run_id": run_id}),
+            )
+        })
     }
 
-    fn disarm(&mut self) {
-        self.armed = false;
+    fn records(&self) -> Vec<SharedRecord> {
+        self.runs.lock().values().cloned().collect()
     }
-}
 
-impl Drop for ExecutionGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Some(pid) = self.pid {
-            terminate_process_tree(pid, self.job.as_deref());
-        }
-        let mut item = self.record.lock();
-        if item.ended_at.is_none() {
-            item.status = "cancelled".to_owned();
-            item.ended_at = Some(Utc::now());
-            item.pid = None;
-            item.job = None;
-            if !item.output.is_empty() {
-                item.output.push('\n');
+    /// Insert a run, then evict the oldest terminal runs beyond `retain`.
+    /// Active runs are never evicted.
+    fn insert(&self, run_id: String, record: SharedRecord, retain: usize) {
+        let snapshot: Vec<(String, SharedRecord)> = {
+            let mut runs = self.runs.lock();
+            runs.insert(run_id, record);
+            if runs.len() <= retain {
+                return;
             }
-            item.output
-                .push_str("Bash run was abandoned; the process tree was terminated.");
+            runs.iter()
+                .map(|(id, record)| (id.clone(), record.clone()))
+                .collect()
+        };
+        let excess = snapshot.len().saturating_sub(retain);
+        let mut ended: Vec<(DateTime<Utc>, u64, String)> = snapshot
+            .into_iter()
+            .filter_map(|(id, record)| {
+                let record = record.lock();
+                record
+                    .ended_at()
+                    .map(|ended| (ended, record.sequence(), id))
+            })
+            .collect();
+        ended.sort();
+        // A terminal run never becomes active again, so these stay evictable.
+        let mut runs = self.runs.lock();
+        for (_, _, run_id) in ended.into_iter().take(excess) {
+            runs.remove(&run_id);
         }
     }
 }
 
 #[derive(Clone)]
 pub struct BashSupervisor {
-    runs: Arc<Mutex<HashMap<String, Arc<Mutex<RunRecord>>>>>,
+    runs: Arc<RunTable>,
     next_run_sequence: Arc<AtomicU64>,
     run_permit: Arc<Semaphore>,
     policy: PolicyConfig,
     readiness: BashReadiness,
+    /// Present exactly when Bash is ready.
+    launcher: Option<Arc<dyn Launcher>>,
 }
 
 impl std::fmt::Debug for BashSupervisor {
@@ -131,14 +131,6 @@ impl std::fmt::Debug for BashSupervisor {
     }
 }
 
-struct ExecutionRequest {
-    bash_executable: String,
-    command: String,
-    cwd: PathBuf,
-    timeout_ms: u64,
-    max_output: usize,
-}
-
 const MAX_RETAINED_RUNS: usize = 128;
 
 #[derive(Debug, Clone)]
@@ -150,56 +142,75 @@ pub struct StartRequest {
 }
 
 struct PreparedStartRequest {
+    launcher: Arc<dyn Launcher>,
     command: String,
     cwd: PathBuf,
     background: bool,
     timeout_ms: u64,
 }
 
+fn validate_policy(policy: &PolicyConfig) -> AppResult<()> {
+    if policy.bash.executable.trim().is_empty() {
+        return Err(AppError::details(
+            "INVALID_POLICY",
+            "policy.bash.executable must not be empty",
+            json!({}),
+        ));
+    }
+    if policy.bash.max_output_chars == 0 {
+        return Err(AppError::details(
+            "INVALID_POLICY",
+            "policy.bash.maxOutputChars must be greater than zero",
+            json!({"max_output_chars": policy.bash.max_output_chars}),
+        ));
+    }
+    if policy.bash.default_timeout_ms == 0 || policy.bash.max_timeout_ms == 0 {
+        return Err(AppError::details(
+            "INVALID_POLICY",
+            "policy.bash timeout values must be greater than zero",
+            json!({
+                "default_timeout_ms": policy.bash.default_timeout_ms,
+                "max_timeout_ms": policy.bash.max_timeout_ms
+            }),
+        ));
+    }
+    if policy.bash.default_timeout_ms > policy.bash.max_timeout_ms {
+        return Err(AppError::details(
+            "INVALID_POLICY",
+            "policy.bash.defaultTimeoutMs must be less than or equal to maxTimeoutMs",
+            json!({
+                "default_timeout_ms": policy.bash.default_timeout_ms,
+                "max_timeout_ms": policy.bash.max_timeout_ms
+            }),
+        ));
+    }
+    Ok(())
+}
+
 impl BashSupervisor {
-    pub fn new(_cache_root: PathBuf, policy: PolicyConfig) -> AppResult<Self> {
-        if policy.bash.executable.trim().is_empty() {
-            return Err(AppError::details(
-                "INVALID_POLICY",
-                "policy.bash.executable must not be empty",
-                json!({}),
-            ));
-        }
-        if policy.bash.max_output_chars == 0 {
-            return Err(AppError::details(
-                "INVALID_POLICY",
-                "policy.bash.maxOutputChars must be greater than zero",
-                json!({"max_output_chars": policy.bash.max_output_chars}),
-            ));
-        }
-        if policy.bash.default_timeout_ms == 0 || policy.bash.max_timeout_ms == 0 {
-            return Err(AppError::details(
-                "INVALID_POLICY",
-                "policy.bash timeout values must be greater than zero",
-                json!({
-                    "default_timeout_ms": policy.bash.default_timeout_ms,
-                    "max_timeout_ms": policy.bash.max_timeout_ms
-                }),
-            ));
-        }
-        if policy.bash.default_timeout_ms > policy.bash.max_timeout_ms {
-            return Err(AppError::details(
-                "INVALID_POLICY",
-                "policy.bash.defaultTimeoutMs must be less than or equal to maxTimeoutMs",
-                json!({
-                    "default_timeout_ms": policy.bash.default_timeout_ms,
-                    "max_timeout_ms": policy.bash.max_timeout_ms
-                }),
-            ));
-        }
+    pub fn new(policy: PolicyConfig) -> AppResult<Self> {
+        validate_policy(&policy)?;
         let readiness = resolve_bash(&policy);
-        Ok(Self {
-            runs: Arc::new(Mutex::new(HashMap::new())),
+        let launcher = readiness
+            .executable()
+            .filter(|_| readiness.is_ready())
+            .map(|executable| Arc::new(ShellLauncher::new(executable)) as Arc<dyn Launcher>);
+        Ok(Self::with_parts(policy, readiness, launcher))
+    }
+
+    fn with_parts(
+        policy: PolicyConfig,
+        readiness: BashReadiness,
+        launcher: Option<Arc<dyn Launcher>>,
+    ) -> Self {
+        Self {
+            runs: Arc::default(),
             next_run_sequence: Arc::new(AtomicU64::new(0)),
             run_permit: Arc::new(Semaphore::new(1)),
             policy,
             readiness,
-        })
+            launcher,
+        }
     }
 
     pub fn readiness(&self) -> BashReadiness {
@@ -207,86 +218,55 @@ impl BashSupervisor {
     }
 
     pub fn ensure_available(&self) -> AppResult<()> {
-        if self.readiness.is_ready() {
-            return Ok(());
-        }
-        Err(AppError::details(
-            "BASH_UNAVAILABLE",
-            self.readiness
-                .failure_reason
-                .clone()
-                .unwrap_or_else(|| "No usable Bash implementation found".to_owned()),
-            json!({"execution": self.readiness()}),
-        ))
+        self.launcher().map(|_| ())
+    }
+
+    fn launcher(&self) -> AppResult<Arc<dyn Launcher>> {
+        self.launcher.clone().ok_or_else(|| {
+            AppError::details(
+                "BASH_UNAVAILABLE",
+                self.readiness
+                    .failure_reason
+                    .clone()
+                    .unwrap_or_else(|| "No usable Bash implementation found".to_owned()),
+                json!({"execution": self.readiness()}),
+            )
+        })
     }
 
     pub fn running_count(&self) -> usize {
         self.runs
-            .lock()
-            .values()
-            .filter(|record| record.lock().ended_at.is_none())
+            .records()
+            .into_iter()
+            .filter(|record| !record.lock().status().is_terminal())
             .count()
     }
 
-    pub(crate) fn set_change_baseline(
-        &self,
-        run_id: &str,
-        generation: u64,
-        dirty_files: HashSet<String>,
-    ) {
-        if let Some(record) = self.runs.lock().get(run_id).cloned() {
-            let mut record = record.lock();
-            record.baseline_generation = Some(generation);
-            record.baseline_dirty = dirty_files;
+    /// Set the workspace stamp a run's change attribution starts from.
+    pub(crate) fn set_change_baseline(&self, run_id: &str, baseline: ChangeBaseline) {
+        if let Ok(record) = self.runs.get(run_id) {
+            record.lock().set_baseline(baseline);
         }
     }
 
-    pub(crate) fn observe_changes<F>(
+    /// What the workspace needs to attribute changes to a run. A run without a
+    /// baseline adopts `fallback`.
+    pub(crate) fn change_window(
         &self,
         run_id: &str,
-        current_generation: u64,
-        current_dirty: HashSet<String>,
-        terminal: bool,
-        calculate: F,
-    ) -> AppResult<(u64, u64, HashSet<String>)>
-    where
-        F: FnOnce(
-            u64,
-            &HashSet<String>,
-            Option<&DateTime<Utc>>,
-            &HashSet<String>,
-        ) -> HashSet<String>,
-    {
-        let record = self.runs.lock().get(run_id).cloned().ok_or_else(|| {
-            AppError::details(
-                "RUN_NOT_FOUND",
-                "Bash run not found",
-                json!({"run_id": run_id}),
-            )
-        })?;
-        let mut record = record.lock();
-        if record.baseline_generation.is_none() {
-            record.baseline_generation = Some(current_generation);
-            record.baseline_dirty = current_dirty.clone();
-        }
-        let start = record.baseline_generation.unwrap_or(current_generation);
-        if let Some((generation, paths)) = &record.frozen_changes {
-            return Ok((start, *generation, paths.clone()));
-        }
-        let changed = calculate(
-            start,
-            &record.baseline_dirty,
-            if terminal {
-                record.ended_at.as_ref()
-            } else {
-                None
-            },
-            &current_dirty,
-        );
-        if terminal {
-            record.frozen_changes = Some((current_generation, changed.clone()));
-        }
-        Ok((start, current_generation, changed))
+        fallback: ChangeBaseline,
+    ) -> AppResult<RunChangeWindow> {
+        Ok(self.runs.get(run_id)?.lock().change_window(fallback))
+    }
+
+    /// Fix a terminal run's changed paths; returns the frozen result, which is
+    /// the earlier one if the run was already frozen.
+    pub(crate) fn freeze_changes(
+        &self,
+        run_id: &str,
+        changes: FrozenChanges,
+    ) -> AppResult<FrozenChanges> {
+        Ok(self.runs.get(run_id)?.lock().freeze_changes(changes))
     }
 
     fn prepare_start_request(
@@ -294,7 +274,7 @@ impl BashSupervisor {
         root: &Path,
         request: StartRequest,
     ) -> AppResult<PreparedStartRequest> {
-        self.ensure_available()?;
+        let launcher = self.launcher()?;
         let command = request.command.trim().to_owned();
         if command.is_empty() {
             return Err(AppError::invalid("Bash command cannot be empty"));
@@ -322,6 +302,7 @@ impl BashSupervisor {
             ));
         }
         Ok(PreparedStartRequest {
+            launcher,
             command,
             cwd,
             background: request.background.unwrap_or(false),
@@ -366,6 +347,7 @@ impl BashSupervisor {
         immediate_permit: Option<OwnedSemaphorePermit>,
     ) -> AppResult<serde_json::Value> {
         let PreparedStartRequest {
+            launcher,
             command,
             cwd,
             background,
@@ -374,47 +356,27 @@ impl BashSupervisor {
         let queued = immediate_permit.is_none();
         let run_id = format!("run_{}", Uuid::new_v4().simple());
         let sequence = self.next_run_sequence.fetch_add(1, Ordering::Relaxed);
-        let record = Arc::new(Mutex::new(RunRecord {
-            run_id: run_id.clone(),
+        let record = Arc::new(Mutex::new(RunRecord::queued(
+            run_id.clone(),
             sequence,
-            status: "queued".to_owned(),
-            command: command.clone(),
-            cwd: cwd.clone(),
-            started_at: Utc::now(),
-            ended_at: None,
-            exit_code: None,
-            output: String::new(),
-            stdout: String::new(),
-            stderr: String::new(),
-            combined: String::new(),
-            output_truncated: false,
-            stdout_dropped_chars: 0,
-            stderr_dropped_chars: 0,
-            combined_dropped_chars: 0,
-            pid: None,
-            cancel_requested: false,
-            job: None,
-            baseline_generation: None,
-            baseline_dirty: HashSet::new(),
-            frozen_changes: None,
-        }));
-        self.runs.lock().insert(run_id.clone(), record.clone());
-        self.trim_runs();
-        let bash_executable = self
-            .readiness
-            .executable()
-            .expect("prepare_start_request guarantees a resolved executable");
-        let max_output = self.policy.bash.max_output_chars;
+            command.clone(),
+            cwd.clone(),
+            self.policy.bash.max_output_chars,
+        )));
+        self.runs
+            .insert(run_id.clone(), record.clone(), MAX_RETAINED_RUNS);
 
         // Execution always runs on a detached task, even for foreground calls.
         // If the client aborts the request, the command keeps running and owns
         // the permit until completion. Queued internal runs wait for that permit
         // inside their detached task, so they are immediately pollable without
-        // violating the single-slot execution order.
+        // violating the single-slot execution order. The guard is moved in
+        // before the task first runs, so even a never-polled task ends its run.
         let semaphore = self.run_permit.clone();
-        let execution_record = record.clone();
+        let guard = AbandonGuard(record);
         let mut handle = tokio::spawn(async move {
-            let permit = match immediate_permit {
+            let record = &guard.0;
+            let _run_permit = match immediate_permit {
                 Some(permit) => permit,
                 None => match semaphore.acquire_owned().await {
                     Ok(permit) => permit,
@@ -423,22 +385,19 @@ impl BashSupervisor {
                             "BASH_QUEUE_CLOSED",
                             "Bash execution queue is unavailable",
                         );
-                        finalize_run_error(&execution_record, &error);
+                        finalize_run_error(record, &error);
                         return Err(error);
                     }
                 },
             };
-            let _run_permit = permit;
             let request = ExecutionRequest {
-                bash_executable,
                 command,
                 cwd,
                 timeout_ms,
-                max_output,
             };
-            let result = execute(record, request).await;
+            let result = execute(record, launcher.as_ref(), request).await;
             if let Err(error) = &result {
-                finalize_run_error(&execution_record, error);
+                finalize_run_error(record, error);
             }
             result
         });
@@ -488,13 +447,10 @@ impl BashSupervisor {
             )),
             None => {
                 // Budget exceeded; command continues in the background.
-                eprintln!(
-                    "{}",
-                    json!({
-                        "event": "bash_foreground_auto_promoted",
-                        "run_id": run_id,
-                        "budget_ms": budget_ms
-                    })
+                tracing::info!(
+                    run_id = %run_id,
+                    budget_ms,
+                    "bash foreground run auto-promoted to background"
                 );
                 let mut view = self.status(&run_id)?;
                 view["detached"] = Value::Bool(true);
@@ -513,33 +469,30 @@ impl BashSupervisor {
     /// Summary of the currently active run, attached to RUN_BUSY so the model
     /// can poll or cancel instead of retrying blindly.
     fn active_run_view(&self) -> Option<serde_json::Value> {
-        let records = self.runs.lock().values().cloned().collect::<Vec<_>>();
-        records
+        self.runs
+            .records()
             .into_iter()
             .filter_map(|record| {
                 let record = record.lock();
-                if record.ended_at.is_some() {
-                    return None;
-                }
-                let priority = match record.status.as_str() {
-                    "running" | "cancelling" => 0,
-                    "queued" => 1,
-                    _ => 2,
+                let priority = match record.status() {
+                    RunStatus::Running | RunStatus::Cancelling => 0,
+                    RunStatus::Queued => 1,
+                    _ => return None,
                 };
-                let elapsed_ms = (Utc::now() - record.started_at).num_milliseconds().max(0);
+                let elapsed_ms = (Utc::now() - record.started_at()).num_milliseconds().max(0);
                 Some((
                     priority,
-                    record.sequence,
+                    record.sequence(),
                     json!({
-                        "run_id": record.run_id,
-                        "status": record.status,
-                        "command": record.command,
+                        "run_id": record.run_id(),
+                        "status": record.status(),
+                        "command": record.command(),
                         "elapsed_ms": elapsed_ms,
-                        "status_fetch": {"kind": "bash_status", "value": record.run_id}
+                        "status_fetch": {"kind": "bash_status", "value": record.run_id()}
                     }),
                 ))
             })
-            .min_by_key(|(priority, started_at, _)| (*priority, *started_at))
+            .min_by_key(|(priority, sequence, _)| (*priority, *sequence))
             .map(|(_, _, view)| view)
     }
 
@@ -552,15 +505,10 @@ impl BashSupervisor {
         run_id: &str,
         max_output: usize,
     ) -> AppResult<serde_json::Value> {
-        let record = self.runs.lock().get(run_id).cloned().ok_or_else(|| {
-            AppError::details(
-                "RUN_NOT_FOUND",
-                "Bash run not found",
-                json!({"run_id": run_id}),
-            )
-        })?;
+        let record = self.runs.get(run_id)?;
         let record = record.lock();
-        Ok(serde_json::to_value(view(&record, max_output))?)
+        let limit = max_output.min(self.policy.bash.max_output_chars);
+        Ok(serde_json::to_value(view(&record, limit))?)
     }
 
     pub fn output_stream(
@@ -571,167 +519,95 @@ impl BashSupervisor {
     ) -> AppResult<serde_json::Value> {
         let stream = OutputStream::parse(requested_stream)
             .map_err(|error| AppError::invalid(error.to_string()))?;
-        let record = self.runs.lock().get(run_id).cloned().ok_or_else(|| {
-            AppError::details(
-                "RUN_NOT_FOUND",
-                "Bash run not found",
-                json!({"run_id": run_id}),
-            )
-        })?;
+        let record = self.runs.get(run_id)?;
         let record = record.lock();
-        let full = match stream {
-            OutputStream::Stdout => &record.stdout,
-            OutputStream::Stderr => &record.stderr,
-            OutputStream::Combined => &record.combined,
-        };
-        let dropped_prefix_chars = match stream {
-            OutputStream::Stdout => record.stdout_dropped_chars,
-            OutputStream::Stderr => record.stderr_dropped_chars,
-            OutputStream::Combined => record.combined_dropped_chars,
-        };
-        let requested_offset = continuation_offset(continuation, run_id, stream)
-            .unwrap_or(0)
-            .min(full.len());
-        let offset = char_boundary(full, requested_offset);
-        let end = char_boundary(
-            full,
-            (offset + self.policy.bash.max_output_chars).min(full.len()),
-        );
-        let next = (end < full.len()).then(|| format!("bash:{run_id}:{}:{end}", stream.as_str()));
+        let buffer = record.output().stream(stream);
+        let dropped = buffer.dropped_chars();
+        let from = continuation_offset(continuation, run_id, stream).unwrap_or(dropped);
+        let page = buffer.page(from, self.policy.bash.max_output_chars);
         Ok(json!({
             "run_id": run_id,
-            "status": record.status,
-            "exit_code": record.exit_code,
+            "status": record.status(),
+            "exit_code": record.exit_code(),
             "stream": stream.as_str(),
-            "output": strip_ansi(&full[offset..end]),
-            "continuation": next,
-            "total_chars": dropped_prefix_chars + full.chars().count(),
-            "retained_chars": full.chars().count(),
-            "output_truncated": dropped_prefix_chars > 0,
+            "output": page.text,
+            "continuation": page.next.map(|offset| continuation_token(run_id, stream, offset)),
+            "total_chars": buffer.total_chars(),
+            "retained_chars": buffer.retained_chars(),
+            "output_truncated": dropped > 0,
             "retention_policy": "tail",
-            "dropped_prefix_chars": dropped_prefix_chars,
-            "retained_start_offset": dropped_prefix_chars,
+            "dropped_prefix_chars": dropped,
+            "retained_start_offset": dropped,
             "continuation_scope": "retained_buffer"
         }))
     }
 
+    /// Request cancellation. Never blocks: the process group gets a stop request
+    /// and a tracked escalation, and the execution task records the end.
     pub fn cancel(&self, run_id: &str) -> AppResult<serde_json::Value> {
-        let record = self.runs.lock().get(run_id).cloned().ok_or_else(|| {
-            AppError::details(
-                "RUN_NOT_FOUND",
-                "Bash run not found",
-                json!({"run_id": run_id}),
-            )
-        })?;
-        let (pid, job) = {
+        let record = self.runs.get(run_id)?;
+        let group = {
             let mut item = record.lock();
-            if item.ended_at.is_some() {
-                return Ok(serde_json::to_value(view(
-                    &item,
-                    self.policy.bash.max_output_chars,
-                ))?);
+            match item.request_cancel() {
+                CancelRequest::AlreadyTerminal => {
+                    return Ok(serde_json::to_value(view(
+                        &item,
+                        self.policy.bash.max_output_chars,
+                    ))?);
+                }
+                CancelRequest::Requested(group) => group,
             }
-            item.status = "cancelling".to_owned();
-            item.cancel_requested = true;
-            (item.pid, item.job.clone())
         };
-        if let Some(pid) = pid {
-            terminate_process_tree(pid, job.as_deref());
+        if let Some(group) = group {
+            group.terminate(TERMINATE_GRACE);
         }
-        Ok(json!({"run_id": run_id, "status": "cancelling"}))
+        Ok(json!({"run_id": run_id, "status": RunStatus::Cancelling}))
     }
 
+    /// The retained combined output, for `bash_log` fetches.
     pub fn read_output(&self, run_id: &str) -> AppResult<String> {
-        let record = self
-            .runs
-            .lock()
-            .get(run_id)
-            .cloned()
-            .ok_or_else(|| AppError::new("RUN_NOT_FOUND", "Bash run not found"))?;
+        let record = self.runs.get(run_id)?;
         let record = record.lock();
-        Ok(strip_ansi(&record.combined))
-    }
-
-    fn trim_runs(&self) {
-        let mut runs = self.runs.lock();
-        if runs.len() > MAX_RETAINED_RUNS {
-            let mut completed: Vec<_> = runs
-                .iter()
-                .filter_map(|(run_id, record)| {
-                    record.lock().ended_at.map(|ended| (run_id.clone(), ended))
-                })
-                .collect();
-            completed.sort_by_key(|(_, ended)| *ended);
-            let remove_count = runs.len().saturating_sub(MAX_RETAINED_RUNS);
-            for (run_id, _) in completed.into_iter().take(remove_count) {
-                runs.remove(&run_id);
-            }
-        }
+        Ok(record
+            .output()
+            .stream(OutputStream::Combined)
+            .retained()
+            .to_owned())
     }
 }
 
+/// The client view: retained combined output followed by supervisor notes,
+/// clamped to `max_output` characters (the head for a success, else the tail).
 fn view(record: &RunRecord, max_output: usize) -> BashRunView {
-    let failed = matches!(record.status.as_str(), "failed" | "timed_out" | "cancelled");
-    let output = if record.output.chars().count() > max_output {
-        if failed || record.ended_at.is_none() {
-            tail_chars(&record.output, max_output)
-        } else {
-            head_chars(&record.output, max_output)
+    let combined = record.output().stream(OutputStream::Combined);
+    let mut output = combined.retained().to_owned();
+    for note in record.notes() {
+        if !output.is_empty() {
+            output.push_str("\n\n");
         }
-    } else {
-        record.output.clone()
-    };
+        output.push_str(note);
+    }
+    let clamped =
+        clamp_chars(&output, max_output, record.status().keeps_output_tail()).map(str::to_owned);
+    let output_truncated = record.output().truncated() || clamped.is_some();
+    let run_id = record.run_id();
     BashRunView {
-        run_id: record.run_id.clone(),
-        status: record.status.clone(),
-        command: record.command.clone(),
-        cwd: record.cwd.to_string_lossy().into_owned(),
-        started_at: record.started_at,
-        ended_at: record.ended_at,
-        exit_code: record.exit_code,
-        output,
-        output_truncated: record.output_truncated || record.output.chars().count() > max_output,
+        run_id: run_id.to_owned(),
+        status: record.status(),
+        command: record.command().to_owned(),
+        cwd: record.cwd().to_string_lossy().into_owned(),
+        started_at: record.started_at(),
+        ended_at: record.ended_at(),
+        exit_code: record.exit_code(),
+        output: clamped.unwrap_or(output),
+        output_truncated,
         retention_policy: "tail",
-        dropped_prefix_chars: record.combined_dropped_chars,
-        retained_start_offset: record.combined_dropped_chars,
-        log_handle: format!("bash-log:{}", record.run_id),
-        status_fetch: json!({"kind": "bash_status", "value": record.run_id}),
-        pid: record.pid,
+        dropped_prefix_chars: combined.dropped_chars(),
+        retained_start_offset: combined.dropped_chars(),
+        log_handle: format!("bash-log:{run_id}"),
+        status_fetch: json!({"kind": "bash_status", "value": run_id}),
+        pid: record.pid(),
     }
-}
-
-fn continuation_offset(
-    continuation: Option<&str>,
-    run_id: &str,
-    stream: OutputStream,
-) -> Option<usize> {
-    let value = continuation?;
-    let prefix = format!("bash:{run_id}:{}:", stream.as_str());
-    if let Some(offset) = value.strip_prefix(&prefix) {
-        return offset.parse::<usize>().ok();
-    }
-    if stream == OutputStream::Combined {
-        return value
-            .strip_prefix(&format!("bash:{run_id}:"))
-            .and_then(|offset| offset.parse::<usize>().ok());
-    }
-    None
-}
-
-fn head_chars(value: &str, limit: usize) -> String {
-    value.chars().take(limit).collect()
-}
-
-fn tail_chars(value: &str, limit: usize) -> String {
-    let count = value.chars().count();
-    value.chars().skip(count.saturating_sub(limit)).collect()
-}
-
-fn char_boundary(value: &str, mut index: usize) -> usize {
-    while index > 0 && !value.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 #[cfg(test)]

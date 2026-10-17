@@ -1,7 +1,5 @@
 //! JSON-RPC over a language server's stdio, framed with `Content-Length`.
-use crate::process_runtime::terminate_process_tree;
-#[cfg(windows)]
-use crate::process_runtime::WindowsJob;
+use crate::process_runtime::ProcessTree;
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -76,9 +74,7 @@ pub(super) struct StdioRpcTransport {
     events: Receiver<ReaderEvent>,
     stderr: Arc<Mutex<VecDeque<u8>>>,
     threads: Vec<JoinHandle<()>>,
-    pid: u32,
-    #[cfg(windows)]
-    job: Option<Arc<WindowsJob>>,
+    tree: ProcessTree,
 }
 
 impl StdioRpcTransport {
@@ -90,9 +86,7 @@ impl StdioRpcTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        let pid = child.id();
-        #[cfg(windows)]
-        let job = WindowsJob::assign(pid).ok();
+        let tree = ProcessTree::attach(child.id());
         let missing = |stream: &str| io::Error::other(format!("JSON-RPC {stream} unavailable"));
         let stdin = child.stdin.take().ok_or_else(|| missing("stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| missing("stdout"))?;
@@ -123,9 +117,7 @@ impl StdioRpcTransport {
             events,
             stderr: stderr_tail,
             threads,
-            pid,
-            #[cfg(windows)]
-            job,
+            tree,
         })
     }
 }
@@ -240,16 +232,7 @@ impl RpcTransport for StdioRpcTransport {
 
 impl Drop for StdioRpcTransport {
     fn drop(&mut self) {
-        terminate_process_tree(self.pid, {
-            #[cfg(windows)]
-            {
-                self.job.as_deref()
-            }
-            #[cfg(not(windows))]
-            {
-                None
-            }
-        });
+        self.tree.terminate();
         let _ = self.child.wait();
         // The pipes close once the process tree is gone. A grandchild that
         // escaped the tree could keep them open, so never block on it.

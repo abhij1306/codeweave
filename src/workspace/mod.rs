@@ -154,7 +154,7 @@ impl Workspace {
             .map_err(AppError::internal)?;
         let watcher_ms = watcher_started.elapsed().as_millis();
         let runtime_started = Instant::now();
-        let bash = BashSupervisor::new(workspace_cache, policy.clone())?;
+        let bash = BashSupervisor::new(policy.clone())?;
         let runtime_ms = runtime_started.elapsed().as_millis();
         let open_diagnostics = json!({
             "cache_hit": index_cache_hit,

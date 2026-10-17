@@ -1,5 +1,5 @@
 use crate::model::{AppError, AppResult};
-use crate::process_runtime::{terminate_process_tree, WindowsJob};
+use crate::process_runtime::ProcessTree;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashSet;
@@ -231,11 +231,7 @@ fn checked_output(output: Output, args: &[String], max_chars: usize) -> AppResul
 }
 
 fn wait_for_output(mut child: Child, args: &[String], timeout: Duration) -> AppResult<Output> {
-    let pid = child.id();
-    #[cfg(windows)]
-    let job = WindowsJob::assign(pid).ok();
-    #[cfg(not(windows))]
-    let job: Option<std::sync::Arc<WindowsJob>> = None;
+    let tree = ProcessTree::attach(child.id());
     let mut stdout = child
         .stdout
         .take()
@@ -260,7 +256,7 @@ fn wait_for_output(mut child: Child, args: &[String], timeout: Duration) -> AppR
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
-                terminate_process_tree(pid, job.as_deref());
+                tree.terminate();
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
@@ -271,7 +267,7 @@ fn wait_for_output(mut child: Child, args: &[String], timeout: Duration) -> AppR
                 ));
             }
             Err(error) => {
-                terminate_process_tree(pid, job.as_deref());
+                tree.terminate();
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
