@@ -29,6 +29,16 @@ may be promoted to background after its response budget, without changing the
 run or starting a duplicate process. At most 128 completed runs are retained;
 active runs are never evicted.
 
+Git access goes through one trait, `RepositoryBackend` (`src/repository`). Its
+adapter over the `git` executable is split into a process runner (bounded by a
+timeout that stops the process tree, prompts disabled), a porcelain status
+parser, and a diff parser that returns structured hunks. The runner classifies
+every failed invocation once into a typed error (unavailable, timed out, not a
+repository, failed) instead of callers reading Git's stderr. The workspace keeps
+the `git_diff` scope policy: it resolves a symbol focus to a line range through
+the index, asks the diff for the hunks matching the scope, and pages them with
+snapshot-bound continuations.
+
 ## Public contract
 
 The MCP surface is fixed at 25 tools: workspace, retrieval and intelligence;

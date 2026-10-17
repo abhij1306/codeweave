@@ -1,163 +1,76 @@
+//! [`RepositoryBackend`] over the `git` executable.
+
+use super::diff::Diff;
+use super::porcelain::{normalized_path, parse_porcelain_v2};
+use super::runner::{run_git, truncate_output, GitFailure, GIT_DEFAULT_TIMEOUT, GIT_PUSH_TIMEOUT};
+use super::{RepoStatus, RepositoryBackend};
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::process_runtime::ProcessTree;
-use serde::Serialize;
 use serde_json::json;
-use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
-
-/// Default wall-clock bound for every git invocation. Without it a hung
-/// credential prompt, a stuck lock, or an unresponsive remote wedges the
-/// workspace actor indefinitely. Push reaches the network and keeps the
-/// longer [`GIT_PUSH_TIMEOUT`].
-const GIT_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const GIT_PUSH_TIMEOUT: Duration = Duration::from_secs(120);
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct RepoStatus {
-    pub is_git: bool,
-    pub head: String,
-    pub branch: String,
-    pub dirty_files: Vec<String>,
-    pub staged_files: Vec<String>,
-    pub unstaged_files: Vec<String>,
-    pub untracked_files: Vec<String>,
-    pub partially_staged_files: Vec<String>,
-}
-
-pub trait RepositoryBackend: Send + Sync {
-    fn status(&self, root: &Path) -> AppResult<RepoStatus>;
-    fn diff(
-        &self,
-        root: &Path,
-        staged: bool,
-        paths: &[String],
-        max_chars: usize,
-    ) -> AppResult<String>;
-    fn log(&self, root: &Path, limit: usize) -> AppResult<String>;
-    fn show(&self, root: &Path, reference: &str, max_chars: usize) -> AppResult<String>;
-    fn blame(
-        &self,
-        root: &Path,
-        path: &str,
-        start: Option<usize>,
-        end: Option<usize>,
-        max_chars: usize,
-    ) -> AppResult<String>;
-    fn stage(&self, root: &Path, paths: &[String]) -> AppResult<String>;
-    fn commit(&self, root: &Path, message: &str) -> AppResult<String>;
-    fn restore(&self, root: &Path, paths: &[String], staged: bool) -> AppResult<String>;
-    fn push(&self, root: &Path, remote: &str, branch: &str) -> AppResult<String>;
-}
+use std::time::Duration;
 
 #[derive(Debug, Default)]
 pub struct CliGitBackend;
 
 impl CliGitBackend {
+    /// Require `root` to be inside a Git worktree: `GIT_UNAVAILABLE` when the
+    /// executable cannot start, `NOT_GIT_REPOSITORY` otherwise.
     pub fn require_worktree(root: &Path) -> AppResult<()> {
         Self::require_worktree_with(root, "git")
     }
 
     fn require_worktree_with(root: &Path, executable: &str) -> AppResult<()> {
-        let args = vec!["rev-parse".to_owned(), "--is-inside-work-tree".to_owned()];
-        let output = Self
-            .run_raw_with_timeout(root, &args, GIT_DEFAULT_TIMEOUT, executable)
-            .map_err(|error| {
-                if error.code() == ErrorCode::GitUnavailable {
-                    AppError::with_details(
-                        ErrorCode::GitUnavailable,
-                        error.message(),
-                        json!({"command": "git rev-parse --is-inside-work-tree"}),
-                    )
-                } else {
-                    error
-                }
-            })?;
-        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true" {
-            Ok(())
-        } else {
-            Err(AppError::with_details(
+        let args = ["rev-parse".to_owned(), "--is-inside-work-tree".to_owned()];
+        let not_repository = |stderr: &str| {
+            AppError::with_details(
                 ErrorCode::NotGitRepository,
                 "workspace.path must be a Git worktree",
-                json!({
-                    "path": root,
-                    "stderr": String::from_utf8_lossy(&output.stderr).trim()
-                }),
-            ))
+                json!({"path": root, "stderr": stderr}),
+            )
+        };
+        match run_git(root, &args, GIT_DEFAULT_TIMEOUT, executable) {
+            Ok(stdout) if String::from_utf8_lossy(&stdout).trim() == "true" => Ok(()),
+            Ok(_) => Err(not_repository("")),
+            Err(error) => match error.failure {
+                GitFailure::Unavailable { message } => Err(AppError::with_details(
+                    ErrorCode::GitUnavailable,
+                    message,
+                    json!({"command": "git rev-parse --is-inside-work-tree"}),
+                )),
+                GitFailure::NotRepository { stderr } | GitFailure::Failed { stderr, .. } => {
+                    Err(not_repository(&stderr))
+                }
+                failure => Err(super::runner::GitError {
+                    args: args.to_vec(),
+                    failure,
+                }
+                .into()),
+            },
         }
     }
 
-    /// Build a git command with stdio piped, credential prompts disabled, and
-    /// interactive askpass suppressed so a missing/expired credential fails fast
-    /// instead of blocking on a hidden prompt until the timeout fires.
-    fn command(root: &Path, args: &[String], executable: &str) -> Command {
-        let mut command = Command::new(executable);
-        command
-            .current_dir(root)
-            .arg("--no-pager")
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Fail closed on any credential/prompt path rather than hang:
-            // - GIT_TERMINAL_PROMPT=0 turns terminal prompts into errors.
-            // - GIT_ASKPASS=echo makes the graphical/askpass path return
-            //   immediately (empty), so no dialog can wedge the actor.
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_ASKPASS", "echo");
-        #[cfg(unix)]
-        command.process_group(0);
-        command
-    }
-
-    /// Run a git command under a timeout, returning raw `Output`. Every
-    /// invocation is bounded so no git call can wedge the workspace actor.
-    fn run_raw_with_timeout(
-        &self,
-        root: &Path,
-        args: &[String],
-        timeout: Duration,
-        executable: &str,
-    ) -> AppResult<Output> {
-        let child = Self::command(root, args, executable)
-            .spawn()
-            .map_err(|error| {
-                AppError::with_details(
-                    ErrorCode::GitUnavailable,
-                    error.to_string(),
-                    json!({"args": args}),
-                )
-            })?;
-        wait_for_output(child, args, timeout)
-    }
-
-    fn run_raw(&self, root: &Path, args: &[String]) -> AppResult<Output> {
-        self.run_raw_with_timeout(root, args, GIT_DEFAULT_TIMEOUT, "git")
-    }
-
-    fn run(&self, root: &Path, args: &[String], max_chars: usize) -> AppResult<String> {
-        let output = self.run_raw(root, args)?;
-        checked_output(output, args, max_chars)
+    fn run(root: &Path, args: &[String], max_chars: usize) -> AppResult<String> {
+        Self::run_with_timeout(root, args, max_chars, GIT_DEFAULT_TIMEOUT)
     }
 
     fn run_with_timeout(
-        &self,
         root: &Path,
         args: &[String],
         max_chars: usize,
         timeout: Duration,
     ) -> AppResult<String> {
-        let output = self.run_raw_with_timeout(root, args, timeout, "git")?;
-        checked_output(output, args, max_chars)
+        let stdout = run_git(root, args, timeout, "git")?;
+        Ok(truncate_output(
+            String::from_utf8_lossy(&stdout).into_owned(),
+            max_chars,
+        ))
     }
 
-    fn untracked_diff(&self, root: &Path, paths: &[String], max_chars: usize) -> AppResult<String> {
+    /// New-file patches, each with one hunk, for the untracked files among
+    /// `paths`. Symlinks are shown by target and never followed.
+    fn untracked_diff(root: &Path, paths: &[String], max_chars: usize) -> AppResult<String> {
         let mut args = vec![
             "ls-files".to_owned(),
             "--others".to_owned(),
@@ -166,7 +79,7 @@ impl CliGitBackend {
             "--".to_owned(),
         ];
         args.extend(paths.iter().filter_map(|path| normalized_path(path)));
-        let untracked = self.run(root, &args, usize::MAX)?;
+        let untracked = Self::run(root, &args, usize::MAX)?;
         let mut diff = String::new();
         for path in untracked.split('\0').filter(|path| !path.is_empty()) {
             let Some(normalized) = normalized_path(path) else {
@@ -199,6 +112,17 @@ impl CliGitBackend {
             };
             let (content, content_truncated) = content;
             diff.push_str(&header);
+            match content.lines().count() {
+                0 => {}
+                1 => diff.push_str(
+                    "@@ -0,0 +1 @@
+",
+                ),
+                lines => diff.push_str(&format!(
+                    "@@ -0,0 +1,{lines} @@
+"
+                )),
+            }
             for line in content.lines() {
                 diff.push('+');
                 diff.push_str(line);
@@ -216,84 +140,6 @@ impl CliGitBackend {
         }
         Ok(diff)
     }
-}
-
-fn checked_output(output: Output, args: &[String], max_chars: usize) -> AppResult<String> {
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() {
-        return Err(AppError::with_details(
-            ErrorCode::GitFailed,
-            stderr.trim().to_owned(),
-            json!({"args": args, "exit_code": output.status.code()}),
-        ));
-    }
-    if !stderr.trim().is_empty() {
-        eprintln!("git warning for {:?}: {}", args, stderr.trim());
-    }
-    Ok(truncate_output(text, max_chars))
-}
-
-fn wait_for_output(mut child: Child, args: &[String], timeout: Duration) -> AppResult<Output> {
-    let tree = ProcessTree::attach(child.id());
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::internal("git stdout was not piped"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::internal("git stderr was not piped"))?;
-    let stdout_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout.read_to_end(&mut output).map(|_| output)
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stderr.read_to_end(&mut output).map(|_| output)
-    });
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < timeout => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                tree.terminate();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(AppError::with_details(
-                    ErrorCode::GitTimeout,
-                    "Git operation timed out",
-                    json!({"args": args, "timeout_ms": timeout.as_millis() as u64}),
-                ));
-            }
-            Err(error) => {
-                tree.terminate();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(AppError::with_details(
-                    ErrorCode::GitFailed,
-                    error.to_string(),
-                    json!({"args": args}),
-                ));
-            }
-        }
-    };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| AppError::internal("git stdout reader panicked"))??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| AppError::internal("git stderr reader panicked"))??;
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
 }
 
 fn string_prefix(text: &str, max_bytes: usize) -> (String, bool) {
@@ -325,134 +171,6 @@ fn read_utf8_prefix(path: &Path, max_bytes: usize) -> Option<(String, bool)> {
     Some((String::from_utf8(bytes).ok()?, truncated))
 }
 
-fn truncate_output(mut text: String, max_chars: usize) -> String {
-    const MARKER: &str = "\n… output truncated …";
-    if text.len() <= max_chars {
-        return text;
-    }
-
-    let marker = if MARKER.len() <= max_chars {
-        MARKER
-    } else {
-        ""
-    };
-    let mut end = max_chars.saturating_sub(marker.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text.push_str(marker);
-    text
-}
-
-fn normalized_path(path: &str) -> Option<String> {
-    let path = crate::security::normalize_path_text(path);
-    (!path.is_empty()).then(|| path.into_owned())
-}
-
-fn porcelain_path(record: &str, field_count: usize) -> Option<String> {
-    record
-        .splitn(field_count, ' ')
-        .nth(field_count - 1)
-        .and_then(normalized_path)
-}
-
-fn parse_porcelain_v2(raw: &str) -> RepoStatus {
-    let records: Vec<_> = raw
-        .split('\0')
-        .filter(|record| !record.is_empty())
-        .collect();
-    let mut status = RepoStatus {
-        is_git: true,
-        ..RepoStatus::default()
-    };
-    let mut dirty = HashSet::new();
-    let mut staged: HashSet<String> = HashSet::new();
-    let mut unstaged: HashSet<String> = HashSet::new();
-    let mut untracked: HashSet<String> = HashSet::new();
-    let mut index = 0usize;
-
-    while index < records.len() {
-        let record = records[index];
-        if let Some(oid) = record.strip_prefix("# branch.oid ") {
-            if oid != "(initial)" {
-                status.head = oid.to_owned();
-            }
-        } else if let Some(branch) = record.strip_prefix("# branch.head ") {
-            if branch != "(detached)" {
-                status.branch = branch.to_owned();
-            }
-        } else {
-            match record.as_bytes().first().copied() {
-                Some(b'1') => {
-                    // "1 XY sub mH mI mW hH hI path"; '.' = unmodified in that dimension
-                    if let Some(path) = porcelain_path(record, 9) {
-                        dirty.insert(path.clone());
-                        let x = record.chars().nth(2).unwrap_or('.');
-                        let y = record.chars().nth(3).unwrap_or('.');
-                        if x != '.' {
-                            staged.insert(path.clone());
-                        }
-                        if y != '.' {
-                            unstaged.insert(path);
-                        }
-                    }
-                }
-                Some(b'2') => {
-                    // "2 XY sub mH mI mW hH hI X score path"
-                    if let Some(path) = porcelain_path(record, 10) {
-                        dirty.insert(path.clone());
-                        let x = record.chars().nth(2).unwrap_or('.');
-                        let y = record.chars().nth(3).unwrap_or('.');
-                        if x != '.' {
-                            staged.insert(path.clone());
-                        }
-                        if y != '.' {
-                            unstaged.insert(path);
-                        }
-                    }
-                    if let Some(original) = records
-                        .get(index + 1)
-                        .and_then(|path| normalized_path(path))
-                    {
-                        dirty.insert(original);
-                        index += 1;
-                    }
-                }
-                Some(b'u') => {
-                    // Unmerged: always in both staged and unstaged
-                    if let Some(path) = porcelain_path(record, 11) {
-                        dirty.insert(path.clone());
-                        staged.insert(path.clone());
-                        unstaged.insert(path);
-                    }
-                }
-                Some(b'?') => {
-                    if let Some(path) = record.strip_prefix("? ").and_then(normalized_path) {
-                        dirty.insert(path.clone());
-                        untracked.insert(path);
-                    }
-                }
-                _ => {}
-            }
-        }
-        index += 1;
-    }
-
-    let partially_staged: HashSet<String> = staged.intersection(&unstaged).cloned().collect();
-    status.dirty_files = dirty.into_iter().collect();
-    status.dirty_files.sort();
-    status.staged_files = staged.into_iter().collect();
-    status.staged_files.sort();
-    status.unstaged_files = unstaged.into_iter().collect();
-    status.unstaged_files.sort();
-    status.untracked_files = untracked.into_iter().collect();
-    status.untracked_files.sort();
-    status.partially_staged_files = partially_staged.into_iter().collect();
-    status.partially_staged_files.sort();
-    status
-}
-
 impl RepositoryBackend for CliGitBackend {
     fn status(&self, root: &Path) -> AppResult<RepoStatus> {
         let args = [
@@ -461,24 +179,15 @@ impl RepositoryBackend for CliGitBackend {
             "-z",
             "--branch",
             "--untracked-files=all",
-        ];
-        let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
-        let output = self.run_raw(root, &args)?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
-            if stderr.contains("not a git repository") {
-                return Ok(RepoStatus::default());
+        ]
+        .map(str::to_owned);
+        match run_git(root, &args, GIT_DEFAULT_TIMEOUT, "git") {
+            Ok(stdout) => Ok(parse_porcelain_v2(&String::from_utf8_lossy(&stdout))),
+            Err(error) if matches!(error.failure, GitFailure::NotRepository { .. }) => {
+                Ok(RepoStatus::default())
             }
-            return Err(AppError::with_details(
-                ErrorCode::GitFailed,
-                stderr.trim().to_owned(),
-                json!({"args": args, "exit_code": output.status.code()}),
-            ));
+            Err(error) => Err(error.into()),
         }
-        if !stderr.trim().is_empty() {
-            eprintln!("git warning for {:?}: {}", args, stderr.trim());
-        }
-        Ok(parse_porcelain_v2(&String::from_utf8_lossy(&output.stdout)))
     }
 
     fn diff(
@@ -487,7 +196,7 @@ impl RepositoryBackend for CliGitBackend {
         staged: bool,
         paths: &[String],
         max_chars: usize,
-    ) -> AppResult<String> {
+    ) -> AppResult<Diff> {
         let mut args = vec![
             "diff".to_owned(),
             "--no-ext-diff".to_owned(),
@@ -500,19 +209,20 @@ impl RepositoryBackend for CliGitBackend {
             args.push("--".to_owned());
             args.extend(paths.iter().cloned());
         }
-        let mut diff = self.run(root, &args, max_chars)?;
+        let mut diff = Self::run(root, &args, max_chars)?;
         if staged || paths.is_empty() || diff.len() >= max_chars {
-            return Ok(diff);
+            return Ok(Diff::parse(diff));
         }
-        let untracked = self.untracked_diff(root, paths, max_chars - diff.len())?;
+        let untracked = Self::untracked_diff(root, paths, max_chars - diff.len())?;
         if !diff.is_empty() && !untracked.is_empty() && !diff.ends_with('\n') {
             diff.push('\n');
         }
         diff.push_str(&untracked);
-        Ok(truncate_output(diff, max_chars))
+        Ok(Diff::parse(truncate_output(diff, max_chars)))
     }
+
     fn log(&self, root: &Path, limit: usize) -> AppResult<String> {
-        self.run(
+        Self::run(
             root,
             &[
                 "log".into(),
@@ -523,8 +233,9 @@ impl RepositoryBackend for CliGitBackend {
             100_000,
         )
     }
+
     fn show(&self, root: &Path, reference: &str, max_chars: usize) -> AppResult<String> {
-        self.run(
+        Self::run(
             root,
             &[
                 "show".into(),
@@ -535,6 +246,7 @@ impl RepositoryBackend for CliGitBackend {
             max_chars,
         )
     }
+
     fn blame(
         &self,
         root: &Path,
@@ -549,27 +261,30 @@ impl RepositoryBackend for CliGitBackend {
         }
         args.push("--".to_owned());
         args.push(path.to_owned());
-        self.run(root, &args, max_chars)
+        Self::run(root, &args, max_chars)
     }
+
     fn stage(&self, root: &Path, paths: &[String]) -> AppResult<String> {
         if paths.is_empty() {
             return Err(AppError::invalid("git stage requires paths"));
         }
         let mut args = vec!["add".to_owned(), "--".to_owned()];
         args.extend(paths.iter().cloned());
-        self.run(root, &args, 20_000)?;
+        Self::run(root, &args, 20_000)?;
         Ok(format!("Staged {} path(s)", paths.len()))
     }
+
     fn commit(&self, root: &Path, message: &str) -> AppResult<String> {
         if message.trim().is_empty() {
             return Err(AppError::invalid("git commit requires message"));
         }
-        self.run(
+        Self::run(
             root,
             &["commit".into(), "-m".into(), message.into()],
             50_000,
         )
     }
+
     fn restore(&self, root: &Path, paths: &[String], staged: bool) -> AppResult<String> {
         if paths.is_empty() {
             return Err(AppError::invalid("git restore requires paths"));
@@ -580,15 +295,16 @@ impl RepositoryBackend for CliGitBackend {
         }
         args.push("--".to_owned());
         args.extend(paths.iter().cloned());
-        self.run(root, &args, 20_000)?;
+        Self::run(root, &args, 20_000)?;
         Ok(format!("Restored {} path(s)", paths.len()))
     }
+
     fn push(&self, root: &Path, remote: &str, branch: &str) -> AppResult<String> {
         let mut args = vec!["push".to_owned(), remote.to_owned()];
         if !branch.is_empty() {
             args.push(branch.to_owned());
         }
-        self.run_with_timeout(root, &args, 20_000, GIT_PUSH_TIMEOUT)
+        Self::run_with_timeout(root, &args, 20_000, GIT_PUSH_TIMEOUT)
     }
 }
 
@@ -596,6 +312,11 @@ impl RepositoryBackend for CliGitBackend {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn git(root: &Path, args: &[&str]) {
+        let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        CliGitBackend::run(root, &args, 20_000).unwrap();
+    }
 
     #[test]
     fn startup_distinguishes_missing_git_from_non_repository() {
@@ -607,125 +328,53 @@ mod tests {
 
         let not_repository = CliGitBackend::require_worktree(root.path()).unwrap_err();
         assert_eq!(not_repository.code(), ErrorCode::NotGitRepository);
+
+        git(root.path(), &["init", "-q"]);
+        CliGitBackend::require_worktree(root.path()).unwrap();
     }
 
     #[test]
-    fn timed_process_is_terminated_and_reported() {
-        let mut command = if cfg!(windows) {
-            let mut command = Command::new("powershell.exe");
-            command.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep 5"]);
-            command
-        } else {
-            let mut command = Command::new("sh");
-            command.args(["-c", "sleep 5"]);
-            command
-        };
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        #[cfg(unix)]
-        command.process_group(0);
-        let child = command.spawn().unwrap();
+    fn status_outside_a_repository_is_an_empty_non_git_status() {
+        let root = tempdir().unwrap();
 
-        let error = wait_for_output(
-            child,
-            &["test-timeout".to_owned()],
-            Duration::from_millis(50),
-        )
-        .unwrap_err();
+        let status = CliGitBackend.status(root.path()).unwrap();
 
-        assert_eq!(error.code(), ErrorCode::GitTimeout);
-    }
-
-    #[test]
-    fn parses_porcelain_v2_branch_and_dirty_paths() {
-        let raw = concat!(
-            "# branch.oid abc123\0",
-            "# branch.head feature/status\0",
-            "1 .M N... 100644 100644 100644 aaa bbb src/changed file.rs\0",
-            "2 R. N... 100644 100644 100644 aaa bbb R100 src/new name.rs\0",
-            "src/old name.rs\0",
-            "u UU N... 100644 100644 100644 100644 aaa bbb ccc src/conflict.rs\0",
-            "? src/untracked file.rs\0",
-        );
-
-        let status = parse_porcelain_v2(raw);
-
-        assert!(status.is_git);
-        assert_eq!(status.head, "abc123");
-        assert_eq!(status.branch, "feature/status");
-        assert_eq!(
-            status.dirty_files,
-            vec![
-                "src/changed file.rs",
-                "src/conflict.rs",
-                "src/new name.rs",
-                "src/old name.rs",
-                "src/untracked file.rs",
-            ]
-        );
-        assert_eq!(
-            status.staged_files,
-            vec!["src/conflict.rs", "src/new name.rs"]
-        );
-        assert_eq!(
-            status.unstaged_files,
-            vec!["src/changed file.rs", "src/conflict.rs"]
-        );
-        assert_eq!(status.untracked_files, vec!["src/untracked file.rs"]);
-        assert_eq!(status.partially_staged_files, vec!["src/conflict.rs"]);
-    }
-
-    #[test]
-    fn parses_unborn_detached_status_without_fake_values() {
-        let status =
-            parse_porcelain_v2("# branch.oid (initial)\0# branch.head (detached)\0? new.rs\0");
-
-        assert!(status.is_git);
-        assert!(status.head.is_empty());
-        assert!(status.branch.is_empty());
-        assert_eq!(status.dirty_files, vec!["new.rs"]);
-        assert!(status.staged_files.is_empty());
-        assert!(status.unstaged_files.is_empty());
-        assert_eq!(status.untracked_files, vec!["new.rs"]);
-        assert!(status.partially_staged_files.is_empty());
+        assert_eq!(status, RepoStatus::default());
+        assert!(!status.is_git);
     }
 
     #[test]
     fn diff_returns_synthetic_patch_for_untracked_scoped_file() {
         let root = tempdir().unwrap();
-        let backend = CliGitBackend;
-        backend
-            .run(root.path(), &["init".to_owned()], 20_000)
-            .unwrap();
+        git(root.path(), &["init", "-q"]);
         fs::write(root.path().join("new.py"), "print('hello')\n").unwrap();
 
-        let diff = backend
+        let diff = CliGitBackend
             .diff(root.path(), false, &["new.py".to_owned()], 20_000)
             .unwrap();
 
-        assert!(diff.contains("new file mode 100644"));
-        assert!(diff.contains("+++ b/new.py"));
-        assert!(diff.contains("+print('hello')"));
+        assert!(diff.text.contains("new file mode 100644"));
+        assert!(diff.text.contains("+++ b/new.py"));
+        assert!(diff.text.contains(
+            "@@ -0,0 +1 @@
++print('hello')
+"
+        ));
+        assert_eq!(diff.hunks.len(), 1);
+        assert_eq!(diff.hunks[0].path, "new.py");
+        assert!(diff.hunks[0].overlaps(1, 1));
     }
 
     #[test]
     fn diff_combines_tracked_and_untracked_scoped_files() {
         let root = tempdir().unwrap();
-        let backend = CliGitBackend;
-        backend
-            .run(root.path(), &["init".to_owned()], 20_000)
-            .unwrap();
+        git(root.path(), &["init", "-q"]);
         fs::write(root.path().join("tracked.py"), "print('before')\n").unwrap();
-        backend
-            .run(
-                root.path(),
-                &["add".to_owned(), "--".to_owned(), "tracked.py".to_owned()],
-                20_000,
-            )
-            .unwrap();
+        git(root.path(), &["add", "--", "tracked.py"]);
         fs::write(root.path().join("tracked.py"), "print('after')\n").unwrap();
         fs::write(root.path().join("new.py"), "print('new')\n").unwrap();
 
-        let diff = backend
+        let diff = CliGitBackend
             .diff(
                 root.path(),
                 false,
@@ -734,26 +383,29 @@ mod tests {
             )
             .unwrap();
 
-        assert!(diff.contains("+++ b/tracked.py"));
-        assert!(diff.contains("+++ b/new.py"));
-        assert!(diff.contains("+print('new')"));
+        assert!(diff.text.contains("+++ b/tracked.py"));
+        assert!(diff.text.contains("+++ b/new.py"));
+        assert!(diff.text.contains("+print('new')"));
+        let hunk_paths = diff
+            .hunks
+            .iter()
+            .map(|hunk| hunk.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(hunk_paths, ["tracked.py", "new.py"]);
     }
 
     #[test]
     fn untracked_diff_reads_and_returns_only_the_bounded_prefix() {
         let root = tempdir().unwrap();
-        let backend = CliGitBackend;
-        backend
-            .run(root.path(), &["init".to_owned()], 20_000)
-            .unwrap();
+        git(root.path(), &["init", "-q"]);
         fs::write(root.path().join("large.txt"), "x".repeat(10_000)).unwrap();
 
-        let diff = backend
+        let diff = CliGitBackend
             .diff(root.path(), false, &["large.txt".to_owned()], 200)
             .unwrap();
 
-        assert!(diff.len() <= 200);
-        assert!(diff.ends_with("… output truncated …"));
+        assert!(diff.text.len() <= 200);
+        assert!(diff.text.ends_with("… output truncated …"));
     }
 
     #[cfg(unix)]
@@ -763,20 +415,19 @@ mod tests {
 
         let root = tempdir().unwrap();
         let outside = tempdir().unwrap();
-        let backend = CliGitBackend;
-        backend
-            .run(root.path(), &["init".to_owned()], 20_000)
-            .unwrap();
+        git(root.path(), &["init", "-q"]);
         let secret = outside.path().join("secret.txt");
         fs::write(&secret, "outside secret").unwrap();
         symlink(&secret, root.path().join("linked.txt")).unwrap();
 
-        let diff = backend
+        let diff = CliGitBackend
             .diff(root.path(), false, &["linked.txt".to_owned()], 20_000)
             .unwrap();
 
-        assert!(diff.contains("new file mode 120000"));
-        assert!(diff.contains(&secret.to_string_lossy().replace('\\', "/")));
-        assert!(!diff.contains("outside secret"));
+        assert!(diff.text.contains("new file mode 120000"));
+        assert!(diff
+            .text
+            .contains(&secret.to_string_lossy().replace('\\', "/")));
+        assert!(!diff.text.contains("outside secret"));
     }
 }

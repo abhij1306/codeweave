@@ -1,7 +1,6 @@
 use super::state::MutationPermit;
 use super::{add_phase_metrics, Workspace};
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::index::content_hash;
 use crate::requests::git::{GitAction, GitDiffRequest, GitPushRequest};
 use crate::security::validate_relative;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -55,91 +54,6 @@ fn decode_git_diff_continuation(value: &str) -> AppResult<GitDiffContinuation> {
     let continuation: GitDiffContinuation = serde_json::from_slice(&bytes)
         .map_err(|_| AppError::invalid("Invalid git diff continuation"))?;
     Ok(continuation)
-}
-
-#[derive(Clone)]
-struct DiffHunk {
-    id: String,
-    path: String,
-    old_start: usize,
-    old_count: usize,
-    new_start: usize,
-    new_count: usize,
-    text: String,
-}
-
-fn parse_hunk_range(value: &str) -> (usize, usize) {
-    let value = value.trim_start_matches(['-', '+']);
-    let (start, count) = value.split_once(',').unwrap_or((value, "1"));
-    (start.parse().unwrap_or(0), count.parse().unwrap_or(1))
-}
-
-fn parse_diff_hunks(diff: &str) -> Vec<DiffHunk> {
-    let mut hunks = Vec::new();
-    let mut path = String::new();
-    let mut header = String::new();
-    let mut active: Option<(usize, usize, usize, usize, String)> = None;
-    let finish = |active: &mut Option<(usize, usize, usize, usize, String)>,
-                  path: &str,
-                  hunks: &mut Vec<DiffHunk>| {
-        if let Some((old_start, old_count, new_start, new_count, text)) = active.take() {
-            let id = content_hash(&format!("{path}\0{old_start}\0{new_start}\0{text}"));
-            hunks.push(DiffHunk {
-                id,
-                path: path.to_owned(),
-                old_start,
-                old_count,
-                new_start,
-                new_count,
-                text,
-            });
-        }
-    };
-    for line in diff.split_inclusive('\n') {
-        if line.starts_with("diff --git ") {
-            finish(&mut active, &path, &mut hunks);
-            header.clear();
-            path.clear();
-            header.push_str(line);
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("+++ b/") {
-            path = value.trim_end().to_owned();
-        }
-        if line.starts_with("@@ ") {
-            finish(&mut active, &path, &mut hunks);
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            let (old_start, old_count) = fields
-                .get(1)
-                .map(|value| parse_hunk_range(value))
-                .unwrap_or((0, 0));
-            let (new_start, new_count) = fields
-                .get(2)
-                .map(|value| parse_hunk_range(value))
-                .unwrap_or((0, 0));
-            active = Some((
-                old_start,
-                old_count,
-                new_start,
-                new_count,
-                format!("{header}{line}"),
-            ));
-        } else if let Some((_, _, _, _, text)) = active.as_mut() {
-            text.push_str(line);
-        } else {
-            header.push_str(line);
-        }
-    }
-    finish(&mut active, &path, &mut hunks);
-    hunks
-}
-
-fn hunk_overlaps(hunk: &DiffHunk, start: usize, end: usize) -> bool {
-    let overlaps = |line: usize, count: usize| {
-        let last = line.saturating_add(count.saturating_sub(1));
-        count > 0 && line <= end && last >= start
-    };
-    overlaps(hunk.old_start, hunk.old_count) || overlaps(hunk.new_start, hunk.new_count)
 }
 
 pub(super) fn validated_push_target(
@@ -250,9 +164,10 @@ impl Workspace {
                     let view = writer.read();
                     (view.repo_status().clone(), view.stamp())
                 };
-                let diff =
-                    self.repository
-                        .diff(&self.root, true, &[], self.policy.max_context_chars)?;
+                let diff = self
+                    .repository
+                    .diff(&self.root, true, &[], self.policy.max_context_chars)?
+                    .text;
                 let git_ms = git_started.elapsed().as_millis();
                 let mut result = json!({
                     "action": "preflight",
@@ -363,13 +278,13 @@ impl Workspace {
             (requested_scope, 0)
         };
         validate_paths(&scope.paths)?;
-        let raw = self.repository.diff(
+        let diff = self.repository.diff(
             &self.root,
             scope.staged,
             &scope.paths,
             self.policy.max_context_chars,
         )?;
-        let mut hunks = parse_diff_hunks(&raw);
+        let mut ranges = Vec::new();
         if let Some(symbol) = scope.symbol.as_deref() {
             if scope.paths.len() != 1 {
                 return Err(AppError::invalid(
@@ -397,14 +312,12 @@ impl Workspace {
                 .next()
                 .expect("checked one symbol")
                 .symbol;
-            hunks.retain(|hunk| hunk_overlaps(hunk, symbol.start_line, symbol.end_line));
+            ranges.push((symbol.start_line, symbol.end_line));
         }
         if let (Some(start), Some(end)) = (scope.start_line, scope.end_line) {
-            hunks.retain(|hunk| hunk_overlaps(hunk, start, end));
+            ranges.push((start, end));
         }
-        if !scope.hunk_ids.is_empty() {
-            hunks.retain(|hunk| scope.hunk_ids.iter().any(|id| id == &hunk.id));
-        }
+        let hunks = diff.select(&ranges, &scope.hunk_ids);
         let mut output = String::new();
         let mut selected = Vec::new();
         let mut next = None;
@@ -417,8 +330,8 @@ impl Workspace {
             output.push_str(&hunk.text);
             selected.push(json!({
                 "id": hunk.id, "path": hunk.path,
-                "old": {"start_line": hunk.old_start, "line_count": hunk.old_count},
-                "new": {"start_line": hunk.new_start, "line_count": hunk.new_count}
+                "old": {"start_line": hunk.old.start, "line_count": hunk.old.count},
+                "new": {"start_line": hunk.new.start, "line_count": hunk.new.count}
             }));
             if oversized {
                 next = (index + 1 < hunks.len()).then_some(index + 1);
@@ -481,32 +394,4 @@ fn validate_paths(paths: &[String]) -> AppResult<()> {
         validate_relative(path)?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn hunk(old_start: usize, old_count: usize, new_start: usize, new_count: usize) -> DiffHunk {
-        DiffHunk {
-            id: "test".to_owned(),
-            path: "test.rs".to_owned(),
-            old_start,
-            old_count,
-            new_start,
-            new_count,
-            text: String::new(),
-        }
-    }
-
-    #[test]
-    fn hunk_overlap_ignores_zero_length_sides() {
-        let addition = hunk(10, 0, 100, 2);
-        assert!(!hunk_overlaps(&addition, 10, 10));
-        assert!(hunk_overlaps(&addition, 100, 101));
-
-        let deletion = hunk(20, 2, 200, 0);
-        assert!(hunk_overlaps(&deletion, 20, 21));
-        assert!(!hunk_overlaps(&deletion, 200, 200));
-    }
 }
