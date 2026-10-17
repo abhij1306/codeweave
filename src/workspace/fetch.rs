@@ -3,7 +3,8 @@ use super::Workspace;
 use crate::index::{
     decode_handle, encode_handle, slice_lines, FileEntry, RangeHandle, SymbolDefinition,
 };
-use crate::model::{bool_value, required_str, usize_value, AppError, AppResult};
+use crate::model::{AppError, AppResult};
+use crate::retrieval::ReadTarget;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -69,7 +70,13 @@ impl Workspace {
                 .cloned()
                 .ok_or_else(|| AppError::invalid("Provide 'path' or an 'items' array"))?
         };
-        let max_chars = usize_value(params, "max_chars", 30_000).min(200_000);
+        let max_chars = params
+            .get("max_chars")
+            .and_then(Value::as_u64)
+            .map_or(crate::retrieval::DEFAULT_READ_MAX_CHARS, |value| {
+                value as usize
+            })
+            .min(crate::retrieval::MAX_READ_MAX_CHARS);
         let response_detail = params
             .get("response_detail")
             .and_then(Value::as_str)
@@ -82,7 +89,9 @@ impl Workspace {
             if remaining == 0 {
                 break;
             }
-            match self.read_target(item, remaining) {
+            match read_target_from_item(item)
+                .and_then(|target| self.read_target(&target, remaining))
+            {
                 Ok(result) => {
                     remaining = remaining.saturating_sub(result_text_len(&result));
                     results.push(result);
@@ -145,22 +154,20 @@ impl Workspace {
         Ok(result)
     }
 
-    pub(super) fn read_target(&self, item: &Value, remaining: usize) -> AppResult<Value> {
-        let kind = required_str(item, "kind")?;
-        let value = required_str(item, "value")?;
-        match kind {
-            "path" => {
-                let start = item
-                    .get("start_line")
-                    .and_then(Value::as_u64)
-                    .map(|value| value as usize);
-                let end = item
-                    .get("end_line")
-                    .and_then(Value::as_u64)
-                    .map(|value| value as usize);
-                self.fetch_indexed_path(value, scope_from_bounds(start, end), 0, remaining, None)
-            }
-            "handle" => {
+    pub(super) fn read_target(&self, target: &ReadTarget, remaining: usize) -> AppResult<Value> {
+        match target {
+            ReadTarget::Path {
+                path,
+                start_line,
+                end_line,
+            } => self.fetch_indexed_path(
+                path,
+                scope_from_bounds(*start_line, *end_line),
+                0,
+                remaining,
+                None,
+            ),
+            ReadTarget::Handle(value) => {
                 let handle = decode_handle(value)?;
                 if handle.workspace_id != self.id {
                     return Err(AppError::new(
@@ -185,20 +192,25 @@ impl Workspace {
                     }),
                 )
             }
-            "symbol" => self.fetch_symbol(
-                value,
-                item.get("path").and_then(Value::as_str),
+            ReadTarget::Symbol {
+                name,
+                path,
+                context_lines,
+                include_imports,
+            } => self.fetch_symbol(
+                name,
+                path.as_deref(),
                 remaining,
-                usize_value(item, "context_lines", 0).min(200),
-                bool_value(item, "include_imports", false),
+                *context_lines,
+                *include_imports,
             ),
-            "metadata" => self.fetch_metadata(value),
-            "bash_status" => {
-                let run_id = value.strip_prefix("bash:").unwrap_or(value);
+            ReadTarget::Metadata(path) => self.fetch_metadata(path),
+            ReadTarget::BashStatus(value) => {
+                let run_id = value.strip_prefix("bash:").unwrap_or(value.as_str());
                 self.bash.status_with_limit(run_id, remaining)
             }
-            "bash_log" => {
-                let run_id = value.strip_prefix("bash-log:").unwrap_or(value);
+            ReadTarget::BashLog(value) => {
+                let run_id = value.strip_prefix("bash-log:").unwrap_or(value.as_str());
                 let content = self.bash.read_output(run_id)?;
                 Ok(bounded_content(
                     json!({"kind": "bash_log", "run_id": run_id}),
@@ -208,7 +220,7 @@ impl Workspace {
                     None,
                 ))
             }
-            "continuation" => {
+            ReadTarget::Continuation(value) => {
                 let continuation = decode_fetch_continuation(value)?;
                 if continuation.workspace_id != self.id {
                     return Err(AppError::new(
@@ -230,11 +242,6 @@ impl Workspace {
                     }),
                 )
             }
-            _ => Err(AppError::details(
-                "INVALID_FETCH_KIND",
-                "Unknown fetch kind",
-                json!({"kind": kind}),
-            )),
         }
     }
 
@@ -452,6 +459,53 @@ impl Workspace {
             Some(&continuation),
         ))
     }
+}
+
+/// The typed read target of a test `items` entry (`kind`, `value`, and the
+/// optional `path`, `start_line`, `end_line`, `context_lines`,
+/// `include_imports`).
+#[cfg(test)]
+fn read_target_from_item(item: &Value) -> AppResult<ReadTarget> {
+    let text = |field: &str| item.get(field).and_then(Value::as_str).map(str::to_owned);
+    let number = |field: &str| {
+        item.get(field)
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+    };
+    let value = text("value").ok_or_else(|| AppError::invalid("Missing or invalid 'value'"))?;
+    Ok(
+        match text("kind")
+            .ok_or_else(|| AppError::invalid("Missing or invalid 'kind'"))?
+            .as_str()
+        {
+            "path" => ReadTarget::Path {
+                path: value,
+                start_line: number("start_line"),
+                end_line: number("end_line"),
+            },
+            "handle" => ReadTarget::Handle(value),
+            "symbol" => ReadTarget::Symbol {
+                name: value,
+                path: text("path"),
+                context_lines: number("context_lines").unwrap_or(0).min(200),
+                include_imports: item
+                    .get("include_imports")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            },
+            "metadata" => ReadTarget::Metadata(value),
+            "bash_status" => ReadTarget::BashStatus(value),
+            "bash_log" => ReadTarget::BashLog(value),
+            "continuation" => ReadTarget::Continuation(value),
+            kind => {
+                return Err(AppError::details(
+                    "INVALID_FETCH_KIND",
+                    "Unknown fetch kind",
+                    json!({"kind": kind}),
+                ))
+            }
+        },
+    )
 }
 
 #[cfg(test)]

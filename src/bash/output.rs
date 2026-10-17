@@ -1,10 +1,10 @@
 //! A Bash run's output: one incremental UTF-8 + ANSI decoder per pipe, and a
 //! bounded tail per stream with tracked character counts, so ingesting a chunk
 //! costs time proportional to the chunk. Text is stripped once, at ingest.
-use std::io;
-
-/// A stream a client can read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// A stream a client can read. (A plain comment: the type also generates the
+// `bash_output` `stream` schema, which publishes doc comments.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum OutputStream {
     Combined,
     Stdout,
@@ -12,18 +12,6 @@ pub enum OutputStream {
 }
 
 impl OutputStream {
-    pub fn parse(value: Option<&str>) -> io::Result<Self> {
-        match value.unwrap_or("combined") {
-            "combined" => Ok(Self::Combined),
-            "stdout" => Ok(Self::Stdout),
-            "stderr" => Ok(Self::Stderr),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unknown Bash output stream: {other}"),
-            )),
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Combined => "combined",

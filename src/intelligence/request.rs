@@ -1,10 +1,8 @@
-//! Typed `code_intelligence` request: parsed and validated once at the boundary.
+//! Typed `code_intelligence` request: the per-operation form of the tool's
+//! `CodeIntelligenceRequest`, built once at the boundary.
 use crate::model::{AppError, AppResult};
+use crate::requests::intelligence::{CodeIntelligenceRequest, IntelligenceOperationName};
 use crate::security::validate_relative;
-use serde_json::{json, Value};
-
-pub(crate) const DEFAULT_MAX_RESULTS: usize = 20;
-pub(crate) const MAX_RESULTS: usize = 200;
 
 /// A public position: one-based line, zero-based UTF-16 column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,101 +30,65 @@ pub(crate) enum Operation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IntelligenceRequest {
+pub struct IntelligenceRequest {
     /// Validated workspace-relative path with `/` separators.
     pub(crate) path: String,
     pub(crate) operation: Operation,
 }
 
-impl IntelligenceRequest {
-    pub(crate) fn parse(params: &Value) -> AppResult<Self> {
-        let operation = string(params, "operation")?
-            .ok_or_else(|| AppError::invalid("code_intelligence requires operation"))?;
-        let path = string(params, "path")?
+impl TryFrom<CodeIntelligenceRequest> for IntelligenceRequest {
+    type Error = AppError;
+
+    fn try_from(request: CodeIntelligenceRequest) -> AppResult<Self> {
+        let path = request
+            .path
+            .as_deref()
             .ok_or_else(|| AppError::invalid("code_intelligence requires path"))?;
         let path = validate_relative(path)?
             .to_string_lossy()
             .replace('\\', "/");
-        let operation = match operation {
-            "definition" => Operation::Definition {
-                position: position(params)?,
+        let position = || {
+            let line = request.line.ok_or_else(|| {
+                AppError::invalid("This code_intelligence operation requires line")
+            })?;
+            Ok::<_, AppError>(Position {
+                line: line as usize,
+                column: request.column.unwrap_or(0) as usize,
+            })
+        };
+        let operation = match request.operation {
+            IntelligenceOperationName::Definition => Operation::Definition {
+                position: position()?,
             },
-            "references" => Operation::References {
-                position: position(params)?,
-                max_results: max_results(params)?,
+            IntelligenceOperationName::References => Operation::References {
+                position: position()?,
+                max_results: request.max_results,
             },
-            "diagnostics" => Operation::Diagnostics {
-                max_results: max_results(params)?,
+            IntelligenceOperationName::Diagnostics => Operation::Diagnostics {
+                max_results: request.max_results,
             },
-            "rename_preview" => Operation::RenamePreview {
-                position: position(params)?,
-                new_name: string(params, "new_name")?
-                    .ok_or_else(|| AppError::invalid("rename_preview requires new_name"))?
-                    .to_owned(),
+            IntelligenceOperationName::RenamePreview => Operation::RenamePreview {
+                position: position()?,
+                new_name: request
+                    .new_name
+                    .clone()
+                    .ok_or_else(|| AppError::invalid("rename_preview requires new_name"))?,
             },
-            other => {
-                return Err(AppError::details(
-                    "INVALID_ARGUMENT",
-                    "Unknown code_intelligence operation",
-                    json!({"operation": other}),
-                ))
-            }
         };
         Ok(Self { path, operation })
     }
 }
 
-/// A field that is absent or JSON `null` is "not provided".
-fn field<'a>(params: &'a Value, key: &str) -> Option<&'a Value> {
-    params.get(key).filter(|value| !value.is_null())
-}
-
-fn string<'a>(params: &'a Value, key: &str) -> AppResult<Option<&'a str>> {
-    field(params, key)
-        .map(|value| {
-            value
-                .as_str()
-                .ok_or_else(|| AppError::invalid(format!("{key} must be a string")))
-        })
-        .transpose()
-}
-
-fn integer(params: &Value, key: &str, min: u64, max: u64) -> AppResult<Option<usize>> {
-    let Some(value) = field(params, key) else {
-        return Ok(None);
-    };
-    let number = value
-        .as_u64()
-        .filter(|number| (min..=max).contains(number))
-        .ok_or_else(|| {
-            AppError::details(
-                "INVALID_ARGUMENT",
-                format!("{key} must be an integer from {min} to {max}"),
-                json!({"field": key, "value": value}),
-            )
-        })?;
-    usize::try_from(number)
-        .map(Some)
-        .map_err(|_| AppError::invalid(format!("{key} is too large")))
-}
-
-fn position(params: &Value) -> AppResult<Position> {
-    let line = integer(params, "line", 1, u32::MAX.into())?
-        .ok_or_else(|| AppError::invalid("This code_intelligence operation requires line"))?;
-    let column = integer(params, "column", 0, u32::MAX.into())?.unwrap_or(0);
-    Ok(Position { line, column })
-}
-
-fn max_results(params: &Value) -> AppResult<usize> {
-    Ok(integer(params, "max_results", 1, MAX_RESULTS as u64)?.unwrap_or(DEFAULT_MAX_RESULTS))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::requests::{Contract, Rejection};
+    use serde_json::{json, Value};
 
     fn parse(params: Value) -> AppResult<IntelligenceRequest> {
-        IntelligenceRequest::parse(&params)
+        Contract::of::<CodeIntelligenceRequest>("code_intelligence")
+            .parse::<CodeIntelligenceRequest>(params, Rejection::Argument)?
+            .try_into()
     }
 
     #[test]

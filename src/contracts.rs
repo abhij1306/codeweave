@@ -110,62 +110,6 @@ pub const RETRIEVAL_CONTRACTS: &[ContractSpec] = &[
     },
 ];
 
-pub const CHANGE_CONTRACTS: &[ContractSpec] = &[
-    ContractSpec {
-        name: "create",
-        required: &["kind", "path", "content"],
-        optional: &["overwrite", "expected_hash"],
-    },
-    ContractSpec {
-        name: "replace",
-        required: &["kind", "path", "old_text", "new_text"],
-        optional: &["expected_replacements", "expected_hash", "handle"],
-    },
-    ContractSpec {
-        name: "replace_range",
-        required: &["kind", "path", "handle", "new_text"],
-        optional: &[],
-    },
-    ContractSpec {
-        name: "insert",
-        required: &["kind", "path", "content", "anchor_symbol", "position"],
-        optional: &["expected_hash"],
-    },
-    ContractSpec {
-        name: "delete",
-        required: &["kind", "path"],
-        optional: &["expected_hash"],
-    },
-    ContractSpec {
-        name: "rename",
-        required: &["kind", "path", "to"],
-        optional: &["expected_hash"],
-    },
-];
-
-pub const BASH_CONTRACTS: &[ContractSpec] = &[
-    ContractSpec {
-        name: "bash",
-        required: &["command"],
-        optional: &["cwd", "background", "timeout_ms"],
-    },
-    ContractSpec {
-        name: "bash_status",
-        required: &["run_id"],
-        optional: &[],
-    },
-    ContractSpec {
-        name: "bash_output",
-        required: &["run_id"],
-        optional: &["stream", "continuation"],
-    },
-    ContractSpec {
-        name: "bash_cancel",
-        required: &["run_id"],
-        optional: &[],
-    },
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     MissingOperationField,
@@ -282,29 +226,8 @@ pub fn retrieval_contract(name: &str) -> Option<ContractSpec> {
         .find(|contract| contract.name == name)
 }
 
-pub fn change_contract(name: &str) -> Option<ContractSpec> {
-    CHANGE_CONTRACTS
-        .iter()
-        .copied()
-        .find(|contract| contract.name == name)
-}
-
-pub fn bash_contract(name: &str) -> Option<ContractSpec> {
-    BASH_CONTRACTS
-        .iter()
-        .copied()
-        .find(|contract| contract.name == name)
-}
-
 pub fn retrieval_operation_names() -> Vec<&'static str> {
     RETRIEVAL_CONTRACTS
-        .iter()
-        .map(|contract| contract.name)
-        .collect()
-}
-
-pub fn change_kind_names() -> Vec<&'static str> {
-    CHANGE_CONTRACTS
         .iter()
         .map(|contract| contract.name)
         .collect()
@@ -377,126 +300,6 @@ pub fn validate_retrieval_operation(kind: &str, operation: &Map<String, Value>) 
         }
     }
     Ok(())
-}
-
-pub fn validate_change(change: &Value) -> AppResult<()> {
-    let object = change.as_object().ok_or_else(|| {
-        ErrorCode::InvalidChangeField.error(
-            "transaction changes must be objects",
-            json!({"field": "changes"}),
-        )
-    })?;
-    let kind = object
-        .get("kind")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            ErrorCode::MissingChangeField.error("change requires kind", json!({"field": "kind"}))
-        })?;
-    let contract = change_contract(kind).ok_or_else(|| {
-        ErrorCode::UnsupportedChangeKind.error(
-            format!("unsupported change kind '{kind}'"),
-            json!({"kind": kind, "supported": change_kind_names()}),
-        )
-    })?;
-    validate_fields(
-        contract,
-        object,
-        ErrorCode::MissingChangeField,
-        ErrorCode::UnknownChangeField,
-        "change",
-    )?;
-    require_non_empty_string(object, "path", ErrorCode::InvalidChangeField, "change")?;
-    if kind == "replace_range" {
-        require_non_empty_string(object, "handle", ErrorCode::InvalidChangeField, "change")?;
-    }
-    if kind == "insert" {
-        let valid = object
-            .get("position")
-            .and_then(Value::as_str)
-            .is_some_and(|value| {
-                matches!(value, "before" | "after" | "inside_start" | "inside_end")
-            });
-        if !valid {
-            return Err(ErrorCode::InvalidChangeField.error(
-                "insert position must be before, after, inside_start, or inside_end",
-                json!({"kind": kind, "field": "position"}),
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub fn normalize_bash_request(method: &str, input: &Value) -> AppResult<Value> {
-    let contract = bash_contract(method).ok_or_else(|| {
-        ErrorCode::InvalidBashRequest.error(
-            format!("unsupported Bash method '{method}'"),
-            json!({"method": method}),
-        )
-    })?;
-    let object = input.as_object().ok_or_else(|| {
-        ErrorCode::InvalidBashRequest.error(
-            format!("{method} input must be an object"),
-            json!({"method": method}),
-        )
-    })?;
-    validate_fields(
-        contract,
-        object,
-        ErrorCode::InvalidBashRequest,
-        ErrorCode::InvalidBashRequest,
-        method,
-    )?;
-
-    let required_string = if method == "bash" {
-        "command"
-    } else {
-        "run_id"
-    };
-    require_non_empty_string(
-        object,
-        required_string,
-        ErrorCode::InvalidBashRequest,
-        method,
-    )?;
-    if let Some(stream) = object.get("stream") {
-        let valid = stream
-            .as_str()
-            .is_some_and(|value| matches!(value, "combined" | "stdout" | "stderr"));
-        if !valid {
-            return Err(ErrorCode::InvalidBashRequest.error(
-                "bash_output stream must be combined, stdout, or stderr",
-                json!({"method": method, "field": "stream"}),
-            ));
-        }
-    }
-    if let Some(background) = object.get("background") {
-        if !background.is_boolean() {
-            return Err(ErrorCode::InvalidBashRequest.error(
-                "bash background must be a boolean",
-                json!({"method": method, "field": "background"}),
-            ));
-        }
-    }
-    if let Some(timeout) = object.get("timeout_ms") {
-        if timeout.as_u64().is_none_or(|value| value == 0) {
-            return Err(ErrorCode::InvalidBashRequest.error(
-                "bash timeout_ms must be a positive integer",
-                json!({"method": method, "field": "timeout_ms"}),
-            ));
-        }
-    }
-
-    let action = match method {
-        "bash" => "start",
-        "bash_status" => "status",
-        "bash_output" => "output",
-        "bash_cancel" => "cancel",
-        _ => unreachable!("validated Bash contract"),
-    };
-    let mut normalized = object.clone();
-    normalized.insert("action".to_owned(), Value::String(action.to_owned()));
-    Ok(Value::Object(normalized))
 }
 
 fn validate_fields(
@@ -606,33 +409,18 @@ mod tests {
 
     #[test]
     fn contract_names_and_fields_are_unique() {
-        for contracts in [RETRIEVAL_CONTRACTS, CHANGE_CONTRACTS, BASH_CONTRACTS] {
-            let names = contracts
-                .iter()
-                .map(|contract| contract.name)
-                .collect::<BTreeSet<_>>();
-            assert_eq!(names.len(), contracts.len());
-            for contract in contracts {
-                let fields = contract.allowed_fields().collect::<Vec<_>>();
-                assert_eq!(
-                    fields.iter().copied().collect::<BTreeSet<_>>().len(),
-                    fields.len()
-                );
-            }
+        let names = RETRIEVAL_CONTRACTS
+            .iter()
+            .map(|contract| contract.name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), RETRIEVAL_CONTRACTS.len());
+        for contract in RETRIEVAL_CONTRACTS {
+            let fields = contract.allowed_fields().collect::<Vec<_>>();
+            assert_eq!(
+                fields.iter().copied().collect::<BTreeSet<_>>().len(),
+                fields.len()
+            );
         }
-    }
-
-    #[test]
-    fn bash_normalization_rejects_spoofed_fields_and_adds_action() {
-        let normalized = normalize_bash_request("bash", &json!({"command": "printf ok"}))
-            .expect("valid Bash request");
-        assert_eq!(normalized["action"], "start");
-        let error = normalize_bash_request(
-            "bash_status",
-            &json!({"run_id": "run_1", "action": "cancel"}),
-        )
-        .unwrap_err();
-        assert_eq!(error.0.code, "INVALID_BASH_REQUEST");
     }
 
     #[test]
@@ -664,20 +452,5 @@ mod tests {
             error.0.details.as_ref().unwrap()["retry_kind"],
             "remove_field"
         );
-    }
-
-    #[test]
-    fn change_contract_rejects_missing_and_unknown_fields() {
-        let missing = json!({"kind": "rename", "path": "old.rs"});
-        let error = validate_change(&missing).unwrap_err();
-        assert_eq!(error.0.code, "MISSING_CHANGE_FIELD");
-
-        let unknown = json!({
-            "kind": "delete",
-            "path": "old.rs",
-            "content": "not allowed for delete"
-        });
-        let error = validate_change(&unknown).unwrap_err();
-        assert_eq!(error.0.code, "UNKNOWN_CHANGE_FIELD");
     }
 }

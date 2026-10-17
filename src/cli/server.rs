@@ -5,7 +5,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use codeweave_rust::{manager, model, tools};
+use codeweave_rust::{manager, model};
 use manager::Application;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -25,12 +25,7 @@ pub(super) struct AppState {
     pub(super) manager: Arc<Application>,
     pub(super) server: ServerConfig,
     pub(super) token: Option<Arc<Vec<u8>>>,
-    pub(super) tool_access: Arc<tools::ToolAccess>,
     pub(super) instance_id: Arc<str>,
-}
-
-pub(super) fn resolve_tool_access() -> tools::ToolAccess {
-    tools::fixed_access()
 }
 
 pub(super) fn init_tracing() {
@@ -134,18 +129,10 @@ pub(super) async fn live(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    match state.manager.dispatch("health", &json!({})).await {
-        Ok(value) => (
-            StatusCode::OK,
-            Json(json!({"ok":true,"gateway_ready":true,"engine":value})),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"ok":false,"error":error.0})),
-        )
-            .into_response(),
-    }
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "gateway_ready": true, "engine": state.manager.health()})),
+    )
 }
 
 /// Load the config, initialize the repository, and start the selected transport.
@@ -160,24 +147,23 @@ pub(super) async fn run_serve(cli: Cli) -> Result<()> {
         None
     };
     let manager = Arc::new(Application::default());
+    let config = model::parse_daemon_config(&config).map_err(|e| anyhow::anyhow!(e))?;
     let init = manager
-        .dispatch("initialize", &config)
+        .initialize(config)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
     tracing::info!(
-        workspace = %init["workspace"]["path"].as_str().unwrap_or_default(),
-        file_count = init["file_count"].as_u64().unwrap_or_default(),
-        index_ready = init["index_ready"].as_bool().unwrap_or(false),
-        bash_available = init["bash_available"].as_bool().unwrap_or(false),
+        workspace = %init.workspace.path,
+        file_count = init.file_count,
+        index_ready = init.index_ready,
+        bash_available = init.bash_available,
         "repository ready before transport bind"
     );
-    let tool_access = Arc::new(resolve_tool_access());
     let instance_id = manager.instance_id();
     let state = AppState {
         manager,
         server,
         token,
-        tool_access,
         instance_id,
     };
     match cli.transport {

@@ -263,7 +263,7 @@ async fn background_commands_can_be_polled_paged_and_cancelled() {
         "queued" | "running"
     ));
     let mut output = supervisor
-        .output_stream(run_id, None, Some("combined"))
+        .output_stream(run_id, None, OutputStream::Combined)
         .unwrap();
     for _ in 0..50 {
         if output["output"].as_str().unwrap().contains("started") {
@@ -271,7 +271,7 @@ async fn background_commands_can_be_polled_paged_and_cancelled() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
         output = supervisor
-            .output_stream(run_id, None, Some("combined"))
+            .output_stream(run_id, None, OutputStream::Combined)
             .unwrap();
     }
     assert!(output["output"].as_str().unwrap().contains("started"));
@@ -734,7 +734,7 @@ async fn output_streams_are_kept_apart_and_report_dropped_prefixes() {
     let run_id = finished["run_id"].as_str().unwrap();
 
     let stdout = supervisor
-        .output_stream(run_id, None, Some("stdout"))
+        .output_stream(run_id, None, OutputStream::Stdout)
         .unwrap();
     assert_eq!(stdout["output"], "out-only");
     assert_eq!(stdout["total_chars"], 11);
@@ -743,11 +743,7 @@ async fn output_streams_are_kept_apart_and_report_dropped_prefixes() {
     assert_eq!(stdout["output_truncated"], true);
     assert_eq!(stdout["continuation"], Value::Null);
     let stderr = supervisor
-        .output_stream(run_id, None, Some("stderr"))
+        .output_stream(run_id, None, OutputStream::Stderr)
         .unwrap();
     assert_eq!(stderr["output"], "err-only");
-    let invalid = supervisor
-        .output_stream(run_id, None, Some("both"))
-        .unwrap_err();
-    assert_eq!(invalid.0.code, "INVALID_ARGUMENT");
 }

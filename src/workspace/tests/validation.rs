@@ -7,7 +7,7 @@ async fn detached_validation_keeps_leading_failure_as_primary_run() {
     fs::write(root.path().join("value.rs"), original).unwrap();
     let actor = test_actor_with_budget(root.path(), 20);
     let result = actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [{
                 "kind": "replace",
                 "path": "value.rs",
@@ -19,7 +19,7 @@ async fn detached_validation_keeps_leading_failure_as_primary_run() {
                 "sleep 0.2; exit 7",
                 "printf later > validation-after-failure.txt"
             ]
-        }))
+        })))
         .await
         .unwrap();
 
@@ -66,7 +66,7 @@ async fn syntax_error_gate_blocks_broken_rust_and_leaves_file_untouched() {
     let actor = test_actor(root.path());
 
     let error = actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [{
                 "kind": "replace",
                 "path": "value.rs",
@@ -74,7 +74,7 @@ async fn syntax_error_gate_blocks_broken_rust_and_leaves_file_untouched() {
                 "new_text": "{ 1 ",
                 "expected_hash": content_hash(original)
             }]
-        }))
+        })))
         .await
         .unwrap_err();
 
@@ -96,7 +96,7 @@ async fn json_edits_are_syntax_checked_and_yaml_edits_are_reported_skipped() {
 
     // D5: JSON now has a bundled grammar, so a broken JSON edit is gated.
     let error = actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [{
                 "kind": "replace",
                 "path": "data.json",
@@ -104,7 +104,7 @@ async fn json_edits_are_syntax_checked_and_yaml_edits_are_reported_skipped() {
                 "new_text": "\"a\": 1,",
                 "expected_hash": content_hash(json_original)
             }]
-        }))
+        })))
         .await
         .unwrap_err();
     assert_eq!(error.0.code, "SYNTAX_ERROR");
@@ -116,7 +116,7 @@ async fn json_edits_are_syntax_checked_and_yaml_edits_are_reported_skipped() {
     // A valid JSON edit reports the check ran; a YAML edit (no grammar) reports
     // the bypass explicitly as "skipped" rather than silently passing.
     let applied = actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [
                 {
                     "kind": "replace",
@@ -133,7 +133,7 @@ async fn json_edits_are_syntax_checked_and_yaml_edits_are_reported_skipped() {
                     "expected_hash": content_hash(yaml_original)
                 }
             ]
-        }))
+        })))
         .await
         .unwrap();
 

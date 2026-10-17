@@ -27,10 +27,10 @@ async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
         .record(&[mutation("unrelated/generated.txt", "external", generation)]);
 
     let started = actor
-        .run(&json!({
+        .run(bash_request(&json!({
             "command": "printf codeweave-bash-test",
             "background": false
-        }))
+        })))
         .await
         .unwrap();
     let run_id = started["run_id"].as_str().unwrap();
@@ -72,10 +72,10 @@ async fn completed_bash_status_does_not_attribute_later_workspace_writes() {
     let actor = test_actor(root.path());
 
     let started = actor
-        .run(&json!({
+        .run(bash_request(&json!({
             "command": "printf codeweave-bash-test",
             "background": true
-        }))
+        })))
         .await
         .unwrap();
     let run_id = started["run_id"].as_str().unwrap();
@@ -103,10 +103,10 @@ async fn completed_bash_status_does_not_attribute_later_workspace_writes() {
         .unwrap();
 
     let fetched = actor
-        .run(&json!({
+        .run(bash_request(&json!({
             "action": "status",
             "run_id": run_id
-        }))
+        })))
         .await
         .unwrap();
 
@@ -115,10 +115,10 @@ async fn completed_bash_status_does_not_attribute_later_workspace_writes() {
     assert_eq!(fetched["observed_changed_paths"], json!([]));
 
     let fetched_again = actor
-        .run(&json!({
+        .run(bash_request(&json!({
             "action": "status",
             "run_id": run_id
-        }))
+        })))
         .await
         .unwrap();
     assert_eq!(
@@ -194,9 +194,9 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
     assert!(fetch["phase_ms"]["fetch_items"].is_number());
 
     let retrieved = actor
-        .code_retrieve(&json!({
+        .code_retrieve(&retrieve_request(&json!({
             "operations": [{"operation": "search_text", "pattern": "pending_symbol"}]
-        }))
+        })))
         .unwrap();
     let search = &retrieved["results"][0]["result"];
     assert_eq!(search["reconcile_pending"], true);
@@ -255,7 +255,7 @@ async fn failed_bash_validation_preserves_mutation() {
     assert_eq!(summary["capabilities"]["bash_available"], true);
     assert!(summary["warnings"].as_array().is_some_and(Vec::is_empty));
     let result = actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [{
                 "kind": "replace",
                 "path": "value.rs",
@@ -267,7 +267,7 @@ async fn failed_bash_validation_preserves_mutation() {
                 "printf validation-started",
                 "printf validation-failed >&2; exit 1"
             ]
-        }))
+        })))
         .await
         .unwrap();
     assert_eq!(result["applied"], true);
@@ -283,7 +283,7 @@ async fn failed_bash_validation_preserves_mutation() {
         fs::read_to_string(root.path().join("value.rs")).unwrap(),
         "fn value() -> i32 { 2 }\n"
     );
-    let changes = actor.changes(&json!({"since_generation": 0})).unwrap();
+    let changes = actor.changes(0, None, 200).unwrap();
     assert!(changes["mutations"]
         .as_array()
         .unwrap()
@@ -310,7 +310,7 @@ async fn unavailable_bash_validation_rejects_before_mutation() {
     assert_eq!(summary["capabilities"]["bash"]["readiness"], "unavailable");
 
     let error = actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [{
                 "kind": "replace",
                 "path": "value.rs",
@@ -319,7 +319,7 @@ async fn unavailable_bash_validation_rejects_before_mutation() {
                 "expected_hash": content_hash(original)
             }],
             "validate": ["true"]
-        }))
+        })))
         .await
         .unwrap_err();
 
@@ -334,7 +334,7 @@ async fn slow_bash_validation_queues_remaining_commands() {
     fs::write(root.path().join("value.rs"), original).unwrap();
     let actor = test_actor_with_budget(root.path(), 50);
     let result = actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [{
                 "kind": "replace",
                 "path": "value.rs",
@@ -346,7 +346,7 @@ async fn slow_bash_validation_queues_remaining_commands() {
                 "echo checking; sleep 1",
                 "printf later > validation-later.txt"
             ]
-        }))
+        })))
         .await
         .unwrap();
     assert_eq!(result["applied"], true);
@@ -411,6 +411,6 @@ fn process_local_changes_include_external_mutations() {
         .ledger()
         .record(&[mutation("value.rs", "external", 99)]);
 
-    let result = actor.changes(&json!({"since_generation": 0})).unwrap();
+    let result = actor.changes(0, None, 200).unwrap();
     assert_eq!(result["mutations"].as_array().unwrap().len(), 1);
 }

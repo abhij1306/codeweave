@@ -38,6 +38,13 @@ supported hosted clients. The `code_preview` and `code_transaction` change
 arrays use a discriminated `oneOf` schema keyed by `kind`, matching the strict
 typed validation boundary. Unknown or operation-inapplicable fields are errors.
 
+`src/tools` is the registry and the dispatch seam: each entry binds a tool name,
+title, description and safety class to a typed request from `src/requests`.
+That type generates the published schema and the field contract, and is bound
+to the `Application` operation that serves it. JSON values exist only between
+the transport and the registry's parse step; the application, workspace, Git
+and Bash layers receive typed requests.
+
 Configuration requires `configVersion: 2` and rejects unknown fields at every
 level. Streamable HTTP is stateless and returns JSON. Stdio is available for
 local clients.

@@ -326,6 +326,7 @@ dependencies = [
  "rayon",
  "regex",
  "rmcp",
+ "schemars",
  "serde",
  "serde_json",
  "serde_path_to_error",

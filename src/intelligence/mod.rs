@@ -23,6 +23,7 @@ mod uri;
 mod worker;
 mod workspace_edit;
 
+pub use request::IntelligenceRequest;
 pub use service::{IntelligenceResponse, IntelligenceService, RenamePreview};
 
 #[cfg(test)]

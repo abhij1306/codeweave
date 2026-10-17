@@ -36,11 +36,11 @@ async fn git_diff_continuation_preserves_the_original_scope() {
 
     let actor = test_actor(root.path());
     let first = actor
-        .git(&json!({
+        .git(git_action(&json!({
             "action": "diff",
             "paths": ["a.rs"],
             "max_chars": 1_200
-        }))
+        })))
         .await
         .unwrap();
     assert_eq!(first["truncated"], true);
@@ -53,11 +53,11 @@ async fn git_diff_continuation_preserves_the_original_scope() {
     let continuation = first["continuation"].as_str().unwrap();
 
     let second = actor
-        .git(&json!({
+        .git(git_action(&json!({
             "action": "diff",
             "continuation": continuation,
             "max_chars": 5_000
-        }))
+        })))
         .await
         .unwrap();
     assert!(second["hunks"]
@@ -69,11 +69,11 @@ async fn git_diff_continuation_preserves_the_original_scope() {
     assert_eq!(second["scope"]["paths"], json!(["a.rs"]));
 
     let error = actor
-        .git(&json!({
+        .git(git_action(&json!({
             "action": "diff",
             "continuation": continuation,
             "paths": ["b.rs"]
-        }))
+        })))
         .await
         .unwrap_err();
     assert_eq!(error.0.code, "CONTINUATION_SCOPE_MISMATCH");
@@ -111,7 +111,9 @@ async fn git_diff_pagination_advances_past_oversized_hunks() {
 
     let actor = test_actor(root.path());
     let first = actor
-        .git(&json!({"action": "diff", "paths": ["large.rs"], "max_chars": 100}))
+        .git(git_action(
+            &json!({"action": "diff", "paths": ["large.rs"], "max_chars": 100}),
+        ))
         .await
         .unwrap();
     assert_eq!(first["hunks"].as_array().unwrap().len(), 1);
@@ -120,7 +122,9 @@ async fn git_diff_pagination_advances_past_oversized_hunks() {
     let continuation = first["continuation"].as_str().unwrap();
 
     let second = actor
-        .git(&json!({"action": "diff", "continuation": continuation, "max_chars": 100}))
+        .git(git_action(
+            &json!({"action": "diff", "continuation": continuation, "max_chars": 100}),
+        ))
         .await
         .unwrap();
     assert_eq!(second["hunks"].as_array().unwrap().len(), 1);
@@ -132,12 +136,12 @@ async fn git_diff_pagination_advances_past_oversized_hunks() {
 #[test]
 fn push_target_defaults_to_current_branch_and_rejects_git_syntax() {
     assert_eq!(
-        validated_push_target(&json!({}), "feature/current").unwrap(),
+        validated_push_target(&push_request(&json!({})), "feature/current").unwrap(),
         ("origin".to_owned(), "feature/current".to_owned())
     );
     assert_eq!(
         validated_push_target(
-            &json!({"remote": "upstream", "branch": "feature/explicit"}),
+            &push_request(&json!({"remote": "upstream", "branch": "feature/explicit"})),
             "feature/current"
         )
         .unwrap(),
@@ -151,7 +155,7 @@ fn push_target_defaults_to_current_branch_and_rejects_git_syntax() {
         json!({"branch": "+main"}),
         json!({"branch": "main~1"}),
     ] {
-        assert!(validated_push_target(&params, "main").is_err());
+        assert!(validated_push_target(&push_request(&params), "main").is_err());
     }
-    assert!(validated_push_target(&json!({}), "").is_err());
+    assert!(validated_push_target(&push_request(&json!({})), "").is_err());
 }

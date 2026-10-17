@@ -179,39 +179,6 @@ impl std::fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
-pub fn required_str<'a>(value: &'a Value, key: &str) -> AppResult<&'a str> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| AppError::invalid(format!("Missing or invalid '{key}'")))
-}
-
-pub fn bool_value(value: &Value, key: &str, default: bool) -> bool {
-    value.get(key).and_then(Value::as_bool).unwrap_or(default)
-}
-
-pub fn usize_value(value: &Value, key: &str, default: usize) -> usize {
-    value
-        .get(key)
-        .and_then(Value::as_u64)
-        .map(|v| v as usize)
-        .unwrap_or(default)
-}
-
-pub fn string_list(value: &Value, key: &str) -> Vec<String> {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

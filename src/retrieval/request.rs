@@ -5,9 +5,9 @@ use crate::index::{FilenameQuery, SymbolQuery, TextQuery, TextSyntax};
 use crate::model::{AppError, AppResult};
 use crate::reference_service::{ReferenceQuery, ReferenceScope};
 use crate::symbols::ReferenceKind;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::cell::RefCell;
-use std::collections::BTreeSet;
 
 /// Results returned when an operation does not set `max_results`.
 pub const DEFAULT_MAX_RESULTS: usize = 20;
@@ -17,6 +17,92 @@ pub const DEFAULT_CONTEXT_LINES: usize = 2;
 pub const MAX_CONTEXT_LINES: usize = 20;
 pub const DEFAULT_READ_MAX_CHARS: usize = 30_000;
 pub const MAX_READ_MAX_CHARS: usize = 200_000;
+/// Context lines an exact symbol read may add around the symbol.
+pub const MAX_SURROUNDING_LINES: usize = 200;
+/// The largest integer a JSON number carries exactly.
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+// The published shape of one retrieval operation: every field any operation
+// accepts. `RETRIEVAL_CONTRACTS` narrows it per operation before parsing.
+// Enum-like strings keep their per-field validation (and error codes) in the
+// parser, so the schema lists their values with `extend`. Plain comments only:
+// schemars publishes doc comments as schema descriptions.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetrievalOperationInput {
+    #[schemars(length(min = 1, max = 80))]
+    pub id: Option<String>,
+    #[schemars(extend("enum" = contracts::retrieval_operation_names()))]
+    pub operation: String,
+    #[schemars(
+        length(min = 1),
+        description = "Filename substring or glob for find_file."
+    )]
+    pub name: Option<String>,
+    #[schemars(
+        length(min = 1),
+        description = "Symbol selector for find_symbol or find_references."
+    )]
+    pub symbol: Option<String>,
+    #[schemars(
+        length(min = 1),
+        description = "Literal text or regular expression for search_text."
+    )]
+    pub pattern: Option<String>,
+    #[schemars(extend("enum" = TextSyntax::ALL.map(TextSyntax::as_str), "default" = "literal"))]
+    pub syntax: Option<String>,
+    #[schemars(
+        extend("enum" = READ_TARGETS),
+        description = "Exact target kind for read."
+    )]
+    pub target: Option<String>,
+    #[schemars(length(min = 1), description = "Exact target value for read.")]
+    pub value: Option<String>,
+    #[schemars(
+        description = "Single path for symbols_overview or optional symbol owner path for read."
+    )]
+    pub path: Option<String>,
+    #[schemars(description = "Strict workspace-relative search scope.")]
+    pub paths: Option<Vec<String>>,
+    #[schemars(range(min = 1, max = MAX_SAFE_INTEGER))]
+    pub max_results: Option<usize>,
+    #[schemars(
+        range(min = 0, max = MAX_CONTEXT_LINES),
+        description = "Search-result context lines."
+    )]
+    pub context_lines: Option<usize>,
+    pub case_sensitive: Option<bool>,
+    #[schemars(extend(
+        "enum" = ReferenceScope::ALL.map(ReferenceScope::as_str),
+        "default" = "all"
+    ))]
+    pub reference_scope: Option<String>,
+    #[schemars(extend("items" = {
+        "type": "string",
+        "enum": ReferenceKind::ALL.map(ReferenceKind::as_str)
+    }))]
+    pub reference_kinds: Option<Vec<String>>,
+    pub definition_path: Option<String>,
+    #[schemars(range(min = 1))]
+    pub definition_line: Option<usize>,
+    #[schemars(range(min = 1, max = MAX_SAFE_INTEGER))]
+    pub start_line: Option<usize>,
+    #[schemars(range(min = 1, max = MAX_SAFE_INTEGER))]
+    pub end_line: Option<usize>,
+    #[schemars(
+        range(min = 0, max = MAX_SURROUNDING_LINES),
+        description = "Additional lines around an exact symbol read."
+    )]
+    pub surrounding_lines: Option<usize>,
+    pub include_imports: Option<bool>,
+    #[schemars(range(min = 1, max = MAX_READ_MAX_CHARS))]
+    pub max_chars: Option<usize>,
+    #[schemars(extend(
+        "enum" = ["compact", "standard", "debug"],
+        "default" = "standard"
+    ))]
+    pub response_detail: Option<String>,
+}
 
 /// A validated search operation.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,9 +130,37 @@ pub enum SearchTarget {
     RepoMap,
 }
 
-#[derive(Debug, Clone)]
+/// What an exact `read` returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadTarget {
+    /// A file, optionally narrowed to a line range.
+    Path {
+        path: String,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    },
+    /// The range bound to a `code_retrieve` read handle.
+    Handle(String),
+    /// One symbol declaration, optionally qualified by its file.
+    Symbol {
+        name: String,
+        path: Option<String>,
+        context_lines: usize,
+        include_imports: bool,
+    },
+    /// File metadata without content.
+    Metadata(String),
+    /// A Bash run's status (`bash:` prefix optional).
+    BashStatus(String),
+    /// A Bash run's retained log (`bash-log:` prefix optional).
+    BashLog(String),
+    /// The next page of an earlier read.
+    Continuation(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadOperation {
-    pub item: Value,
+    pub target: ReadTarget,
     pub max_chars: usize,
     pub compact: bool,
 }
@@ -63,91 +177,112 @@ pub fn prepare_retrieval_operation(
     operation: &Map<String, Value>,
 ) -> AppResult<PreparedRetrievalOperation> {
     contracts::validate_retrieval_operation(kind, operation)?;
-    parse_operation(&OperationFields::new(kind, operation))
+    parse_operation(kind, typed_operation(kind, operation)?)
 }
 
-fn parse_operation(fields: &OperationFields<'_>) -> AppResult<PreparedRetrievalOperation> {
-    // `operation` and `id` belong to the batch envelope; search operations
-    // accept `response_detail` without using it.
-    fields.accept_unused(&["operation", "id"]);
-    let search = |target| {
-        Ok(PreparedRetrievalOperation::Search(SearchRequest {
-            target,
-            paths: fields.paths(),
-            max_results: fields.usize("max_results").unwrap_or(DEFAULT_MAX_RESULTS),
-        }))
-    };
-    match fields.kind {
-        "find_file" => {
-            fields.accept_unused(&["context_lines", "response_detail"]);
-            search(SearchTarget::Filename(FilenameQuery {
-                name: fields.required_str("name")?.to_owned(),
-                case_sensitive: fields.case_sensitive(),
-            }))
-        }
-        "find_symbol" => {
-            fields.accept_unused(&["context_lines", "case_sensitive", "response_detail"]);
-            search(SearchTarget::Symbol(SymbolQuery {
-                name: fields.required_str("symbol")?.to_owned(),
-            }))
-        }
+/// Deserialize the operation; a field of the wrong type is an error, never a
+/// default. JSON `null` counts as omitted.
+fn typed_operation(
+    kind: &str,
+    operation: &Map<String, Value>,
+) -> AppResult<RetrievalOperationInput> {
+    let present = operation
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .map(|(field, value)| (field.clone(), value.clone()))
+        .collect::<Map<_, _>>();
+    serde_path_to_error::deserialize(Value::Object(present)).map_err(|error| {
+        let field = error.path().to_string();
+        ErrorCode::InvalidOperationField.error(
+            format!(
+                "retrieval operation field '{field}' is invalid: {}",
+                error.inner()
+            ),
+            json!({"operation": kind, "field": field}),
+        )
+    })
+}
+
+fn parse_operation(
+    kind: &str,
+    input: RetrievalOperationInput,
+) -> AppResult<PreparedRetrievalOperation> {
+    let paths = input.scope_paths();
+    let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS);
+    let context_lines = input
+        .context_lines
+        .unwrap_or(DEFAULT_CONTEXT_LINES)
+        .min(MAX_CONTEXT_LINES);
+    let case_sensitive = input.case_sensitive.unwrap_or(false);
+    // `response_detail` is accepted by search operations without being used.
+    let target = match kind {
+        "find_file" => SearchTarget::Filename(FilenameQuery {
+            name: required("name", input.name)?,
+            case_sensitive,
+        }),
+        "find_symbol" => SearchTarget::Symbol(SymbolQuery {
+            name: required("symbol", input.symbol)?,
+        }),
         "search_text" => {
-            fields.accept_unused(&["response_detail"]);
-            let pattern = fields.required_str("pattern")?.to_owned();
-            let syntax = match fields.str("syntax") {
+            let pattern = required("pattern", input.pattern)?;
+            let syntax = match input.syntax.as_deref() {
                 None => TextSyntax::Literal,
                 Some(value) => TextSyntax::parse(value).ok_or_else(|| {
                     ErrorCode::InvalidOperationField.error(
                         "search_text syntax must be literal or regex",
-                        json!({"operation": fields.kind, "field": "syntax"}),
+                        json!({"operation": kind, "field": "syntax"}),
                     )
                 })?,
             };
-            search(SearchTarget::Text(TextQuery {
+            SearchTarget::Text(TextQuery {
                 pattern,
                 syntax,
-                case_sensitive: fields.case_sensitive(),
-                context_lines: fields.context_lines(),
-            }))
+                case_sensitive,
+                context_lines,
+            })
         }
-        "find_references" => {
-            // References match exact identifiers, so case folding does not apply.
-            fields.accept_unused(&["case_sensitive", "response_detail"]);
-            search(SearchTarget::References(reference_query(fields)?))
-        }
+        // References match exact identifiers, so case folding does not apply.
+        "find_references" => SearchTarget::References(reference_query(input, context_lines)?),
         "symbols_overview" => {
-            fields.accept_unused(&["response_detail"]);
-            if fields.paths().is_empty() {
+            if paths.is_empty() {
                 return Err(AppError::invalid("symbols_overview requires path or paths"));
             }
-            search(SearchTarget::Outline)
+            SearchTarget::Outline
         }
-        "repo_map" => {
-            fields.accept_unused(&["response_detail"]);
-            search(SearchTarget::RepoMap)
+        "repo_map" => SearchTarget::RepoMap,
+        "read" => return read_operation(input).map(PreparedRetrievalOperation::Read),
+        unsupported => {
+            return Err(ErrorCode::UnsupportedRetrievalOperation.error(
+                format!("unsupported retrieval operation '{unsupported}'"),
+                json!({
+                    "operation": unsupported,
+                    "supported": contracts::retrieval_operation_names()
+                }),
+            ))
         }
-        "read" => read_operation(fields).map(PreparedRetrievalOperation::Read),
-        unsupported => Err(ErrorCode::UnsupportedRetrievalOperation.error(
-            format!("unsupported retrieval operation '{unsupported}'"),
-            json!({
-                "operation": unsupported,
-                "supported": contracts::retrieval_operation_names()
-            }),
-        )),
-    }
+    };
+    Ok(PreparedRetrievalOperation::Search(SearchRequest {
+        target,
+        paths,
+        max_results,
+    }))
 }
 
-fn reference_query(fields: &OperationFields<'_>) -> AppResult<ReferenceQuery> {
-    let symbol = fields.required_str("symbol")?.to_owned();
-    let scope = match fields.str("reference_scope") {
+fn reference_query(
+    input: RetrievalOperationInput,
+    context_lines: usize,
+) -> AppResult<ReferenceQuery> {
+    let symbol = required("symbol", input.symbol)?;
+    let scope = match input.reference_scope.as_deref() {
         None => ReferenceScope::All,
         Some(value) => ReferenceScope::parse(value).ok_or_else(|| {
             AppError::invalid("reference_scope must be all, production, or tests")
         })?,
     };
-    let kinds = fields
-        .string_list("reference_kinds")
-        .into_iter()
+    let kinds = input
+        .reference_kinds
+        .unwrap_or_default()
+        .iter()
         .map(|kind| {
             ReferenceKind::parse(kind)
                 .ok_or_else(|| AppError::invalid("reference_kinds contains an unsupported kind"))
@@ -157,126 +292,75 @@ fn reference_query(fields: &OperationFields<'_>) -> AppResult<ReferenceQuery> {
         symbol,
         scope,
         kinds,
-        definition_path: fields.str("definition_path").map(str::to_owned),
-        definition_line: fields.usize("definition_line"),
-        context_lines: fields.context_lines(),
+        definition_path: input.definition_path,
+        definition_line: input.definition_line,
+        context_lines,
     })
 }
 
-fn read_operation(fields: &OperationFields<'_>) -> AppResult<ReadOperation> {
-    let target = fields.required_str("target")?;
-    if !READ_TARGETS.contains(&target) {
-        return Err(AppError::details(
-            "UNSUPPORTED_READ_TARGET",
-            format!("unsupported read target '{target}'"),
-            json!({"target": target, "supported": READ_TARGETS}),
-        ));
-    }
-    let value = fields.required_str("value")?;
-    let mut item = json!({"kind": target, "value": value});
-    for field in ["path", "start_line", "end_line", "include_imports"] {
-        if let Some(value) = fields.get(field) {
-            item[field] = value.clone();
+fn read_operation(input: RetrievalOperationInput) -> AppResult<ReadOperation> {
+    let target = required("target", input.target)?;
+    let value = required("value", input.value)?;
+    let target = match target.as_str() {
+        "path" => ReadTarget::Path {
+            path: value,
+            start_line: input.start_line,
+            end_line: input.end_line,
+        },
+        "handle" => ReadTarget::Handle(value),
+        "symbol" => ReadTarget::Symbol {
+            name: value,
+            path: input.path,
+            context_lines: input
+                .surrounding_lines
+                .unwrap_or(0)
+                .min(MAX_SURROUNDING_LINES),
+            include_imports: input.include_imports.unwrap_or(false),
+        },
+        "metadata" => ReadTarget::Metadata(value),
+        "bash_status" => ReadTarget::BashStatus(value),
+        "bash_log" => ReadTarget::BashLog(value),
+        "continuation" => ReadTarget::Continuation(value),
+        unsupported => {
+            return Err(AppError::details(
+                "UNSUPPORTED_READ_TARGET",
+                format!("unsupported read target '{unsupported}'"),
+                json!({"target": unsupported, "supported": READ_TARGETS}),
+            ))
         }
-    }
-    if let Some(value) = fields.get("surrounding_lines") {
-        item["context_lines"] = value.clone();
-    }
+    };
     Ok(ReadOperation {
-        item,
-        max_chars: fields
-            .usize("max_chars")
+        target,
+        max_chars: input
+            .max_chars
             .unwrap_or(DEFAULT_READ_MAX_CHARS)
             .min(MAX_READ_MAX_CHARS),
-        compact: fields.str("response_detail") == Some("compact"),
+        compact: input.response_detail.as_deref() == Some("compact"),
     })
 }
 
-/// Field access for one operation. Every field the parser reads, or accepts
-/// without using, is recorded so tests can check the parser against the
-/// published contract.
-struct OperationFields<'a> {
-    kind: &'a str,
-    object: &'a Map<String, Value>,
-    consumed: RefCell<BTreeSet<&'static str>>,
+/// A required string field that must not be blank.
+fn required(field: &'static str, value: Option<String>) -> AppResult<String> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ErrorCode::InvalidOperationField.error(
+                format!("retrieval operation field '{field}' must be a non-empty string"),
+                json!({"field": field}),
+            )
+        })
 }
 
-impl<'a> OperationFields<'a> {
-    fn new(kind: &'a str, object: &'a Map<String, Value>) -> Self {
-        Self {
-            kind,
-            object,
-            consumed: RefCell::new(BTreeSet::new()),
-        }
-    }
-
-    fn get(&self, field: &'static str) -> Option<&'a Value> {
-        self.consumed.borrow_mut().insert(field);
-        self.object.get(field)
-    }
-
-    fn accept_unused(&self, fields: &[&'static str]) {
-        self.consumed.borrow_mut().extend(fields);
-    }
-
-    /// A string field; a value of another type counts as absent.
-    fn str(&self, field: &'static str) -> Option<&'a str> {
-        self.get(field).and_then(Value::as_str)
-    }
-
-    /// A non-negative integer field; a value of another type counts as absent.
-    fn usize(&self, field: &'static str) -> Option<usize> {
-        self.get(field)
-            .and_then(Value::as_u64)
-            .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
-    }
-
-    fn required_str(&self, field: &'static str) -> AppResult<&'a str> {
-        self.str(field)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                ErrorCode::InvalidOperationField.error(
-                    format!("retrieval operation field '{field}' must be a non-empty string"),
-                    json!({"field": field}),
-                )
-            })
-    }
-
-    /// The string items of an array field; other items are ignored.
-    fn string_list(&self, field: &'static str) -> Vec<&'a str> {
-        self.get(field)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect()
-    }
-
+impl RetrievalOperationInput {
     /// `paths`, plus `path` when it is not already listed.
-    fn paths(&self) -> Vec<String> {
-        let mut paths: Vec<String> = self
-            .string_list("paths")
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        if let Some(path) = self.str("path") {
-            if !paths.iter().any(|candidate| candidate == path) {
-                paths.push(path.to_owned());
+    fn scope_paths(&self) -> Vec<String> {
+        let mut paths = self.paths.clone().unwrap_or_default();
+        if let Some(path) = &self.path {
+            if !paths.contains(path) {
+                paths.push(path.clone());
             }
         }
         paths
-    }
-
-    fn case_sensitive(&self) -> bool {
-        self.get("case_sensitive")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    fn context_lines(&self) -> usize {
-        self.usize("context_lines")
-            .unwrap_or(DEFAULT_CONTEXT_LINES)
-            .min(MAX_CONTEXT_LINES)
     }
 }
 
@@ -284,6 +368,8 @@ impl<'a> OperationFields<'a> {
 mod tests {
     use super::*;
     use crate::contracts::RETRIEVAL_CONTRACTS;
+    use crate::requests::input_schema;
+    use std::collections::BTreeSet;
 
     fn sample_value(field: &str) -> Value {
         match field {
@@ -304,24 +390,34 @@ mod tests {
     }
 
     #[test]
-    fn parser_consumes_exactly_the_contract_fields() {
+    fn every_operation_parses_with_all_of_its_contract_fields() {
         for contract in RETRIEVAL_CONTRACTS {
             let mut operation: Map<String, Value> = contract
                 .allowed_fields()
                 .map(|field| (field.to_owned(), sample_value(field)))
                 .collect();
             operation.insert("operation".to_owned(), json!(contract.name));
-            let fields = OperationFields::new(contract.name, &operation);
 
-            parse_operation(&fields).unwrap();
-
-            assert_eq!(
-                fields.consumed.into_inner(),
-                contract.allowed_fields().collect::<BTreeSet<_>>(),
-                "operation: {}",
-                contract.name
-            );
+            prepare_retrieval_operation(contract.name, &operation)
+                .unwrap_or_else(|error| panic!("{}: {error}", contract.name));
         }
+    }
+
+    #[test]
+    fn published_operation_fields_are_the_union_of_the_operation_contracts() {
+        let schema = input_schema::<RetrievalOperationInput>();
+        let published = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let contracted = RETRIEVAL_CONTRACTS
+            .iter()
+            .flat_map(|contract| contract.allowed_fields())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(published, contracted);
     }
 
     fn prepare(operation: Value) -> AppResult<PreparedRetrievalOperation> {
@@ -399,6 +495,19 @@ mod tests {
     }
 
     #[test]
+    fn a_field_of_the_wrong_type_is_an_operation_error_not_a_default() {
+        let error = prepare(json!({
+            "operation": "search_text",
+            "pattern": "needle",
+            "max_results": "5"
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.0.code, "INVALID_OPERATION_FIELD");
+        assert_eq!(error.0.details.unwrap()["field"], "max_results");
+    }
+
+    #[test]
     fn read_clamps_max_chars_and_maps_surrounding_lines() {
         let PreparedRetrievalOperation::Read(read) = prepare(json!({
             "operation": "read",
@@ -413,10 +522,17 @@ mod tests {
         };
 
         assert_eq!(
-            read.item,
-            json!({"kind": "symbol", "value": "run", "context_lines": 4})
+            read,
+            ReadOperation {
+                target: ReadTarget::Symbol {
+                    name: "run".to_owned(),
+                    path: None,
+                    context_lines: 4,
+                    include_imports: false,
+                },
+                max_chars: 200_000,
+                compact: true,
+            }
         );
-        assert_eq!(read.max_chars, 200_000);
-        assert!(read.compact);
     }
 }

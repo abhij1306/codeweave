@@ -26,12 +26,17 @@ async fn git_restore_waits_while_an_edit_holds_the_mutation_permit() {
         let actor = Arc::clone(&actor);
         async move {
             actor
-                .git(&json!({"action": "restore", "paths": ["value.rs"], "confirm": true}))
+                .git(git_action(
+                    &json!({"action": "restore", "paths": ["value.rs"], "confirm": true}),
+                ))
                 .await
         }
     });
     // Non-mutating Git actions do not wait for the permit.
-    let status = actor.git(&json!({"action": "status"})).await.unwrap();
+    let status = actor
+        .git(git_action(&json!({"action": "status"})))
+        .await
+        .unwrap();
     assert_eq!(status["status"]["dirty_files"], json!(["value.rs"]));
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!restore.is_finished());
@@ -73,18 +78,18 @@ async fn refresh_status_through(actor: &Arc<Workspace>, site: &str, round: usize
             actor.summary().unwrap();
         }
         "git status" => {
-            let _ = actor.git(&json!({"action": "status"})).await;
+            let _ = actor.git(git_action(&json!({"action": "status"}))).await;
         }
         "git preflight" => {
-            let _ = actor.git(&json!({"action": "preflight"})).await;
+            let _ = actor.git(git_action(&json!({"action": "preflight"}))).await;
         }
         "edit commit" => {
             actor
-                .code_edit(&json!({"changes": [{
+                .code_edit(edit_request(&json!({"changes": [{
                     "kind": "create",
                     "path": format!("edited_{round}.rs"),
                     "content": "fn edited() {}\n"
-                }]}))
+                }]})))
                 .await
                 .unwrap();
         }
@@ -141,17 +146,24 @@ async fn failed_git_status_is_reported_by_status_and_by_stage_responses() {
     let actor = test_actor_with_repository(root.path(), Arc::clone(&repository));
     repository.fail();
 
-    let error = actor.git(&json!({"action": "status"})).await.unwrap_err();
+    let error = actor
+        .git(git_action(&json!({"action": "status"})))
+        .await
+        .unwrap_err();
     assert_eq!(error.0.code, "GIT_FAILED");
     let staged = actor
-        .git(&json!({"action": "stage", "paths": ["initial.rs"]}))
+        .git(git_action(
+            &json!({"action": "stage", "paths": ["initial.rs"]}),
+        ))
         .await
         .unwrap();
     assert_eq!(staged["repo_status_stale"], true);
 
     repository.succeed_with(status_on("initial"));
     let staged = actor
-        .git(&json!({"action": "stage", "paths": ["initial.rs"]}))
+        .git(git_action(
+            &json!({"action": "stage", "paths": ["initial.rs"]}),
+        ))
         .await
         .unwrap();
     assert!(staged.get("repo_status_stale").is_none());
@@ -206,11 +218,11 @@ async fn edit_response_reports_the_stamp_the_state_published() {
     let before = actor.state.read().stamp();
 
     let response = actor
-        .code_edit(&json!({"changes": [{
+        .code_edit(edit_request(&json!({"changes": [{
             "kind": "create",
             "path": "created.rs",
             "content": "fn created() {}\n"
-        }]}))
+        }]})))
         .await
         .unwrap();
 

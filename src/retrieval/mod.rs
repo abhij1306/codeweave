@@ -5,9 +5,10 @@ mod request;
 
 pub use crate::contracts::{MAX_RETRIEVAL_OPERATIONS, READ_TARGETS};
 pub use request::{
-    prepare_retrieval_operation, PreparedRetrievalOperation, ReadOperation, SearchRequest,
-    SearchTarget, DEFAULT_CONTEXT_LINES, DEFAULT_MAX_RESULTS, DEFAULT_READ_MAX_CHARS,
-    MAX_CONTEXT_LINES, MAX_READ_MAX_CHARS, PROTOCOL_MAX_RESULTS,
+    prepare_retrieval_operation, PreparedRetrievalOperation, ReadOperation, ReadTarget,
+    RetrievalOperationInput, SearchRequest, SearchTarget, DEFAULT_CONTEXT_LINES,
+    DEFAULT_MAX_RESULTS, DEFAULT_READ_MAX_CHARS, MAX_CONTEXT_LINES, MAX_READ_MAX_CHARS,
+    MAX_SURROUNDING_LINES, PROTOCOL_MAX_RESULTS,
 };
 
 use crate::index::{CodeIndex, SearchScope};

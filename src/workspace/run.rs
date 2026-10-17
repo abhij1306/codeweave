@@ -1,42 +1,27 @@
 use super::state::RunWindow;
 use super::*;
 use crate::bash::{ChangeBaseline, FrozenChanges, RunStatus};
+use crate::requests::bash::BashRequest;
 
 impl Workspace {
-    pub async fn run(self: &Arc<Self>, params: &Value) -> AppResult<Value> {
+    pub async fn run(self: &Arc<Self>, request: BashRequest) -> AppResult<Value> {
         let started = Instant::now();
-        let action = params
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("start");
         // Run polls (status/output/cancel) never mutate the tree themselves, so a
         // pre-action reconcile only adds latency to a hot loop. Reconcile before
         // `start` (which may depend on a fresh view) and defer poll reconciles to the
         // debounced pass after the action completes.
-        let is_poll = matches!(action, "status" | "output" | "cancel");
+        let is_poll = request.is_poll();
         let reconcile_started = Instant::now();
         if !is_poll {
             self.reconcile_pending_async().await?;
         }
         let reconcile_before_ms = reconcile_started.elapsed().as_millis();
         let mut run_startup_ms = None;
-        let mut result = match action {
-            "start" => {
+        let mut result = match request {
+            BashRequest::Start(start) => {
                 let baseline = self.change_baseline();
-                let command = required_str(params, "command")?.to_owned();
                 let run_started = Instant::now();
-                let value = self
-                    .bash
-                    .start(
-                        &self.root,
-                        StartRequest {
-                            command,
-                            cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
-                            background: params.get("background").and_then(Value::as_bool),
-                            timeout_ms: params.get("timeout_ms").and_then(Value::as_u64),
-                        },
-                    )
-                    .await?;
+                let value = self.bash.start(&self.root, start).await?;
                 run_startup_ms = Some(run_started.elapsed().as_millis());
                 if let Some(run_id) = value.get("run_id").and_then(Value::as_str) {
                     self.bash.set_change_baseline(run_id, baseline);
@@ -45,20 +30,15 @@ impl Workspace {
             }
             // Status, output and cancel only read or signal in-memory state and
             // never block, so they run inline.
-            "status" => self.bash.status(required_str(params, "run_id")?)?,
-            "output" => self.bash.output_stream(
-                required_str(params, "run_id")?,
-                params.get("continuation").and_then(Value::as_str),
-                params.get("stream").and_then(Value::as_str),
-            )?,
-            "cancel" => self.bash.cancel(required_str(params, "run_id")?)?,
-            other => {
-                return Err(AppError::details(
-                    "INVALID_RUN_ACTION",
-                    "Unknown run action",
-                    json!({"action": other}),
-                ))
-            }
+            BashRequest::Status { run_id } => self.bash.status(&run_id)?,
+            BashRequest::Output {
+                run_id,
+                stream,
+                continuation,
+            } => self
+                .bash
+                .output_stream(&run_id, continuation.as_deref(), stream)?,
+            BashRequest::Cancel { run_id } => self.bash.cancel(&run_id)?,
         };
         let terminal = result
             .get("status")

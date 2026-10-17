@@ -515,10 +515,8 @@ impl BashSupervisor {
         &self,
         run_id: &str,
         continuation: Option<&str>,
-        requested_stream: Option<&str>,
+        stream: OutputStream,
     ) -> AppResult<serde_json::Value> {
-        let stream = OutputStream::parse(requested_stream)
-            .map_err(|error| AppError::invalid(error.to_string()))?;
         let record = self.runs.get(run_id)?;
         let record = record.lock();
         let buffer = record.output().stream(stream);

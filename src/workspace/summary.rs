@@ -1,19 +1,11 @@
 use super::*;
 
 impl Workspace {
-    /// Lightweight alternative to `summary()` for the warm-path auto-open in
-    /// `prepare()`. Returns only the identifiers that `prepare()` mines from
-    /// the full summary (workspace_id, snapshot_id, generation) without
-    /// iterating mutations, cloning dirty sets, or calling
-    /// `summarize_changed_paths`.
-    pub fn summary_ids(&self) -> AppResult<Value> {
+    /// The current snapshot id after reconciling pending watcher paths: the
+    /// precondition an edit without its own `snapshot_id` is planned against.
+    pub fn snapshot_id(&self) -> AppResult<String> {
         self.reconcile_pending()?;
-        let stamp = self.state.read().stamp();
-        Ok(json!({
-            "workspace_id": self.id,
-            "snapshot_id": stamp.snapshot_id,
-            "generation": stamp.generation,
-        }))
+        Ok(self.state.read().stamp().snapshot_id)
     }
 
     pub fn diagnostics(&self) -> AppResult<Value> {
@@ -204,18 +196,22 @@ impl Workspace {
         )
     }
 
-    pub fn changes(&self, params: &Value) -> AppResult<Value> {
+    /// Mutation records newer than `since_generation`, optionally from one
+    /// `source`, at most `limit` of them.
+    pub fn changes(
+        &self,
+        since_generation: u64,
+        source: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Value> {
         let started = Instant::now();
         let reconcile_started = Instant::now();
         self.reconcile_pending()?;
         let reconcile_ms = reconcile_started.elapsed().as_millis();
-        let since = params
-            .get("since_generation")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let source = params.get("source").and_then(Value::as_str);
-        let limit = usize_value(params, "limit", 200).min(2_000);
-        let records = self.state.ledger().records_since(since, source, limit);
+        let records = self
+            .state
+            .ledger()
+            .records_since(since_generation, source, limit);
         let stamp = self.state.read().stamp();
         let mut result = json!({
             "workspace_id": self.id,

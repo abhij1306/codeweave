@@ -5,6 +5,7 @@ use super::protocol::PositionEncoding;
 use super::session::ResultFiles;
 use crate::index::content_hash;
 use crate::model::{AppError, AppResult};
+use crate::requests::edit::Change;
 use serde_json::{json, Value};
 
 /// One file's complete before/after text, guarded by the hash of `old_text`.
@@ -28,15 +29,18 @@ impl RenameChange {
             "expected_hash": self.expected_hash
         })
     }
-}
 
-/// The `code_edit` preview request for `changes` at `snapshot_id`.
-pub(crate) fn preview_request(changes: &[RenameChange], snapshot_id: Value) -> Value {
-    json!({
-        "preview": true,
-        "changes": changes.iter().map(RenameChange::to_json).collect::<Vec<_>>(),
-        "snapshot_id": snapshot_id
-    })
+    /// The same change as a typed edit-engine change.
+    pub(crate) fn to_change(&self) -> Change {
+        Change::Replace {
+            path: self.path.clone(),
+            old_text: self.old_text.clone(),
+            new_text: self.new_text.clone(),
+            expected_replacements: 1,
+            expected_hash: Some(self.expected_hash.clone()),
+            handle: None,
+        }
+    }
 }
 
 fn invalid_edit(message: &str) -> AppError {

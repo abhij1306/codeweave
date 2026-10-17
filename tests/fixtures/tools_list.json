@@ -1,0 +1,1496 @@
+[
+  {
+    "name": "workspace",
+    "title": "Workspace",
+    "description": "View this server's repository summary or process-local changes, refresh its index, or inspect diagnostics. The repository is fixed for the server's lifetime.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "default": "summary",
+          "type": "string",
+          "enum": [
+            "summary",
+            "refresh",
+            "changes",
+            "diagnostics"
+          ]
+        },
+        "force": {
+          "type": "boolean"
+        },
+        "since_generation": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For action=changes, return only mutations with a generation greater than this value."
+        },
+        "source": {
+          "type": "string",
+          "description": "For action=changes, return only mutations from this source."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2000,
+          "default": 200,
+          "description": "Maximum number of mutations returned by action=changes."
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "code_retrieve",
+    "title": "Code Retrieval",
+    "description": "Use this single tool for all repository discovery and exact reads. Submit one or more explicit operations: find_file, find_symbol, search_text, find_references, symbols_overview, repo_map, or read.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              },
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "find_file",
+                  "find_symbol",
+                  "search_text",
+                  "find_references",
+                  "symbols_overview",
+                  "repo_map",
+                  "read"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Filename substring or glob for find_file."
+              },
+              "symbol": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Symbol selector for find_symbol or find_references."
+              },
+              "pattern": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Literal text or regular expression for search_text."
+              },
+              "syntax": {
+                "type": "string",
+                "enum": [
+                  "literal",
+                  "regex"
+                ],
+                "default": "literal"
+              },
+              "target": {
+                "type": "string",
+                "enum": [
+                  "path",
+                  "handle",
+                  "symbol",
+                  "metadata",
+                  "bash_status",
+                  "bash_log",
+                  "continuation"
+                ],
+                "description": "Exact target kind for read."
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact target value for read."
+              },
+              "path": {
+                "type": "string",
+                "description": "Single path for symbols_overview or optional symbol owner path for read."
+              },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Strict workspace-relative search scope."
+              },
+              "max_results": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "context_lines": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 20,
+                "description": "Search-result context lines."
+              },
+              "case_sensitive": {
+                "type": "boolean"
+              },
+              "reference_scope": {
+                "type": "string",
+                "enum": [
+                  "all",
+                  "production",
+                  "tests"
+                ],
+                "default": "all"
+              },
+              "reference_kinds": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "declaration",
+                    "call",
+                    "import",
+                    "type",
+                    "read",
+                    "write",
+                    "other"
+                  ]
+                }
+              },
+              "definition_path": {
+                "type": "string"
+              },
+              "definition_line": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "start_line": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "end_line": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "surrounding_lines": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 200,
+                "description": "Additional lines around an exact symbol read."
+              },
+              "include_imports": {
+                "type": "boolean"
+              },
+              "max_chars": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200000
+              },
+              "response_detail": {
+                "type": "string",
+                "enum": [
+                  "compact",
+                  "standard",
+                  "debug"
+                ],
+                "default": "standard"
+              }
+            },
+            "required": [
+              "operation"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "fail_fast": {
+          "type": "boolean",
+          "default": false
+        },
+        "snapshot_id": {
+          "type": "string",
+          "description": "Optional workspace snapshot precondition for the complete retrieval batch."
+        }
+      },
+      "required": [
+        "operations"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "code_intelligence",
+    "title": "Code Intelligence",
+    "description": "Resolve definitions, references, diagnostics, or a rename preview through the optional semantic backend. Results always label semantic, syntactic, or lexical evidence.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": [
+            "definition",
+            "references",
+            "diagnostics",
+            "rename_preview"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "One-based line number."
+        },
+        "column": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based UTF-16 code-unit offset within the line; CodeWeave converts it to the server's negotiated position encoding."
+        },
+        "new_name": {
+          "type": "string"
+        },
+        "max_results": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 20,
+          "description": "Maximum references or diagnostics returned. Diagnostics also report total_count, result_count, and truncated."
+        }
+      },
+      "required": [
+        "operation"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "code_write",
+    "title": "Write One File",
+    "description": "Create or overwrite exactly one file. Use expected_hash when replacing an existing file.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "overwrite": {
+          "type": "boolean",
+          "default": true
+        },
+        "expected_hash": {
+          "type": "string"
+        },
+        "validate": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Post-apply validation commands. The edit remains applied if a command fails; long-running validation may continue in the background."
+        },
+        "response_detail": {
+          "type": "string",
+          "enum": [
+            "compact",
+            "standard",
+            "debug"
+          ],
+          "default": "standard"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "code_replace",
+    "title": "Replace Text in One File",
+    "description": "Replace exact text in exactly one file. The replacement count is checked before writing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "old_text": {
+          "type": "string"
+        },
+        "new_text": {
+          "type": "string",
+          "description": "Replacement text. When replacing text that ends with a terminal newline, omitting that newline here preserves it from the selected text or range."
+        },
+        "expected_replacements": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        },
+        "expected_hash": {
+          "type": "string"
+        },
+        "handle": {
+          "type": "string",
+          "description": "Optional fresh range handle returned by a code_retrieve read. It scopes the exact-text match to the fetched range and binds the workspace, path, and content hash. A handle-based change must be the only change for its file in one transaction; combining it with another change for that file is rejected as ambiguous."
+        },
+        "validate": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Post-apply validation commands. The edit remains applied if a command fails; long-running validation may continue in the background."
+        },
+        "response_detail": {
+          "type": "string",
+          "enum": [
+            "compact",
+            "standard",
+            "debug"
+          ],
+          "default": "standard"
+        }
+      },
+      "required": [
+        "path",
+        "old_text",
+        "new_text"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "code_replace_range",
+    "title": "Replace Fetched Range in One File",
+    "description": "Replace the complete line range selected by a code_retrieve read handle in exactly one file.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "handle": {
+          "type": "string",
+          "description": "Fresh range handle returned by a code_retrieve read. It binds the workspace, path, line range, and content hash. A handle-based change must be the only change for its file in one transaction; combining it with another change for that file is rejected as ambiguous."
+        },
+        "new_text": {
+          "type": "string",
+          "description": "Replacement text. When replacing text that ends with a terminal newline, omitting that newline here preserves it from the selected text or range."
+        },
+        "validate": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Post-apply validation commands. The edit remains applied if a command fails; long-running validation may continue in the background."
+        },
+        "response_detail": {
+          "type": "string",
+          "enum": [
+            "compact",
+            "standard",
+            "debug"
+          ],
+          "default": "standard"
+        }
+      },
+      "required": [
+        "path",
+        "handle",
+        "new_text"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "code_insert",
+    "title": "Insert Text in One File",
+    "description": "Insert text before, after, or inside one named symbol in exactly one file.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "anchor_symbol": {
+          "type": "string"
+        },
+        "position": {
+          "type": "string",
+          "enum": [
+            "before",
+            "after",
+            "inside_start",
+            "inside_end"
+          ]
+        },
+        "expected_hash": {
+          "type": "string"
+        },
+        "validate": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Post-apply validation commands. The edit remains applied if a command fails; long-running validation may continue in the background."
+        },
+        "response_detail": {
+          "type": "string",
+          "enum": [
+            "compact",
+            "standard",
+            "debug"
+          ],
+          "default": "standard"
+        }
+      },
+      "required": [
+        "path",
+        "content",
+        "anchor_symbol",
+        "position"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "code_delete",
+    "title": "Delete One File",
+    "description": "Delete exactly one file with an optional content-hash precondition.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "expected_hash": {
+          "type": "string"
+        },
+        "validate": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Post-apply validation commands. The edit remains applied if a command fails; long-running validation may continue in the background."
+        },
+        "response_detail": {
+          "type": "string",
+          "enum": [
+            "compact",
+            "standard",
+            "debug"
+          ],
+          "default": "standard"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "code_rename",
+    "title": "Rename One File",
+    "description": "Rename exactly one file with an optional content-hash precondition.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        },
+        "expected_hash": {
+          "type": "string"
+        },
+        "validate": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Post-apply validation commands. The edit remains applied if a command fails; long-running validation may continue in the background."
+        },
+        "response_detail": {
+          "type": "string",
+          "enum": [
+            "compact",
+            "standard",
+            "debug"
+          ],
+          "default": "standard"
+        }
+      },
+      "required": [
+        "path",
+        "to"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "code_preview",
+    "title": "Preview Code Transaction",
+    "description": "Preview a multi-file edit transaction and return the diff without writing files.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "changes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "One operation-specific edit change. Select the branch whose kind matches the requested operation.",
+            "oneOf": [
+              {
+                "type": "object",
+                "title": "Create change",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "create"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "content": {
+                    "type": "string"
+                  },
+                  "overwrite": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "expected_hash": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "content"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "title": "Replace change",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "replace"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "old_text": {
+                    "type": "string"
+                  },
+                  "new_text": {
+                    "type": "string",
+                    "description": "Replacement text. When replacing text that ends with a terminal newline, omitting that newline here preserves it from the selected text or range."
+                  },
+                  "expected_replacements": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1
+                  },
+                  "expected_hash": {
+                    "type": "string"
+                  },
+                  "handle": {
+                    "type": "string",
+                    "description": "Optional fresh range handle returned by a code_retrieve read. It scopes the exact-text match to the fetched range and binds the workspace, path, and content hash. A handle-based change must be the only change for its file in one transaction; combining it with another change for that file is rejected as ambiguous."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "old_text",
+                  "new_text"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "title": "Replace range change",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "replace_range"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "handle": {
+                    "type": "string",
+                    "description": "Fresh range handle returned by a code_retrieve read. It binds the workspace, path, line range, and content hash. A handle-based change must be the only change for its file in one transaction; combining it with another change for that file is rejected as ambiguous."
+                  },
+                  "new_text": {
+                    "type": "string",
+                    "description": "Replacement text. When replacing text that ends with a terminal newline, omitting that newline here preserves it from the selected text or range."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "handle",
+                  "new_text"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "title": "Insert change",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "insert"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "content": {
+                    "type": "string"
+                  },
+                  "anchor_symbol": {
+                    "type": "string"
+                  },
+                  "position": {
+                    "type": "string",
+                    "enum": [
+                      "before",
+                      "after",
+                      "inside_start",
+                      "inside_end"
+                    ]
+                  },
+                  "expected_hash": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "content",
+                  "anchor_symbol",
+                  "position"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "title": "Delete change",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "delete"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "expected_hash": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "title": "Rename change",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "rename"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "string"
+                  },
+                  "expected_hash": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "to"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "snapshot_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "changes"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "code_transaction",
+    "title": "Apply Code Transaction",
+    "description": "Apply a multi-file edit transaction through the same precondition, non-destructive validation reporting, diff, and internal atomic-recovery engine as the narrow write tools.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "changes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "One operation-specific edit change. Select the branch whose kind matches the requested operation.",
+            "oneOf": [
+              {
+                "type": "object",
+                "title": "Create change",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "create"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "content": {
+                    "type": "string"
+                  },
+                  "overwrite": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "expected_hash": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "content"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "title": "Replace change",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "replace"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "old_text": {
+                    "type": "string"
+                  },
+                  "new_text": {
+                    "type": "string",
+                    "description": "Replacement text. When replacing text that ends with a terminal newline, omitting that newline here preserves it from the selected text or range."
+                  },
+                  "expected_replacements": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1
+                  },
+                  "expected_hash": {
+                    "type": "string"
+                  },
+                  "handle": {
+                    "type": "string",
+                    "description": "Optional fresh range handle returned by a code_retrieve read. It scopes the exact-text match to the fetched range and binds the workspace, path, and content hash. A handle-based change must be the only change for its file in one transaction; combining it with another change for that file is rejected as ambiguous."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "old_text",
+                  "new_text"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "title": "Replace range change",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "replace_range"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "handle": {
+                    "type": "string",
+                    "description": "Fresh range handle returned by a code_retrieve read. It binds the workspace, path, line range, and content hash. A handle-based change must be the only change for its file in one transaction; combining it with another change for that file is rejected as ambiguous."
+                  },
+                  "new_text": {
+                    "type": "string",
+                    "description": "Replacement text. When replacing text that ends with a terminal newline, omitting that newline here preserves it from the selected text or range."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "handle",
+                  "new_text"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "title": "Insert change",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "insert"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "content": {
+                    "type": "string"
+                  },
+                  "anchor_symbol": {
+                    "type": "string"
+                  },
+                  "position": {
+                    "type": "string",
+                    "enum": [
+                      "before",
+                      "after",
+                      "inside_start",
+                      "inside_end"
+                    ]
+                  },
+                  "expected_hash": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "content",
+                  "anchor_symbol",
+                  "position"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "title": "Delete change",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "delete"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "expected_hash": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "title": "Rename change",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "rename"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "string"
+                  },
+                  "expected_hash": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "to"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "snapshot_id": {
+          "type": "string"
+        },
+        "validate": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Post-apply validation commands. The edit remains applied if a command fails; long-running validation may continue in the background."
+        },
+        "response_detail": {
+          "type": "string",
+          "enum": [
+            "compact",
+            "standard",
+            "debug"
+          ],
+          "default": "standard",
+          "description": "compact omits the unified diff and returns diff_stat only; standard caps the diff to bound payload size; debug returns the full diff."
+        }
+      },
+      "required": [
+        "changes"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "git_status",
+    "title": "Git Status",
+    "description": "Show the working tree status: staged, unstaged, untracked, and partially staged files.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "git_diff",
+    "title": "Git Diff",
+    "description": "Show the diff for the working tree or, with staged=true, the staged index. Limit to specific paths when given.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "staged": {
+          "type": "boolean",
+          "default": false
+        },
+        "max_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200000
+        },
+        "start_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "hunk_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "continuation": {
+          "type": "string",
+          "description": "Snapshot- and scope-bound continuation returned by a truncated git_diff response. Reuses the original paths, staged mode, symbol/line focus, and hunk IDs."
+        }
+      },
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "git_log",
+    "title": "Git Log",
+    "description": "Show recent commit history.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 20
+        }
+      },
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "git_show",
+    "title": "Git Show",
+    "description": "Show the patch for one commit ref (default HEAD).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "default": "HEAD"
+        },
+        "max_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200000
+        }
+      },
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "git_blame",
+    "title": "Git Blame",
+    "description": "Show line-by-line authorship for one path, optionally bounded by start_line and end_line.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "start_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200000
+        }
+      },
+      "required": [
+        "paths"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "git_preflight",
+    "title": "Git Preflight",
+    "description": "Return staged_files, partially_staged_files, and the cached staged diff without committing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "git_stage",
+    "title": "Git Stage",
+    "description": "Stage the given paths into the index.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "paths"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "git_commit",
+    "title": "Git Commit",
+    "description": "Commit the currently staged changes with the given message.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "git_restore",
+    "title": "Git Restore",
+    "description": "Discard changes for the given paths, restoring them from the index or HEAD. Requires confirm=true because it overwrites local changes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "staged": {
+          "type": "boolean",
+          "default": false
+        },
+        "confirm": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "paths",
+        "confirm"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "git_push",
+    "title": "Git Push",
+    "description": "Push commits to a remote (default origin) and optional branch. This reaches the network and requires confirm=true, matching git_restore, because it is the only network-facing write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "remote": {
+          "type": "string",
+          "description": "Push remote name (default: origin)"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Branch to push (default: current branch)"
+        },
+        "confirm": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "confirm"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "bash",
+    "title": "Run Bash Command",
+    "description": "Run one Bash process as the CodeWeave OS user. This is trusted-client functionality, not a sandbox. Commands exceeding the foreground budget continue as the same background run; poll bash_status with its run_id instead of reissuing the command. Output is bounded and timeout terminates the process tree.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Command string passed to the configured Bash executable with -c."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Existing workspace-relative directory. Defaults to the workspace root."
+        },
+        "background": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run detached and return immediately with a run_id to poll."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-run timeout in ms (<= maxTimeoutMs). The command is killed if it exceeds this; the foreground budget only detaches, it does not kill."
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "bash_status",
+    "title": "Bash Run Status",
+    "description": "Return live or completed state and the retained output tail for a Bash run, including how many prefix characters were discarded.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "bash_output",
+    "title": "Bash Run Output",
+    "description": "Page retained combined, stdout, or stderr output for a Bash run. Continuations cover only the bounded tail; retention metadata reports any discarded prefix.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stream": {
+          "type": "string",
+          "enum": [
+            "combined",
+            "stdout",
+            "stderr"
+          ]
+        },
+        "continuation": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "bash_cancel",
+    "title": "Cancel Bash Run",
+    "description": "Cancel a running background Bash run. Partial output is retained.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  }
+]

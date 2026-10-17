@@ -1,7 +1,8 @@
 use crate::index::ignored_workspace_path;
 use crate::model::{AppError, AppResult};
+use crate::requests::edit::Change;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 pub(super) fn line_range_bytes(
@@ -119,29 +120,21 @@ pub(super) fn stale_snapshot_for_paths(expected: &str, actual: &str, paths: &[St
     )
 }
 
-pub(super) fn changes_without_independent_preconditions(changes: &[Value]) -> Vec<String> {
+/// Paths whose change relies only on the snapshot precondition: everything
+/// except a new-file create and changes carrying a hash or handle.
+pub(super) fn changes_without_independent_preconditions(changes: &[Change]) -> Vec<String> {
     changes
         .iter()
         .filter_map(|change| {
-            let kind = change
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let path = change
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("<unknown>");
-            let new_create = kind == "create"
-                && !change
-                    .get("overwrite")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-            let has_precondition = change
-                .get("expected_hash")
-                .and_then(Value::as_str)
-                .is_some()
-                || change.get("handle").and_then(Value::as_str).is_some();
-            (!new_create && !has_precondition).then(|| path.to_owned())
+            let new_create = matches!(
+                change,
+                Change::Create {
+                    overwrite: false,
+                    ..
+                }
+            );
+            let has_precondition = change.expected_hash().is_some() || change.handle().is_some();
+            (!new_create && !has_precondition).then(|| change.path().to_owned())
         })
         .collect()
 }

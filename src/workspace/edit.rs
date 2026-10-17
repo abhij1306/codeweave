@@ -8,9 +8,9 @@ use super::util::{
 };
 use super::validation::ValidationOutcome;
 use super::Workspace;
-use crate::contracts;
 use crate::index::{content_hash, decode_handle, CodeIndex};
-use crate::model::{bool_value, required_str, string_list, usize_value, AppError, AppResult};
+use crate::model::{AppError, AppResult};
+use crate::requests::edit::{Change, EditRequest, InsertPosition, ResponseDetail};
 use crate::security::validate_relative;
 use crate::symbols::{extract_symbols, parse_has_error};
 use serde_json::{json, Value};
@@ -56,7 +56,7 @@ impl DiffView {
     /// Build the view for the successful/applied response paths. `compact` drops the
     /// unified diff and keeps only the per-file stat; `debug` returns it in full;
     /// `standard` (the default) caps it at `max_context_chars` to bound payload size.
-    fn build(diff: &str, planned: &[PlannedFile], detail: &str, cap: usize) -> Self {
+    fn build(diff: &str, planned: &[PlannedFile], detail: ResponseDetail, cap: usize) -> Self {
         let stat = json!(diff_stat(planned)
             .into_iter()
             .map(|(path, added, removed)| json!({
@@ -66,13 +66,13 @@ impl DiffView {
             }))
             .collect::<Vec<_>>());
         match detail {
-            "compact" => Self {
+            ResponseDetail::Compact => Self {
                 diff: Value::Null,
                 stat,
                 truncated: false,
                 omitted: true,
             },
-            "debug" => Self {
+            ResponseDetail::Debug => Self {
                 diff: json!(diff),
                 stat,
                 truncated: false,
@@ -103,8 +103,9 @@ impl DiffView {
 }
 
 impl Workspace {
-    pub async fn code_edit(self: &Arc<Self>, params: &Value) -> AppResult<Value> {
-        let validate = string_list(params, "validate");
+    pub async fn code_edit(self: &Arc<Self>, request: EditRequest) -> AppResult<Value> {
+        let validate = request.validate.clone();
+        let detail = request.response_detail;
         if !validate.is_empty() {
             self.bash.ensure_available()?;
         }
@@ -112,12 +113,10 @@ impl Workspace {
         // action cannot change the edited files while their validation runs.
         let permit = self.state.exclusive().await;
         let actor = Arc::clone(self);
-        let params_owned = params.clone();
         let prepare_started = Instant::now();
-        let prepared =
-            tokio::task::spawn_blocking(move || actor.prepare_edit(&params_owned, permit))
-                .await
-                .map_err(AppError::internal)??;
+        let prepared = tokio::task::spawn_blocking(move || actor.prepare_edit(&request, permit))
+            .await
+            .map_err(AppError::internal)??;
         let prepare_ms = prepare_started.elapsed().as_millis();
 
         let applied = match prepared {
@@ -138,10 +137,6 @@ impl Workspace {
         // Shape the diff payload by response_detail. `standard` (default) caps the
         // unified diff so a large edit cannot balloon the response; the per-file stat
         // is always returned.
-        let detail = params
-            .get("response_detail")
-            .and_then(Value::as_str)
-            .unwrap_or("standard");
         let diff_view = DiffView::build(&diff, &planned, detail, self.policy.max_context_chars);
         let DiffView {
             diff: diff_value,
@@ -234,24 +229,19 @@ impl Workspace {
         Ok(response)
     }
 
-    fn prepare_edit(&self, params: &Value, permit: MutationPermit) -> AppResult<PreparedEdit> {
+    fn prepare_edit(
+        &self,
+        request: &EditRequest,
+        permit: MutationPermit,
+    ) -> AppResult<PreparedEdit> {
         let mut writer = self.state.writer();
         self.reconcile_with(&mut writer)?;
         let stamp = writer.read().stamp();
         let current_snapshot = stamp.snapshot_id;
-        let requested_snapshot = params
-            .get("snapshot_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let changes = params
-            .get("changes")
-            .and_then(Value::as_array)
-            .ok_or_else(|| AppError::invalid("changes must be an array"))?;
+        let requested_snapshot = request.snapshot_id.clone();
+        let changes = &request.changes;
         if changes.is_empty() {
             return Err(AppError::invalid("changes cannot be empty"));
-        }
-        for change in changes {
-            contracts::validate_change(change)?;
         }
         let snapshot_matches = requested_snapshot
             .as_deref()
@@ -310,7 +300,7 @@ impl Workspace {
         }
         let diff = render_diff(&planned);
         let snapshot_rebased_from = requested_snapshot.filter(|_| !snapshot_matches);
-        if bool_value(params, "preview", false) {
+        if request.preview {
             return Ok(PreparedEdit::Preview(json!({
                 "preview": true,
                 "workspace_id": self.id,
@@ -338,16 +328,14 @@ impl Workspace {
         }))
     }
 
-    fn preflight_overlaps(&self, changes: &[Value], index: &CodeIndex) -> AppResult<()> {
+    fn preflight_overlaps(&self, changes: &[Change], index: &CodeIndex) -> AppResult<()> {
         let mut change_counts = HashMap::<String, usize>::new();
         let mut handle_paths = HashSet::new();
         for change in changes {
-            if let Some(path) = change.get("path").and_then(Value::as_str) {
-                let path = path.replace('\\', "/");
-                *change_counts.entry(path.clone()).or_default() += 1;
-                if change.get("handle").and_then(Value::as_str).is_some() {
-                    handle_paths.insert(path);
-                }
+            let path = change.path().replace('\\', "/");
+            *change_counts.entry(path.clone()).or_default() += 1;
+            if change.handle().is_some() {
+                handle_paths.insert(path);
             }
         }
         if let Some(path) = handle_paths
@@ -366,14 +354,18 @@ impl Workspace {
 
         let mut ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
         for change in changes {
-            let kind = change
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !matches!(kind, "replace" | "replace_range") {
-                continue;
-            }
-            let path = required_str(change, "path")?.replace('\\', "/");
+            // Exact replacements carry their expected match; a range replaces
+            // the whole handle range.
+            let exact = match change {
+                Change::Replace {
+                    old_text,
+                    expected_replacements,
+                    ..
+                } => Some((old_text.as_str(), *expected_replacements)),
+                Change::ReplaceRange { .. } => None,
+                _ => continue,
+            };
+            let path = change.path().replace('\\', "/");
             let content = index
                 .get(&path)
                 .ok_or_else(|| {
@@ -384,11 +376,7 @@ impl Workspace {
                     )
                 })?
                 .content();
-            let handle = change
-                .get("handle")
-                .and_then(Value::as_str)
-                .map(decode_handle)
-                .transpose()?;
+            let handle = change.handle().map(decode_handle).transpose()?;
             let (base_offset, selected) = if let Some(handle) = &handle {
                 if handle.workspace_id != self.id || handle.path != path {
                     return Err(AppError::new(
@@ -401,17 +389,7 @@ impl Workspace {
             } else {
                 (0, content)
             };
-            let found: Vec<_> = if kind == "replace_range" {
-                if handle.is_none() {
-                    return Err(AppError::new(
-                        "MISSING_HANDLE",
-                        "replace_range requires a fresh code_retrieve range handle",
-                    ));
-                }
-                vec![(base_offset, base_offset + selected.len())]
-            } else {
-                let old = required_str(change, "old_text")?;
-                let expected = usize_value(change, "expected_replacements", 1);
+            let found: Vec<_> = if let Some((old, expected)) = exact {
                 let (old, actual) = matching_old_text(content, selected, old, expected);
                 if actual != expected {
                     return Err(AppError::details(
@@ -427,6 +405,8 @@ impl Workspace {
                         (start, start + text.len())
                     })
                     .collect()
+            } else {
+                vec![(base_offset, base_offset + selected.len())]
             };
             let existing = ranges.entry(path.clone()).or_default();
             for range in found {
@@ -448,20 +428,15 @@ impl Workspace {
 
     fn plan_change(
         &self,
-        change: &Value,
+        change: &Change,
         has_snapshot: bool,
         plan: &mut HashMap<String, PlannedFile>,
         index: &CodeIndex,
     ) -> AppResult<()> {
-        let kind = required_str(change, "kind")?;
-        let path = required_str(change, "path")?.replace('\\', "/");
+        let path = change.path().replace('\\', "/");
         validate_relative(&path)?;
-        let expected_hash = change.get("expected_hash").and_then(Value::as_str);
-        let edit_handle = change
-            .get("handle")
-            .and_then(Value::as_str)
-            .map(decode_handle)
-            .transpose()?;
+        let expected_hash = change.expected_hash();
+        let edit_handle = change.handle().map(decode_handle).transpose()?;
         if let Some(handle) = &edit_handle {
             if handle.workspace_id != self.id || handle.path != path {
                 return Err(AppError::new(
@@ -482,7 +457,7 @@ impl Workspace {
             .and_then(|item| item.before.as_ref())
             .map(|content| content_hash(content))
             .or_else(|| before.as_ref().map(|content| content_hash(content)));
-        let edits_existing_file = kind != "create" || before.is_some();
+        let edits_existing_file = !matches!(change, Change::Create { .. }) || before.is_some();
         if edits_existing_file && !has_snapshot && expected_hash.is_none() && handle_hash.is_none()
         {
             return Err(AppError::details(
@@ -500,14 +475,16 @@ impl Workspace {
                 ));
             }
         }
-        match kind {
-            "replace" => {
-                let old = required_str(change, "old_text")?;
-                let new_input = change
-                    .get("new_text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let expected = usize_value(change, "expected_replacements", 1);
+        match change {
+            Change::Replace {
+                old_text,
+                new_text,
+                expected_replacements,
+                ..
+            } => {
+                let old = old_text.as_str();
+                let new_input = new_text.as_str();
+                let expected = *expected_replacements;
                 let current = before.ok_or_else(|| {
                     AppError::details(
                         "PATH_NOT_FOUND",
@@ -549,17 +526,14 @@ impl Workspace {
                 };
                 put_plan(plan, path, Some(current), Some(after));
             }
-            "replace_range" => {
+            Change::ReplaceRange { new_text, .. } => {
                 let handle = edit_handle.as_ref().ok_or_else(|| {
                     AppError::new(
                         "MISSING_HANDLE",
                         "replace_range requires a fresh code_retrieve range handle",
                     )
                 })?;
-                let new_input = change
-                    .get("new_text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let new_input = new_text.as_str();
                 let current = before.ok_or_else(|| {
                     AppError::details(
                         "PATH_NOT_FOUND",
@@ -574,10 +548,14 @@ impl Workspace {
                 after.replace_range(start..end, &replacement);
                 put_plan(plan, path, Some(current), Some(after));
             }
-            "insert" => {
-                let symbol_name = required_str(change, "anchor_symbol")?;
-                let position = required_str(change, "position")?;
-                let insert_input = required_str(change, "content")?;
+            Change::Insert {
+                content,
+                anchor_symbol,
+                position,
+                ..
+            } => {
+                let symbol_name = anchor_symbol.as_str();
+                let insert_input = content.as_str();
                 let current = before
                     .ok_or_else(|| AppError::new("PATH_NOT_FOUND", "Insert path does not exist"))?;
                 let insert = normalize_line_endings_for_content(&current, insert_input);
@@ -595,25 +573,21 @@ impl Workspace {
                 let offset = line_offset(
                     &current,
                     match position {
-                        "before" => symbol.start_line,
-                        "after" => symbol.end_line + 1,
-                        "inside_start" => symbol.start_line + 1,
-                        "inside_end" => symbol.end_line,
-                        _ => return Err(AppError::invalid("Invalid insert position")),
+                        InsertPosition::Before => symbol.start_line,
+                        InsertPosition::After => symbol.end_line + 1,
+                        InsertPosition::InsideStart => symbol.start_line + 1,
+                        InsertPosition::InsideEnd => symbol.end_line,
                     },
                 );
                 let mut after = current.clone();
                 after.insert_str(offset, &insert);
                 put_plan(plan, path, Some(current), Some(after));
             }
-            "create" => {
-                let content_input = change
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                let overwrite = bool_value(change, "overwrite", false);
-                if before.is_some() && !overwrite {
+            Change::Create {
+                content, overwrite, ..
+            } => {
+                let content_input = content.clone();
+                if before.is_some() && !*overwrite {
                     return Err(AppError::details(
                         "PATH_EXISTS",
                         "Create target already exists",
@@ -626,14 +600,14 @@ impl Workspace {
                     .unwrap_or(content_input);
                 put_plan(plan, path, before, Some(content));
             }
-            "delete" => {
+            Change::Delete { .. } => {
                 let current = before.ok_or_else(|| {
                     AppError::new("PATH_NOT_FOUND", "Delete target does not exist")
                 })?;
                 put_plan(plan, path, Some(current), None);
             }
-            "rename" => {
-                let to = required_str(change, "to")?.replace('\\', "/");
+            Change::Rename { to, .. } => {
+                let to = to.replace('\\', "/");
                 validate_relative(&to)?;
                 let current = before.ok_or_else(|| {
                     AppError::new("PATH_NOT_FOUND", "Rename source does not exist")
@@ -649,13 +623,6 @@ impl Workspace {
                 }
                 put_plan(plan, path, Some(current.clone()), None);
                 put_plan(plan, to, None, Some(current));
-            }
-            _ => {
-                return Err(AppError::details(
-                    "INVALID_CHANGE_KIND",
-                    "Unknown change kind",
-                    json!({"kind": kind}),
-                ))
             }
         }
         Ok(())
@@ -708,7 +675,7 @@ mod tests {
     fn diff_view_truncates_on_utf8_boundary() {
         let diff = format!("{}é\nnext\n", "a".repeat(10));
 
-        let view = DiffView::build(&diff, &[], "standard", 11);
+        let view = DiffView::build(&diff, &[], ResponseDetail::Standard, 11);
 
         assert!(view.truncated);
         assert_eq!(view.diff.as_str().unwrap(), "aaaaaaaaaa");

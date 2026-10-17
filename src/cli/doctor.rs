@@ -234,10 +234,14 @@ pub(super) async fn doctor_checks(cli: &Cli) -> Vec<Check> {
 
     if workspace_ok {
         let manager = Arc::new(Application::default());
-        match manager.dispatch("initialize", &config).await {
+        let initialized = match model::parse_daemon_config(&config) {
+            Ok(daemon) => manager.initialize(daemon).await,
+            Err(error) => Err(error),
+        };
+        match initialized {
             Ok(init) => {
-                let indexed = init["index_ready"].as_bool().unwrap_or(false);
-                let files = init["file_count"].as_u64().unwrap_or_default();
+                let indexed = init.index_ready;
+                let files = init.file_count;
                 if indexed {
                     checks.push(Check::ok("index", format!("ready; {files} files indexed")));
                 } else {
@@ -247,7 +251,7 @@ pub(super) async fn doctor_checks(cli: &Cli) -> Vec<Check> {
                     ));
                 }
                 let bash_configured = !bash_config.executable.trim().is_empty();
-                let bash_available = init["bash_available"].as_bool().unwrap_or(false);
+                let bash_available = init.bash_available;
                 if bash_configured && bash_available {
                     checks.push(Check::ok(
                         "bash",

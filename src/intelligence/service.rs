@@ -8,9 +8,10 @@ use super::request::{IntelligenceRequest, Operation};
 use super::session::{Attempt, Semantic, Session, Workspace};
 use super::uri::UriCodec;
 use super::worker::{WorkerOperation, WorkerResponse};
-use super::workspace_edit::{preview_request, workspace_edit_changes, RenameChange};
+use super::workspace_edit::{workspace_edit_changes, RenameChange};
 use crate::model::{AppError, AppResult, IntelligenceSettings};
 use crate::reference_service::{Freshness, SemanticReferenceMetadata};
+use crate::requests::edit::{EditRequest, ResponseDetail};
 use crate::workspace::StateReader;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -38,9 +39,15 @@ pub struct RenamePreview {
 }
 
 impl RenamePreview {
-    /// The `code_edit` preview request for these changes.
-    pub fn edit_request(&self, snapshot_id: Value) -> Value {
-        preview_request(&self.changes, snapshot_id)
+    /// The edit preview request for these changes at `snapshot_id`.
+    pub fn edit_request(&self, snapshot_id: Option<String>) -> EditRequest {
+        EditRequest {
+            changes: self.changes.iter().map(RenameChange::to_change).collect(),
+            snapshot_id,
+            preview: true,
+            validate: Vec::new(),
+            response_detail: ResponseDetail::Standard,
+        }
     }
 
     pub fn into_report(self) -> Value {
@@ -110,8 +117,7 @@ impl IntelligenceService {
         })
     }
 
-    pub fn execute(&self, params: &Value) -> AppResult<IntelligenceResponse> {
-        let request = IntelligenceRequest::parse(params)?;
+    pub fn execute(&self, request: IntelligenceRequest) -> AppResult<IntelligenceResponse> {
         let session = Session::open(self.workspace(), &request.path)?;
         let backend = self.backends.for_path(&request.path);
         let fallback = Fallback {
