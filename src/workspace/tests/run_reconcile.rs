@@ -185,7 +185,7 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
         .state
         .ledger()
         .pending_handle()
-        .observe([root.path().join("pending.rs")]);
+        .observe([actor.root.join("pending.rs")]);
 
     let fetch = actor
         .read_targets(&json!({"path": "existing.rs", "max_chars": 5_000}))

@@ -64,10 +64,10 @@ fn status_on(branch: &str) -> RepoStatus {
 
 /// Drive one site that refreshes the repository status. `round` keeps file names
 /// unique so every reconcile and edit sees a real change.
-async fn refresh_status_through(actor: &Arc<Workspace>, root: &Path, site: &str, round: usize) {
+async fn refresh_status_through(actor: &Arc<Workspace>, site: &str, round: usize) {
     match site {
         "reconcile" => {
-            let path = root.join(format!("watched_{round}.rs"));
+            let path = actor.root.join(format!("watched_{round}.rs"));
             fs::write(&path, "fn watched() {}\n").unwrap();
             actor.state.ledger().pending_handle().observe([path]);
             actor.summary().unwrap();
@@ -112,7 +112,7 @@ async fn failed_git_status_keeps_the_previous_status_and_marks_it_stale_at_every
     for (index, site) in sites.into_iter().enumerate() {
         let previous = actor.state.read().repo_status().clone();
         repository.fail();
-        refresh_status_through(&actor, root.path(), site, index * 2).await;
+        refresh_status_through(&actor, site, index * 2).await;
         {
             let view = actor.state.read();
             assert!(
@@ -124,7 +124,7 @@ async fn failed_git_status_keeps_the_previous_status_and_marks_it_stale_at_every
 
         let branch = format!("after-{index}");
         repository.succeed_with(status_on(&branch));
-        refresh_status_through(&actor, root.path(), site, index * 2 + 1).await;
+        refresh_status_through(&actor, site, index * 2 + 1).await;
         let view = actor.state.read();
         assert!(
             !view.repo_status_stale(),
