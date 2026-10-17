@@ -8,8 +8,8 @@ use super::util::{
 };
 use super::validation::ValidationOutcome;
 use super::Workspace;
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::{content_hash, decode_handle, CodeIndex};
-use crate::model::{AppError, AppResult};
 use crate::requests::edit::{Change, EditRequest, InsertPosition, ResponseDetail};
 use crate::security::validate_relative;
 use crate::symbols::{extract_symbols, parse_has_error};
@@ -283,8 +283,8 @@ impl Workspace {
                 let absolute = self.root.join(&item.path);
                 match parse_has_error(&absolute, after) {
                     Some(true) => {
-                        return Err(AppError::details(
-                            "SYNTAX_ERROR",
+                        return Err(AppError::with_details(
+                            ErrorCode::SyntaxError,
                             "Tree-sitter found syntax errors in planned content",
                             json!({"path": item.path}),
                         ));
@@ -342,8 +342,8 @@ impl Workspace {
             .into_iter()
             .find(|path| change_counts.get(path).copied().unwrap_or_default() > 1)
         {
-            return Err(AppError::details(
-                "AMBIGUOUS_HANDLE_EDIT_ORDER",
+            return Err(AppError::with_details(
+                ErrorCode::AmbiguousHandleEditOrder,
                 "A handle-based edit must be the only change for its file in one transaction",
                 json!({
                     "path": path,
@@ -369,8 +369,8 @@ impl Workspace {
             let content = index
                 .get(&path)
                 .ok_or_else(|| {
-                    AppError::details(
-                        "PATH_NOT_INDEXED",
+                    AppError::with_details(
+                        ErrorCode::PathNotIndexed,
                         "Replace path is not indexed",
                         json!({"path": path}),
                     )
@@ -380,7 +380,7 @@ impl Workspace {
             let (base_offset, selected) = if let Some(handle) = &handle {
                 if handle.workspace_id != self.id || handle.path != path {
                     return Err(AppError::new(
-                        "INVALID_HANDLE",
+                        ErrorCode::InvalidHandle,
                         "Edit handle does not match workspace/path",
                     ));
                 }
@@ -392,8 +392,8 @@ impl Workspace {
             let found: Vec<_> = if let Some((old, expected)) = exact {
                 let (old, actual) = matching_old_text(content, selected, old, expected);
                 if actual != expected {
-                    return Err(AppError::details(
-                        "EXACT_MATCH_COUNT",
+                    return Err(AppError::with_details(
+                        ErrorCode::ExactMatchCount,
                         "Exact replacement count did not match",
                         json!({"path": path, "expected": expected, "actual": actual}),
                     ));
@@ -414,8 +414,8 @@ impl Workspace {
                     .iter()
                     .any(|other| range.0 < other.1 && other.0 < range.1)
                 {
-                    return Err(AppError::details(
-                        "OVERLAPPING_EDITS",
+                    return Err(AppError::with_details(
+                        ErrorCode::OverlappingEdits,
                         "Two exact edits overlap",
                         json!({"path": path}),
                     ));
@@ -440,7 +440,7 @@ impl Workspace {
         if let Some(handle) = &edit_handle {
             if handle.workspace_id != self.id || handle.path != path {
                 return Err(AppError::new(
-                    "INVALID_HANDLE",
+                    ErrorCode::InvalidHandle,
                     "Edit handle does not match workspace/path",
                 ));
             }
@@ -460,16 +460,16 @@ impl Workspace {
         let edits_existing_file = !matches!(change, Change::Create { .. }) || before.is_some();
         if edits_existing_file && !has_snapshot && expected_hash.is_none() && handle_hash.is_none()
         {
-            return Err(AppError::details(
-                "MISSING_PRECONDITION",
+            return Err(AppError::with_details(
+                ErrorCode::MissingPrecondition,
                 "Existing-file edits require snapshot_id, expected_hash, or handle",
                 json!({"path": path}),
             ));
         }
         if let Some(expected) = expected_hash.or(handle_hash) {
             if original_hash.as_deref() != Some(expected) {
-                return Err(AppError::details(
-                    "STALE_FILE",
+                return Err(AppError::with_details(
+                    ErrorCode::StaleFile,
                     "File hash precondition failed",
                     json!({"path": path, "expected_hash": expected, "actual_hash": original_hash}),
                 ));
@@ -486,8 +486,8 @@ impl Workspace {
                 let new_input = new_text.as_str();
                 let expected = *expected_replacements;
                 let current = before.ok_or_else(|| {
-                    AppError::details(
-                        "PATH_NOT_FOUND",
+                    AppError::with_details(
+                        ErrorCode::PathNotFound,
                         "Replace path does not exist",
                         json!({"path": path}),
                     )
@@ -499,8 +499,8 @@ impl Workspace {
                     let selected = &current[start..end];
                     let (old, count) = matching_old_text(&current, selected, old, expected);
                     if count != expected {
-                        return Err(AppError::details(
-                            "EXACT_MATCH_COUNT",
+                        return Err(AppError::with_details(
+                            ErrorCode::ExactMatchCount,
                             "Exact replacement count did not match the provenance range",
                             json!({"path": path, "expected": expected, "actual": count, "start_line": handle.start_line, "end_line": handle.end_line}),
                         ));
@@ -515,8 +515,8 @@ impl Workspace {
                 } else {
                     let (old, count) = matching_old_text(&current, &current, old, expected);
                     if count != expected {
-                        return Err(AppError::details(
-                            "EXACT_MATCH_COUNT",
+                        return Err(AppError::with_details(
+                            ErrorCode::ExactMatchCount,
                             "Exact replacement count did not match current planned content",
                             json!({"path": path, "expected": expected, "actual": count}),
                         ));
@@ -529,14 +529,14 @@ impl Workspace {
             Change::ReplaceRange { new_text, .. } => {
                 let handle = edit_handle.as_ref().ok_or_else(|| {
                     AppError::new(
-                        "MISSING_HANDLE",
+                        ErrorCode::MissingHandle,
                         "replace_range requires a fresh code_retrieve range handle",
                     )
                 })?;
                 let new_input = new_text.as_str();
                 let current = before.ok_or_else(|| {
-                    AppError::details(
-                        "PATH_NOT_FOUND",
+                    AppError::with_details(
+                        ErrorCode::PathNotFound,
                         "Replace path does not exist",
                         json!({"path": path}),
                     )
@@ -556,16 +556,17 @@ impl Workspace {
             } => {
                 let symbol_name = anchor_symbol.as_str();
                 let insert_input = content.as_str();
-                let current = before
-                    .ok_or_else(|| AppError::new("PATH_NOT_FOUND", "Insert path does not exist"))?;
+                let current = before.ok_or_else(|| {
+                    AppError::new(ErrorCode::PathNotFound, "Insert path does not exist")
+                })?;
                 let insert = normalize_line_endings_for_content(&current, insert_input);
                 let absolute = self.root.join(&path);
                 let symbol = extract_symbols(&absolute, &current)
                     .into_iter()
                     .find(|item| item.name == symbol_name)
                     .ok_or_else(|| {
-                        AppError::details(
-                            "SYMBOL_NOT_FOUND",
+                        AppError::with_details(
+                            ErrorCode::SymbolNotFound,
                             "Anchor symbol not found in current planned content",
                             json!({"path": path, "symbol": symbol_name}),
                         )
@@ -588,8 +589,8 @@ impl Workspace {
             } => {
                 let content_input = content.clone();
                 if before.is_some() && !*overwrite {
-                    return Err(AppError::details(
-                        "PATH_EXISTS",
+                    return Err(AppError::with_details(
+                        ErrorCode::PathExists,
                         "Create target already exists",
                         json!({"path": path}),
                     ));
@@ -602,7 +603,7 @@ impl Workspace {
             }
             Change::Delete { .. } => {
                 let current = before.ok_or_else(|| {
-                    AppError::new("PATH_NOT_FOUND", "Delete target does not exist")
+                    AppError::new(ErrorCode::PathNotFound, "Delete target does not exist")
                 })?;
                 put_plan(plan, path, Some(current), None);
             }
@@ -610,13 +611,13 @@ impl Workspace {
                 let to = to.replace('\\', "/");
                 validate_relative(&to)?;
                 let current = before.ok_or_else(|| {
-                    AppError::new("PATH_NOT_FOUND", "Rename source does not exist")
+                    AppError::new(ErrorCode::PathNotFound, "Rename source does not exist")
                 })?;
                 if plan.get(&to).and_then(|item| item.after.as_ref()).is_some()
                     || index.get(&to).is_some()
                 {
-                    return Err(AppError::details(
-                        "PATH_EXISTS",
+                    return Err(AppError::with_details(
+                        ErrorCode::PathExists,
                         "Rename target already exists",
                         json!({"path": to}),
                     ));
@@ -631,13 +632,17 @@ impl Workspace {
     fn recheck_preconditions(&self, plan: &[PlannedFile]) -> AppResult<()> {
         for item in plan {
             let actual = read_optional(&self.root, &item.path).map_err(|error| {
-                AppError::details("READ_FAILED", error.to_string(), json!({"path": item.path}))
+                AppError::with_details(
+                    ErrorCode::ReadFailed,
+                    error.to_string(),
+                    json!({"path": item.path}),
+                )
             })?;
             let actual_hash = actual.as_ref().map(|value| content_hash(value));
             let expected_hash = item.before.as_ref().map(|value| content_hash(value));
             if actual_hash != expected_hash {
-                return Err(AppError::details(
-                    "STALE_FILE",
+                return Err(AppError::with_details(
+                    ErrorCode::StaleFile,
                     "File changed after planning and before commit",
                     json!({"path": item.path, "expected_hash": expected_hash, "actual_hash": actual_hash}),
                 ));

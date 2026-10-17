@@ -13,7 +13,8 @@ use super::request::Position;
 use super::sync::{DocumentSnapshot, SynchronizedDocument};
 use super::transport::{RpcTransport, StdioRpcTransport, TransportFactory};
 use super::uri::UriCodec;
-use crate::model::{AppError, AppResult, LanguageServerSettings};
+use crate::error::{AppError, AppResult, ErrorCode};
+use crate::model::LanguageServerSettings;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use server::{RequestContext, Server};
@@ -228,8 +229,8 @@ impl LspWorker {
                 .name(format!("codeweave-lsp-{}", preset.key()))
                 .spawn(move || runtime.run(receiver))
                 .map_err(|error| {
-                    AppError::details(
-                        "LSP_WORKER_START_FAILED",
+                    AppError::with_details(
+                        ErrorCode::LspWorkerStartFailed,
                         format!("Cannot start the language-server worker thread: {error}"),
                         json!({"language": preset.key()}),
                     )
@@ -478,7 +479,7 @@ impl WorkerRuntime {
 
     fn record_failure(&self, error: &WorkerError, restarting: bool) {
         let mut status = self.status.write();
-        status.last_error = Some(error.to_app_error().0.message);
+        status.last_error = Some(error.to_app_error().message().to_owned());
         if restarting {
             status.restart_count += 1;
         }

@@ -3,8 +3,8 @@
 use super::preset::LspPreset;
 use super::test_support::{FakeServer, Fixture, Reply};
 use super::{IntelligenceRequest, IntelligenceResponse};
+use crate::error::{AppResult, ErrorCode};
 use crate::index::{content_hash, SearchScope};
-use crate::model::AppResult;
 use crate::reference_service::{ReferenceQuery, ReferenceScope, ReferenceService};
 use crate::requests::edit::{Change, EditRequest, ResponseDetail};
 use crate::requests::intelligence::CodeIntelligenceRequest;
@@ -229,7 +229,7 @@ fn a_target_edited_during_the_request_is_stale_for_every_operation() {
         json!("after_request"),
     );
     assert_eq!(reasons, vec![expected.clone(), expected.clone(), expected]);
-    assert_eq!(rename_error.0.code, "INTELLIGENCE_STALE");
+    assert_eq!(rename_error.code(), ErrorCode::IntelligenceStale);
 }
 
 #[test]
@@ -240,8 +240,8 @@ fn a_target_that_changed_before_the_request_is_rejected() {
 
     let error = run(&service, definition()).unwrap_err();
 
-    assert_eq!(error.0.code, "INTELLIGENCE_STALE");
-    assert_eq!(error.0.details.unwrap()["phase"], "before_request");
+    assert_eq!(error.code(), ErrorCode::IntelligenceStale);
+    assert_eq!(error.details().unwrap()["phase"], "before_request");
 }
 
 #[test]
@@ -256,8 +256,8 @@ fn a_rename_touching_a_file_that_changed_since_indexing_is_stale() {
 
     let error = run(&service, rename()).unwrap_err();
 
-    assert_eq!(error.0.code, "INTELLIGENCE_STALE");
-    let details = error.0.details.unwrap();
+    assert_eq!(error.code(), ErrorCode::IntelligenceStale);
+    let details = error.details().unwrap();
     assert_eq!(
         [&details["phase"], &details["path"]],
         [&json!("result_file"), &json!("src/caller.rs")]
@@ -301,7 +301,7 @@ fn a_silent_server_times_out_and_every_operation_falls_back() {
         definition["result"]["result"]["symbol"]["name"],
         "open_workspace"
     );
-    assert_eq!(rename.0.code, "LSP_TIMEOUT");
+    assert_eq!(rename.code(), ErrorCode::LspTimeout);
     // Each timed-out operation restarts the server once before giving up.
     assert_eq!(server.spawn_count(), 8);
 }
@@ -320,7 +320,7 @@ fn without_a_backend_reads_fall_back_and_rename_is_unavailable() {
     assert!(definition.get("fallback_reason").is_none());
     assert_eq!(diagnostics["diagnostic_scope"], "syntax_only");
     assert_eq!(diagnostics["result"]["diagnostics"], json!([]));
-    assert_eq!(rename.0.code, "SEMANTIC_BACKEND_UNAVAILABLE");
+    assert_eq!(rename.code(), ErrorCode::SemanticBackendUnavailable);
 }
 
 #[test]
@@ -442,7 +442,7 @@ fn result_uris_naming_a_symlink_out_of_the_workspace_are_never_read() {
         "INVALID_LSP_RESPONSE"
     );
     assert!(!definition.to_string().contains("outside_secret"));
-    assert_eq!(rename.0.code, "INVALID_LSP_RESPONSE");
+    assert_eq!(rename.code(), ErrorCode::InvalidLspResponse);
 }
 
 #[cfg(unix)]
@@ -458,7 +458,7 @@ fn a_target_replaced_by_a_symlink_is_never_read() {
 
     let error = run(&service, definition()).unwrap_err();
 
-    assert_eq!(error.0.code, "INTELLIGENCE_STALE");
+    assert_eq!(error.code(), ErrorCode::IntelligenceStale);
     assert!(!error.to_string().contains("outside_secret"));
 }
 

@@ -1,4 +1,4 @@
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use cap_std::{ambient_authority, fs::Dir};
 use std::borrow::Cow;
 use std::io::Read;
@@ -12,15 +12,15 @@ pub struct WorkspaceFile {
 
 pub fn canonical_root(path: &Path) -> AppResult<PathBuf> {
     let root = path.canonicalize().map_err(|e| {
-        AppError::details(
-            "WORKSPACE_NOT_FOUND",
+        AppError::with_details(
+            ErrorCode::WorkspaceNotFound,
             format!("Cannot open workspace: {e}"),
             serde_json::json!({"path": path}),
         )
     })?;
     if !root.is_dir() {
         return Err(AppError::new(
-            "WORKSPACE_NOT_DIRECTORY",
+            ErrorCode::WorkspaceNotDirectory,
             "Workspace root is not a directory",
         ));
     }
@@ -31,7 +31,7 @@ pub fn validate_relative(relative: &str) -> AppResult<PathBuf> {
     let path = Path::new(relative);
     if path.is_absolute() {
         return Err(AppError::new(
-            "OUTSIDE_ROOT",
+            ErrorCode::OutsideRoot,
             "Absolute paths are not allowed",
         ));
     }
@@ -41,7 +41,7 @@ pub fn validate_relative(relative: &str) -> AppResult<PathBuf> {
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         ) {
             return Err(AppError::new(
-                "OUTSIDE_ROOT",
+                ErrorCode::OutsideRoot,
                 "Path traversal is not allowed",
             ));
         }
@@ -53,15 +53,15 @@ pub fn resolve_existing(root: &Path, relative: &str) -> AppResult<PathBuf> {
     let relative = validate_relative(relative)?;
     let joined = root.join(&relative);
     let resolved = joined.canonicalize().map_err(|e| {
-        AppError::details(
-            "PATH_NOT_FOUND",
+        AppError::with_details(
+            ErrorCode::PathNotFound,
             e.to_string(),
             serde_json::json!({"path": relative}),
         )
     })?;
     if !resolved.starts_with(root) {
         return Err(AppError::new(
-            "OUTSIDE_ROOT",
+            ErrorCode::OutsideRoot,
             "Resolved path is outside workspace",
         ));
     }

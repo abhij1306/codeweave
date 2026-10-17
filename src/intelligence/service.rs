@@ -9,7 +9,8 @@ use super::session::{Attempt, Semantic, Session, Workspace};
 use super::uri::UriCodec;
 use super::worker::{WorkerOperation, WorkerResponse};
 use super::workspace_edit::{workspace_edit_changes, RenameChange};
-use crate::model::{AppError, AppResult, IntelligenceSettings};
+use crate::error::{AppError, AppResult, ErrorCode};
+use crate::model::IntelligenceSettings;
 use crate::reference_service::{Freshness, SemanticReferenceMetadata};
 use crate::requests::edit::{EditRequest, ResponseDetail};
 use crate::workspace::StateReader;
@@ -155,7 +156,10 @@ impl IntelligenceService {
                 let attempt =
                     session.attempt(backend, WorkerOperation::Diagnostics, |response, _| {
                         let items = response.result.as_array().ok_or_else(|| {
-                            AppError::new("LSP_PROTOCOL_ERROR", "Diagnostic result is not an array")
+                            AppError::new(
+                                ErrorCode::LspProtocolError,
+                                "Diagnostic result is not an array",
+                            )
                         })?;
                         Ok(LimitedDiagnostics::new(items.clone(), max_results))
                     });
@@ -255,7 +259,7 @@ impl IntelligenceService {
                     }
                     Attempt::Fallback(Some(reason)) => Err(reason.error),
                     Attempt::Fallback(None) => Err(AppError::new(
-                        "SEMANTIC_BACKEND_UNAVAILABLE",
+                        ErrorCode::SemanticBackendUnavailable,
                         "No enabled LSP backend supports this file",
                     )),
                 };

@@ -14,9 +14,10 @@ use super::util::{
     summarize_changed_paths, MAX_CHANGED_PATH_GROUPS, MAX_OBSERVED_CHANGED_PATHS,
 };
 use super::{validated_push_target, Workspace};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::content_hash;
-use crate::model::{AppError, AppResult, BashConfig, PolicyConfig, WorkspaceConfig};
-use crate::repository::{RepoStatus, RepositoryBackend};
+use crate::model::{BashConfig, PolicyConfig, WorkspaceConfig};
+use crate::repository::{Diff, RepoStatus, RepositoryBackend};
 use crate::requests::bash::{
     BashCancelRequest, BashOutputRequest, BashRequest, BashStartRequest, BashStatusRequest,
 };
@@ -146,17 +147,31 @@ fn test_actor_with_policy_and_exclusions(
     )
 }
 
-/// Repository backend whose `git status` result the test controls. Every other
+/// Repository backend whose `git status` result and diff text the test
+/// controls, and which records the scope of every diff request. Every other
 /// action succeeds with empty output.
 struct ScriptedRepository {
     status: Mutex<Option<RepoStatus>>,
+    diff: Mutex<String>,
+    diff_requests: Mutex<Vec<(bool, Vec<String>)>>,
 }
 
 impl ScriptedRepository {
     fn new(status: RepoStatus) -> Arc<Self> {
         Arc::new(Self {
             status: Mutex::new(Some(status)),
+            diff: Mutex::new(String::new()),
+            diff_requests: Mutex::new(Vec::new()),
         })
+    }
+
+    fn diff_with(&self, text: &str) {
+        *self.diff.lock() = text.to_owned();
+    }
+
+    /// `(staged, paths)` of every diff request so far.
+    fn diff_requests(&self) -> Vec<(bool, Vec<String>)> {
+        self.diff_requests.lock().clone()
     }
 
     fn succeed_with(&self, status: RepoStatus) {
@@ -173,10 +188,11 @@ impl RepositoryBackend for ScriptedRepository {
         self.status
             .lock()
             .clone()
-            .ok_or_else(|| AppError::new("GIT_FAILED", "scripted status failure"))
+            .ok_or_else(|| AppError::new(ErrorCode::GitFailed, "scripted status failure"))
     }
-    fn diff(&self, _: &Path, _: bool, _: &[String], _: usize) -> AppResult<String> {
-        Ok(String::new())
+    fn diff(&self, _: &Path, staged: bool, paths: &[String], _: usize) -> AppResult<Diff> {
+        self.diff_requests.lock().push((staged, paths.to_vec()));
+        Ok(Diff::parse(self.diff.lock().clone()))
     }
     fn log(&self, _: &Path, _: usize) -> AppResult<String> {
         Ok(String::new())

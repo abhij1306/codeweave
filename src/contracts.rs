@@ -1,4 +1,4 @@
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 
@@ -110,115 +110,6 @@ pub const RETRIEVAL_CONTRACTS: &[ContractSpec] = &[
     },
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ErrorCode {
-    MissingOperationField,
-    InvalidOperationField,
-    UnknownOperationField,
-    UnsupportedRetrievalOperation,
-    MissingChangeField,
-    InvalidChangeField,
-    UnknownChangeField,
-    UnsupportedChangeKind,
-    InvalidBashRequest,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ErrorPolicy {
-    pub code: &'static str,
-    pub retryable: bool,
-    pub retry_kind: &'static str,
-    pub category: &'static str,
-}
-
-impl ErrorCode {
-    pub const ALL: [Self; 9] = [
-        Self::MissingOperationField,
-        Self::InvalidOperationField,
-        Self::UnknownOperationField,
-        Self::UnsupportedRetrievalOperation,
-        Self::MissingChangeField,
-        Self::InvalidChangeField,
-        Self::UnknownChangeField,
-        Self::UnsupportedChangeKind,
-        Self::InvalidBashRequest,
-    ];
-
-    pub const fn policy(self) -> ErrorPolicy {
-        match self {
-            Self::MissingOperationField => ErrorPolicy {
-                code: "MISSING_OPERATION_FIELD",
-                retryable: false,
-                retry_kind: "fix_request",
-                category: "invalid_request",
-            },
-            Self::InvalidOperationField => ErrorPolicy {
-                code: "INVALID_OPERATION_FIELD",
-                retryable: false,
-                retry_kind: "fix_request",
-                category: "invalid_request",
-            },
-            Self::UnknownOperationField => ErrorPolicy {
-                code: "UNKNOWN_OPERATION_FIELD",
-                retryable: false,
-                retry_kind: "remove_field",
-                category: "invalid_request",
-            },
-            Self::UnsupportedRetrievalOperation => ErrorPolicy {
-                code: "UNSUPPORTED_RETRIEVAL_OPERATION",
-                retryable: false,
-                retry_kind: "choose_supported_operation",
-                category: "unsupported_request",
-            },
-            Self::MissingChangeField => ErrorPolicy {
-                code: "MISSING_CHANGE_FIELD",
-                retryable: false,
-                retry_kind: "fix_request",
-                category: "invalid_request",
-            },
-            Self::InvalidChangeField => ErrorPolicy {
-                code: "INVALID_CHANGE_FIELD",
-                retryable: false,
-                retry_kind: "fix_request",
-                category: "invalid_request",
-            },
-            Self::UnknownChangeField => ErrorPolicy {
-                code: "UNKNOWN_CHANGE_FIELD",
-                retryable: false,
-                retry_kind: "remove_field",
-                category: "invalid_request",
-            },
-            Self::UnsupportedChangeKind => ErrorPolicy {
-                code: "UNSUPPORTED_CHANGE_KIND",
-                retryable: false,
-                retry_kind: "choose_supported_change",
-                category: "unsupported_request",
-            },
-            Self::InvalidBashRequest => ErrorPolicy {
-                code: "INVALID_BASH_REQUEST",
-                retryable: false,
-                retry_kind: "fix_request",
-                category: "invalid_request",
-            },
-        }
-    }
-
-    pub fn error(self, message: impl Into<String>, details: Value) -> AppError {
-        let policy = self.policy();
-        let mut object = details.as_object().cloned().unwrap_or_default();
-        object.insert("retryable".to_owned(), Value::Bool(policy.retryable));
-        object.insert(
-            "retry_kind".to_owned(),
-            Value::String(policy.retry_kind.to_owned()),
-        );
-        object.insert(
-            "category".to_owned(),
-            Value::String(policy.category.to_owned()),
-        );
-        AppError::details(policy.code, message, Value::Object(object))
-    }
-}
-
 pub fn retrieval_contract(name: &str) -> Option<ContractSpec> {
     RETRIEVAL_CONTRACTS
         .iter()
@@ -235,7 +126,8 @@ pub fn retrieval_operation_names() -> Vec<&'static str> {
 
 pub fn validate_retrieval_operation(kind: &str, operation: &Map<String, Value>) -> AppResult<()> {
     let contract = retrieval_contract(kind).ok_or_else(|| {
-        ErrorCode::UnsupportedRetrievalOperation.error(
+        AppError::with_details(
+            ErrorCode::UnsupportedRetrievalOperation,
             format!("unsupported retrieval operation '{kind}'"),
             json!({"operation": kind, "supported": retrieval_operation_names()}),
         )
@@ -271,7 +163,8 @@ pub fn validate_retrieval_operation(kind: &str, operation: &Map<String, Value>) 
             .and_then(Value::as_array)
             .is_some_and(|values| !values.is_empty());
         if !has_path && !has_paths {
-            return Err(ErrorCode::MissingOperationField.error(
+            return Err(AppError::with_details(
+                ErrorCode::MissingOperationField,
                 "symbols_overview requires path or paths",
                 json!({"operation": kind, "required_any": ["path", "paths"]}),
             ));
@@ -282,7 +175,8 @@ pub fn validate_retrieval_operation(kind: &str, operation: &Map<String, Value>) 
             .as_array()
             .is_some_and(|values| values.iter().all(Value::is_string));
         if !valid {
-            return Err(ErrorCode::InvalidOperationField.error(
+            return Err(AppError::with_details(
+                ErrorCode::InvalidOperationField,
                 "retrieval operation paths must be an array of strings",
                 json!({"operation": kind, "field": "paths"}),
             ));
@@ -293,7 +187,8 @@ pub fn validate_retrieval_operation(kind: &str, operation: &Map<String, Value>) 
             .as_str()
             .is_some_and(|value| matches!(value, "compact" | "standard" | "debug"));
         if !valid {
-            return Err(ErrorCode::InvalidOperationField.error(
+            return Err(AppError::with_details(
+                ErrorCode::InvalidOperationField,
                 "response_detail must be compact, standard, or debug",
                 json!({"operation": kind, "field": "response_detail"}),
             ));
@@ -316,7 +211,8 @@ fn validate_fields(
         .cloned()
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
-        return Err(unknown_code.error(
+        return Err(AppError::with_details(
+            unknown_code,
             format!("{context} received unsupported fields"),
             json!({
                 "contract": contract.name,
@@ -332,7 +228,8 @@ fn validate_fields(
         .filter(|field| object.get(*field).is_none_or(Value::is_null))
         .collect::<Vec<_>>();
     if !missing.is_empty() {
-        return Err(missing_code.error(
+        return Err(AppError::with_details(
+            missing_code,
             format!("{context} is missing required fields"),
             json!({
                 "contract": contract.name,
@@ -357,7 +254,8 @@ fn require_non_empty_string(
     if valid {
         Ok(())
     } else {
-        Err(code.error(
+        Err(AppError::with_details(
+            code,
             format!("{context} field '{field}' must be a non-empty string"),
             json!({"field": field}),
         ))
@@ -367,45 +265,6 @@ fn require_non_empty_string(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn error_code_registry_covers_every_variant() {
-        macro_rules! expected_variant_count {
-            ($($variant:path),+ $(,)?) => {{
-                fn assert_exhaustive(code: ErrorCode) {
-                    match code {
-                        $($variant => {}),+
-                    }
-                }
-                for code in ErrorCode::ALL {
-                    assert_exhaustive(code);
-                }
-                [$(stringify!($variant)),+].len()
-            }};
-        }
-
-        let expected = expected_variant_count!(
-            ErrorCode::MissingOperationField,
-            ErrorCode::InvalidOperationField,
-            ErrorCode::UnknownOperationField,
-            ErrorCode::UnsupportedRetrievalOperation,
-            ErrorCode::MissingChangeField,
-            ErrorCode::InvalidChangeField,
-            ErrorCode::UnknownChangeField,
-            ErrorCode::UnsupportedChangeKind,
-            ErrorCode::InvalidBashRequest,
-        );
-        assert_eq!(ErrorCode::ALL.len(), expected);
-    }
-
-    #[test]
-    fn error_codes_are_unique() {
-        let codes = ErrorCode::ALL
-            .iter()
-            .map(|code| code.policy().code)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(codes.len(), ErrorCode::ALL.len());
-    }
 
     #[test]
     fn contract_names_and_fields_are_unique() {
@@ -431,11 +290,8 @@ mod tests {
             missing.as_object().expect("operation object"),
         )
         .unwrap_err();
-        assert_eq!(error.0.code, "MISSING_OPERATION_FIELD");
-        assert_eq!(
-            error.0.details.as_ref().unwrap()["retry_kind"],
-            "fix_request"
-        );
+        assert_eq!(error.code(), ErrorCode::MissingOperationField);
+        assert_eq!(error.details().unwrap()["retry_kind"], "fix_request");
 
         let irrelevant = json!({
             "operation": "find_symbol",
@@ -447,10 +303,7 @@ mod tests {
             irrelevant.as_object().expect("operation object"),
         )
         .unwrap_err();
-        assert_eq!(error.0.code, "UNKNOWN_OPERATION_FIELD");
-        assert_eq!(
-            error.0.details.as_ref().unwrap()["retry_kind"],
-            "remove_field"
-        );
+        assert_eq!(error.code(), ErrorCode::UnknownOperationField);
+        assert_eq!(error.details().unwrap()["retry_kind"], "remove_field");
     }
 }

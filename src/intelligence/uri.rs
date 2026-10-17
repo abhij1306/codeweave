@@ -6,7 +6,7 @@
 //! remainder contains no `.`/`..` segments. Symlinks are deliberately not
 //! resolved here: every read of a decoded path goes through the confined
 //! workspace reader, which refuses symlinks and escapes at open time.
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -49,7 +49,7 @@ impl UriCodec {
             .ok_or_else(outside_root)?;
         if remainder.is_empty() {
             return Err(AppError::new(
-                "INVALID_LSP_URI",
+                ErrorCode::InvalidLspUri,
                 "LSP URI names the workspace root, not a file",
             ));
         }
@@ -64,7 +64,10 @@ impl UriCodec {
 }
 
 fn outside_root() -> AppError {
-    AppError::new("OUTSIDE_ROOT", "LSP result is outside the workspace")
+    AppError::new(
+        ErrorCode::OutsideRoot,
+        "LSP result is outside the workspace",
+    )
 }
 
 /// Encode an absolute filesystem path as a `file://` URI.
@@ -127,9 +130,9 @@ fn strip_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
 
 /// Decode a `file://` URI into platform path text.
 fn decode_file_uri(uri: &str) -> AppResult<String> {
-    let raw = uri
-        .strip_prefix("file://")
-        .ok_or_else(|| AppError::new("UNSUPPORTED_LSP_URI", "LSP returned a non-file URI"))?;
+    let raw = uri.strip_prefix("file://").ok_or_else(|| {
+        AppError::new(ErrorCode::UnsupportedLspUri, "LSP returned a non-file URI")
+    })?;
     let (authority, path) = match raw.find('/') {
         Some(index) => (&raw[..index], &raw[index..]),
         None => (raw, ""),
@@ -141,7 +144,7 @@ fn decode_file_uri(uri: &str) -> AppResult<String> {
             return Ok(format!("//{authority}{path}"));
         }
         return Err(AppError::new(
-            "UNSUPPORTED_LSP_URI",
+            ErrorCode::UnsupportedLspUri,
             "LSP returned a file URI with a remote authority",
         ));
     }
@@ -167,7 +170,7 @@ fn percent_encode(value: &str, preserve_path_separators: bool) -> String {
 }
 
 fn percent_decode(value: &str) -> AppResult<String> {
-    let invalid = |message: &str| AppError::new("INVALID_LSP_URI", message.to_owned());
+    let invalid = |message: &str| AppError::new(ErrorCode::InvalidLspUri, message.to_owned());
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -227,7 +230,7 @@ mod tests {
             sibling,
             "https://example.com/a.rs".into(),
         ]
-        .map(|uri| codec.relative(&uri).unwrap_err().0.code);
+        .map(|uri| codec.relative(&uri).unwrap_err().code().as_str());
 
         assert_eq!(
             codes,

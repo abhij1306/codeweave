@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::ErrorCode;
 
 #[tokio::test]
 async fn detached_validation_keeps_leading_failure_as_primary_run() {
@@ -78,7 +79,7 @@ async fn syntax_error_gate_blocks_broken_rust_and_leaves_file_untouched() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.0.code, "SYNTAX_ERROR");
+    assert_eq!(error.code(), ErrorCode::SyntaxError);
     assert_eq!(
         fs::read_to_string(root.path().join("value.rs")).unwrap(),
         original
@@ -107,7 +108,7 @@ async fn json_edits_are_syntax_checked_and_yaml_edits_are_reported_skipped() {
         })))
         .await
         .unwrap_err();
-    assert_eq!(error.0.code, "SYNTAX_ERROR");
+    assert_eq!(error.code(), ErrorCode::SyntaxError);
     assert_eq!(
         fs::read_to_string(root.path().join("data.json")).unwrap(),
         json_original

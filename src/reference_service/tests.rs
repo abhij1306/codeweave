@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::ErrorCode;
 use crate::index::WorkspaceExclusions;
 use serde_json::Value;
 
@@ -272,9 +273,9 @@ fn ambiguous_selector_lists_candidates_until_a_definition_is_chosen() {
     )
     .unwrap();
 
-    assert_eq!(error.0.code, "AMBIGUOUS_SYMBOL");
+    assert_eq!(error.code(), ErrorCode::AmbiguousSymbol);
     assert_eq!(
-        error.0.details.unwrap()["candidates"][1]["path"],
+        error.details().unwrap()["candidates"][1]["path"],
         "src/b.rs"
     );
     assert_eq!(chosen["definitions"][0]["path"], "src/b.rs");

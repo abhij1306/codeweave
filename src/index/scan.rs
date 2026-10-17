@@ -5,7 +5,7 @@ use super::entry::FileEntry;
 use super::exclusions::{excluded_dir, excluded_path, WorkspaceExclusions};
 use super::handle::content_hash;
 use super::store::CodeIndex;
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::security::{read_workspace_file, relative_string, validate_relative};
 use crate::symbols::extract_symbols;
 use ignore::WalkBuilder;
@@ -122,7 +122,7 @@ fn scan_workspace(
         let resolved = candidate.canonicalize()?;
         if !resolved.starts_with(&canonical_root) {
             return Err(AppError::new(
-                "OUTSIDE_ROOT",
+                ErrorCode::OutsideRoot,
                 "Artifact path resolves outside workspace",
             ));
         }

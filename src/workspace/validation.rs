@@ -85,7 +85,7 @@ impl Workspace {
                     failed = true;
                     validation.push(json!({
                         "command": command,
-                        "error": error.0,
+                        "error": error,
                     }));
                 }
             }
@@ -155,7 +155,7 @@ impl Workspace {
                 run_id
             }
             Err(error) => {
-                validation.push(json!({"command": joined, "error": error.0}));
+                validation.push(json!({"command": joined, "error": error}));
                 None
             }
         }

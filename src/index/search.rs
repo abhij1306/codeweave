@@ -2,7 +2,7 @@ use super::path_filter::PathFilterSet;
 use super::query::{FilenameQuery, SearchScope, SymbolQuery, TextQuery, TextSyntax};
 use super::windows::{FileGroups, WindowBuilder};
 use super::{encode_handle, slice_lines, CodeIndex, FileEntry, RangeHandle};
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -192,8 +192,8 @@ impl CodeIndex {
     /// The symbol outline of one indexed file.
     pub fn outline(&self, path: &str) -> AppResult<Value> {
         let file = self.get(path).ok_or_else(|| {
-            AppError::details(
-                "PATH_NOT_INDEXED",
+            AppError::with_details(
+                ErrorCode::PathNotIndexed,
                 "Outline path is not indexed",
                 json!({"path": path}),
             )
@@ -294,8 +294,8 @@ impl LineMatcher {
                     .case_insensitive(!query.case_sensitive)
                     .build()
                     .map_err(|error| {
-                        AppError::details(
-                            "INVALID_REGEX",
+                        AppError::with_details(
+                            ErrorCode::InvalidRegex,
                             error.to_string(),
                             json!({"query_length": query.pattern.len()}),
                         )

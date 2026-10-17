@@ -3,7 +3,7 @@
 //! from disk during a scan, so a stale cache can never serve stale text.
 
 use super::store::CodeIndex;
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult};
 use crate::symbols::Symbol;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

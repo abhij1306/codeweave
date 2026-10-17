@@ -11,8 +11,8 @@ pub use request::{
     MAX_SURROUNDING_LINES, PROTOCOL_MAX_RESULTS,
 };
 
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::{CodeIndex, SearchScope};
-use crate::model::{AppError, AppResult};
 use crate::reference_service::ReferenceService;
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -60,8 +60,8 @@ pub fn execute_index_search(
 /// One outline for a single path; a batch with per-path errors otherwise.
 fn outlines(index: &CodeIndex, snapshot_id: &str, paths: &[String]) -> AppResult<Value> {
     match paths {
-        [] => Err(AppError::details(
-            "INVALID_OUTLINE_PATH",
+        [] => Err(AppError::with_details(
+            ErrorCode::InvalidOutlinePath,
             "Outline requires a file path in query or exactly one paths entry",
             json!({
                 "paths_count": 0,
@@ -80,7 +80,7 @@ fn outlines(index: &CodeIndex, snapshot_id: &str, paths: &[String]) -> AppResult
                     Err(error) => errors.push(json!({
                         "index": position,
                         "path": path,
-                        "error": error.0
+                        "error": error
                     })),
                 }
             }

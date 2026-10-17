@@ -1,6 +1,6 @@
 //! Typed `code_intelligence` request: the per-operation form of the tool's
 //! `CodeIntelligenceRequest`, built once at the boundary.
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult};
 use crate::requests::intelligence::{CodeIntelligenceRequest, IntelligenceOperationName};
 use crate::security::validate_relative;
 
@@ -132,7 +132,7 @@ mod tests {
             json!({"operation":"definition","path":"../a.rs","line":1}),
             json!({"operation":"hover","path":"a.rs","line":1}),
         ]
-        .map(|params| parse(params).unwrap_err().0.code);
+        .map(|params| parse(params).unwrap_err().code().as_str());
 
         assert_eq!(
             rejected,

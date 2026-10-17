@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::ErrorCode;
 
 #[tokio::test]
 async fn exact_replace_prefers_normalized_crlf_match_over_raw_lf_suffix() {
@@ -148,8 +149,8 @@ fn failed_write_does_not_leave_an_internal_write_marker() {
     let error = actor
         .commit_plan(&mut actor.state.writer(), &plan, "failed-write")
         .unwrap_err();
-    assert_eq!(error.0.code, "ATOMIC_WRITE_FAILED");
-    let details = error.0.details.as_ref().unwrap();
+    assert_eq!(error.code(), ErrorCode::AtomicWriteFailed);
+    let details = error.details().unwrap();
     assert_eq!(details["failed_path"], "blocked");
     assert_eq!(details["completed_before_failure"], json!([]));
     assert_eq!(details["restored_paths"], json!([]));
@@ -236,7 +237,7 @@ async fn standard_response_detail_caps_oversized_edit_diff() {
 #[test]
 fn reversed_handle_ranges_are_rejected() {
     let error = line_range_bytes("first\nsecond\n", 3, 2).unwrap_err();
-    assert_eq!(error.0.code, "INVALID_HANDLE_RANGE");
+    assert_eq!(error.code(), ErrorCode::InvalidHandleRange);
 }
 
 #[test]
@@ -285,7 +286,7 @@ async fn overlapping_exact_edits_in_one_transaction_are_rejected() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.0.code, "OVERLAPPING_EDITS");
+    assert_eq!(error.code(), ErrorCode::OverlappingEdits);
     assert_eq!(
         fs::read_to_string(root.path().join("value.rs")).unwrap(),
         original
@@ -329,7 +330,7 @@ async fn handle_edit_cannot_share_a_file_with_another_change() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.0.code, "AMBIGUOUS_HANDLE_EDIT_ORDER");
+    assert_eq!(error.code(), ErrorCode::AmbiguousHandleEditOrder);
     assert_eq!(fs::read_to_string(path).unwrap(), original);
 }
 

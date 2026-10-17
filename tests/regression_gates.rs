@@ -35,7 +35,7 @@ fn malformed_retrieval_calls_are_rejected_deterministically() {
         let object = operation.as_object().unwrap();
         let error = prepare_retrieval_operation(operation["operation"].as_str().unwrap(), object)
             .unwrap_err();
-        assert_eq!(error.0.code, code);
+        assert_eq!(error.code().as_str(), code);
     }
 }
 

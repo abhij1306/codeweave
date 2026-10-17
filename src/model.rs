@@ -1,3 +1,4 @@
+use crate::error::{AppError, AppResult, ErrorCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -117,67 +118,13 @@ pub fn parse_daemon_config(value: &Value) -> AppResult<DaemonConfig> {
     let mut deserializer = serde_json::Deserializer::from_slice(&encoded);
     serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
         let path = error.path().to_string();
-        AppError::details(
-            "INVALID_CONFIG",
+        AppError::with_details(
+            ErrorCode::InvalidConfig,
             format!("invalid configuration at {path}: {}", error.inner()),
             serde_json::json!({"path": path, "error": error.inner().to_string()}),
         )
     })
 }
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ErrorBody {
-    pub code: String,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<Value>,
-}
-
-#[derive(Debug)]
-pub struct AppError(pub ErrorBody);
-pub type AppResult<T> = Result<T, AppError>;
-
-impl AppError {
-    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self(ErrorBody {
-            code: code.into(),
-            message: message.into(),
-            details: None,
-        })
-    }
-    pub fn details(code: impl Into<String>, message: impl Into<String>, details: Value) -> Self {
-        Self(ErrorBody {
-            code: code.into(),
-            message: message.into(),
-            details: Some(details),
-        })
-    }
-    pub fn invalid(message: impl Into<String>) -> Self {
-        Self::new("INVALID_ARGUMENT", message)
-    }
-    pub fn internal(error: impl std::fmt::Display) -> Self {
-        Self::new("INTERNAL_ERROR", error.to_string())
-    }
-}
-
-impl From<std::io::Error> for AppError {
-    fn from(value: std::io::Error) -> Self {
-        Self::internal(value)
-    }
-}
-impl From<serde_json::Error> for AppError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::new("INVALID_JSON", value.to_string())
-    }
-}
-
-impl std::fmt::Display for AppError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}] {}", self.0.code, self.0.message)
-    }
-}
-
-impl std::error::Error for AppError {}
 
 #[cfg(test)]
 mod tests {

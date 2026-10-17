@@ -4,6 +4,7 @@
 
 pub mod bash;
 pub mod contracts;
+pub mod error;
 pub mod index;
 pub mod intelligence;
 pub mod manager;

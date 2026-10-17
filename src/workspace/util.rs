@@ -1,5 +1,5 @@
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::ignored_workspace_path;
-use crate::model::{AppError, AppResult};
 use crate::requests::edit::Change;
 use serde::Serialize;
 use serde_json::json;
@@ -11,8 +11,8 @@ pub(super) fn line_range_bytes(
     end_line: usize,
 ) -> AppResult<(usize, usize)> {
     if start_line > end_line {
-        return Err(AppError::details(
-            "INVALID_HANDLE_RANGE",
+        return Err(AppError::with_details(
+            ErrorCode::InvalidHandleRange,
             "Handle start_line must be less than or equal to end_line",
             json!({"start_line": start_line, "end_line": end_line}),
         ));
@@ -107,8 +107,8 @@ pub(super) fn stale_snapshot(expected: &str, actual: &str) -> AppError {
 }
 
 pub(super) fn stale_snapshot_for_paths(expected: &str, actual: &str, paths: &[String]) -> AppError {
-    AppError::details(
-        "STALE_SNAPSHOT",
+    AppError::with_details(
+        ErrorCode::StaleSnapshot,
         "Workspace changed after the requested snapshot",
         json!({
             "expected_snapshot": expected,

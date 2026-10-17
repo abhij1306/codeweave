@@ -123,3 +123,35 @@ report `dropped_prefix_chars`, `retained_start_offset`, and
 `retention_policy: "tail"`; continuation tokens page only within that retained
 buffer. Output remains available in memory until the completed run is evicted.
 At most 128 completed runs are retained and active runs are never evicted.
+
+## Error codes
+
+A failed call returns `isError: true` with `structuredContent.error` holding
+`code`, `message`, `details`, `retryable` and `retry_kind`. Every code is a
+variant of `ErrorCode` (`src/error.rs`), and a unit test pins each wire string.
+
+`STALE_SNAPSHOT`, `STALE_FILE`, `STALE_HANDLE` and `STALE_CONTINUATION` are
+always retryable with `retry_kind: "retry_same_request"`. The request-validation
+codes (`MISSING_OPERATION_FIELD`, `INVALID_OPERATION_FIELD`,
+`UNKNOWN_OPERATION_FIELD`, `UNSUPPORTED_RETRIEVAL_OPERATION`,
+`MISSING_CHANGE_FIELD`, `INVALID_CHANGE_FIELD`, `UNKNOWN_CHANGE_FIELD`,
+`UNSUPPORTED_CHANGE_KIND`, `INVALID_BASH_REQUEST`) carry `retryable: false`, a
+fixed `retry_kind` and a `category` in `details`. Any other error is retryable
+only when its `details.retryable` says so.
+
+| Area | Codes |
+| --- | --- |
+| Request validation | `INVALID_ARGUMENT`, `INVALID_JSON`, `UNKNOWN_TOOL_FIELD`, `MISSING_OPERATION_FIELD`, `INVALID_OPERATION_FIELD`, `UNKNOWN_OPERATION_FIELD`, `UNSUPPORTED_RETRIEVAL_OPERATION`, `MISSING_CHANGE_FIELD`, `INVALID_CHANGE_FIELD`, `UNKNOWN_CHANGE_FIELD`, `UNSUPPORTED_CHANGE_KIND`, `INVALID_BASH_REQUEST` |
+| Configuration and startup | `INVALID_CONFIG`, `INVALID_POLICY`, `INVALID_EXCLUDE_PATTERN`, `NOT_INITIALIZED`, `WORKSPACE_NOT_FOUND`, `WORKSPACE_NOT_DIRECTORY`, `NOT_GIT_REPOSITORY`, `GIT_UNAVAILABLE`, `BASH_UNAVAILABLE` |
+| Paths and files | `OUTSIDE_ROOT`, `PATH_NOT_FOUND`, `PATH_EXISTS`, `PATH_NOT_INDEXED`, `PERMISSION_DENIED`, `READ_FAILED` |
+| Retrieval | `TOO_MANY_RETRIEVAL_OPERATIONS`, `DUPLICATE_RETRIEVAL_OPERATION_ID`, `UNSUPPORTED_READ_TARGET`, `INVALID_FETCH_KIND`, `INVALID_OUTLINE_PATH`, `INVALID_REGEX`, `SYMBOL_NOT_FOUND`, `AMBIGUOUS_SYMBOL`, `INVALID_HANDLE`, `INVALID_HANDLE_RANGE`, `INVALID_CONTINUATION`, `STALE_HANDLE`, `STALE_CONTINUATION` |
+| Edits | `STALE_SNAPSHOT`, `STALE_FILE`, `MISSING_PRECONDITION`, `MISSING_HANDLE`, `EXACT_MATCH_COUNT`, `OVERLAPPING_EDITS`, `AMBIGUOUS_HANDLE_EDIT_ORDER`, `SYNTAX_ERROR`, `ATOMIC_WRITE_FAILED`, `PARTIAL_COMMIT`, `INDEX_REFRESH_FAILED` |
+| Intelligence | `INTELLIGENCE_STALE`, `SEMANTIC_BACKEND_UNAVAILABLE`, `LSP_BUSY`, `LSP_TIMEOUT`, `LSP_TRANSPORT_ERROR`, `LSP_PROTOCOL_ERROR`, `LSP_ERROR`, `LSP_UNSUPPORTED`, `LSP_SYNC_UNSUPPORTED`, `LSP_START_FAILED`, `LSP_WORKER_START_FAILED`, `LSP_WORKER_STOPPED`, `INVALID_LSP_RESPONSE`, `INVALID_LSP_URI`, `UNSUPPORTED_LSP_URI`, `INVALID_LSP_POSITION`, `INVALID_LSP_EDIT`, `OVERLAPPING_LSP_EDITS`, `UNSUPPORTED_WORKSPACE_EDIT` |
+| Git | `GIT_FAILED`, `GIT_TIMEOUT`, `CONFIRMATION_REQUIRED`, `CONTINUATION_SCOPE_MISMATCH` |
+| Bash | `RUN_BUSY`, `RUN_NOT_FOUND`, `INVALID_CWD`, `INVALID_TIMEOUT`, `BASH_START_FAILED`, `BASH_PIPE_FAILED`, `BASH_QUEUE_CLOSED`, `BASH_EXECUTION_FAILED` |
+| Other | `INTERNAL_ERROR` |
+
+A filesystem error that reaches a client without its own mapping reports
+`PATH_NOT_FOUND` (missing path), `PATH_EXISTS` (existing path) or
+`PERMISSION_DENIED` (access refused by the operating system); any other I/O
+failure is `INTERNAL_ERROR`.

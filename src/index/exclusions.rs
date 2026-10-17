@@ -1,4 +1,4 @@
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::security::normalize_path_text;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde_json::json;
@@ -18,23 +18,23 @@ impl WorkspaceExclusions {
         for pattern in patterns {
             let normalized = pattern.replace('\\', "/");
             if normalized.trim().is_empty() || normalized.starts_with('!') {
-                return Err(AppError::details(
-                    "INVALID_EXCLUDE_PATTERN",
+                return Err(AppError::with_details(
+                    ErrorCode::InvalidExcludePattern,
                     "Workspace exclude patterns must be non-empty exclusions",
                     json!({"pattern": pattern}),
                 ));
             }
             builder.add_line(None, &normalized).map_err(|error| {
-                AppError::details(
-                    "INVALID_EXCLUDE_PATTERN",
+                AppError::with_details(
+                    ErrorCode::InvalidExcludePattern,
                     error.to_string(),
                     json!({"pattern": pattern}),
                 )
             })?;
         }
         let matcher = builder.build().map_err(|error| {
-            AppError::details(
-                "INVALID_EXCLUDE_PATTERN",
+            AppError::with_details(
+                ErrorCode::InvalidExcludePattern,
                 error.to_string(),
                 json!({"patterns": patterns}),
             )

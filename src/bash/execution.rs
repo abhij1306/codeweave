@@ -2,7 +2,7 @@
 use super::launch::{Launched, Launcher};
 use super::lifecycle::{ProcessOutcome, RunRecord, RunStatus};
 use super::output::Pipe;
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -89,7 +89,7 @@ pub(super) async fn execute(
         Ok(Ok(Ok(()))) => None,
         Ok(Ok(Err(error))) => Some(format!(
             "CodeWeave warning: live Bash logging failed: {}",
-            error.0.message
+            error.message()
         )),
         Ok(Err(error)) => Some(format!(
             "CodeWeave warning: output collector failed: {error}"
@@ -119,7 +119,8 @@ async fn collect_output(
     let mut stderr_done = false;
     let mut out = [0_u8; 8192];
     let mut err = [0_u8; 8192];
-    let pipe_error = |error: std::io::Error| AppError::new("BASH_PIPE_FAILED", error.to_string());
+    let pipe_error =
+        |error: std::io::Error| AppError::new(ErrorCode::BashPipeFailed, error.to_string());
     while !stdout_done || !stderr_done {
         tokio::select! {
             read = stdout.read(&mut out), if !stdout_done => {
@@ -154,7 +155,7 @@ pub(super) fn finalize_run_error(record: &Mutex<RunRecord>, error: &AppError) {
         None,
         Some(format!(
             "CodeWeave Bash execution failed: {}",
-            error.0.message
+            error.message()
         )),
     );
 }

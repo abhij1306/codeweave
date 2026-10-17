@@ -3,12 +3,12 @@
 use super::protocol::PositionEncoding;
 use super::request::Position;
 use super::session::ResultFiles;
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::reference_service::{ReferencePosition, ReferenceRange, SemanticReferenceLocation};
 use serde_json::{json, Value};
 
 fn invalid_position(message: &str) -> AppError {
-    AppError::new("INVALID_LSP_POSITION", message.to_owned())
+    AppError::new(ErrorCode::InvalidLspPosition, message.to_owned())
 }
 
 fn line_content(content: &str, line: usize) -> AppResult<&str> {
@@ -109,7 +109,7 @@ pub(crate) fn offset_for_server_position(
         base = content.len();
     }
     let line = selected
-        .ok_or_else(|| AppError::new("INVALID_LSP_EDIT", "Edit line is outside the file"))?;
+        .ok_or_else(|| AppError::new(ErrorCode::InvalidLspEdit, "Edit line is outside the file"))?;
     let prefix = prefix_for_server_column(line, server_column, encoding)?;
     Ok(base + prefix.len())
 }
@@ -136,8 +136,8 @@ pub(crate) fn lsp_position(value: &Value) -> AppResult<(usize, usize)> {
             .and_then(Value::as_u64)
             .and_then(|number| usize::try_from(number).ok())
             .ok_or_else(|| {
-                AppError::details(
-                    "INVALID_LSP_RESPONSE",
+                AppError::with_details(
+                    ErrorCode::InvalidLspResponse,
                     format!("LSP position lacks a numeric {key}"),
                     json!({"position": value}),
                 )
@@ -163,11 +163,11 @@ fn normalize_location(
         .get("uri")
         .or_else(|| item.get("targetUri"))
         .and_then(Value::as_str)
-        .ok_or_else(|| AppError::new("INVALID_LSP_RESPONSE", "Location lacks URI"))?;
+        .ok_or_else(|| AppError::new(ErrorCode::InvalidLspResponse, "Location lacks URI"))?;
     let range = item
         .get("range")
         .or_else(|| item.get("targetSelectionRange"))
-        .ok_or_else(|| AppError::new("INVALID_LSP_RESPONSE", "Location lacks range"))?;
+        .ok_or_else(|| AppError::new(ErrorCode::InvalidLspResponse, "Location lacks range"))?;
     let relative = files.relative(uri)?;
     let content = files.content(&relative)?;
     let (start_line, start_character) = lsp_position(&range["start"])?;
@@ -242,8 +242,8 @@ mod tests {
         assert_eq!(
             server_character_from_utf16(content, 1, 2, PositionEncoding::Utf8)
                 .unwrap_err()
-                .0
-                .code,
+                .code()
+                .as_str(),
             "INVALID_LSP_POSITION"
         );
     }
@@ -258,8 +258,8 @@ mod tests {
         assert_eq!(
             offset_for_server_position(content, 3, 0, PositionEncoding::Utf16)
                 .unwrap_err()
-                .0
-                .code,
+                .code()
+                .as_str(),
             "INVALID_LSP_EDIT"
         );
     }
@@ -273,8 +273,8 @@ mod tests {
         assert_eq!(
             lsp_position(&json!({"line": "2", "character": 7}))
                 .unwrap_err()
-                .0
-                .code,
+                .code()
+                .as_str(),
             "INVALID_LSP_RESPONSE"
         );
     }

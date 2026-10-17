@@ -4,11 +4,11 @@
 //! occurrences; the semantic path shapes language-server locations into the
 //! same response.
 
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::{
     encode_handle, slice_lines, CodeIndex, DocumentType, FileEntry, FileGroups, PathFilterSet,
     RangeHandle, SearchScope, SymbolDefinition, Window, WindowBuilder,
 };
-use crate::model::{AppError, AppResult};
 use crate::symbols::{
     identifier_occurrences_with_symbols, Evidence, IdentifierOccurrence, ReferenceKind, Symbol,
 };
@@ -261,8 +261,8 @@ impl<'a> ReferenceService<'a> {
 
     pub fn resolve_position(&self, path: &str, line: usize) -> AppResult<ReferenceTargetSelection> {
         let file = self.index.get(path).ok_or_else(|| {
-            AppError::details(
-                "PATH_NOT_INDEXED",
+            AppError::with_details(
+                ErrorCode::PathNotIndexed,
                 "Reference target path is not indexed",
                 json!({"path": path}),
             )
@@ -281,8 +281,8 @@ impl<'a> ReferenceService<'a> {
                 )
             })
             .ok_or_else(|| {
-                AppError::details(
-                    "SYMBOL_NOT_FOUND",
+                AppError::with_details(
+                    ErrorCode::SymbolNotFound,
                     "No indexed declaration contains the requested position",
                     json!({"path": path, "line": line}),
                 )
@@ -391,8 +391,8 @@ impl<'a> ReferenceService<'a> {
         let path_filters = PathFilterSet::new(scope.paths);
         let target_path = target.target.path.clone();
         let target_file = self.index.get(&target_path).ok_or_else(|| {
-            AppError::details(
-                "SYMBOL_NOT_FOUND",
+            AppError::with_details(
+                ErrorCode::SymbolNotFound,
                 "Reference target file is no longer indexed",
                 json!({"path": target_path}),
             )
@@ -511,8 +511,8 @@ impl<'a> ReferenceService<'a> {
         });
         let SymbolDefinition { path, symbol, .. } = match definitions.len() {
             0 => {
-                return Err(AppError::details(
-                    "SYMBOL_NOT_FOUND",
+                return Err(AppError::with_details(
+                    ErrorCode::SymbolNotFound,
                     "Reference search requires an indexed symbol definition",
                     json!({
                         "symbol": selector,
@@ -526,8 +526,8 @@ impl<'a> ReferenceService<'a> {
                     .iter()
                     .map(|found| json!({"path": found.path, "symbol": found.symbol}))
                     .collect::<Vec<_>>();
-                return Err(AppError::details(
-                    "AMBIGUOUS_SYMBOL",
+                return Err(AppError::with_details(
+                    ErrorCode::AmbiguousSymbol,
                     "Reference search found multiple declarations; specify definition_path and definition_line",
                     json!({"symbol": selector, "candidates": candidates}),
                 ));
@@ -535,8 +535,8 @@ impl<'a> ReferenceService<'a> {
         };
 
         let file = self.index.get(&path).ok_or_else(|| {
-            AppError::details(
-                "SYMBOL_NOT_FOUND",
+            AppError::with_details(
+                ErrorCode::SymbolNotFound,
                 "Reference target file is no longer indexed",
                 json!({"path": path}),
             )

@@ -1,5 +1,6 @@
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::intelligence::{IntelligenceRequest, IntelligenceResponse, IntelligenceService};
-use crate::model::{AppError, AppResult, DaemonConfig, WorkspaceConfig};
+use crate::model::{DaemonConfig, WorkspaceConfig};
 use crate::repository::CliGitBackend;
 use crate::requests::bash::BashRequest;
 use crate::requests::edit::EditRequest;
@@ -256,7 +257,10 @@ impl Application {
             let actor = self.actor()?;
             actor.snapshot_id()?;
             let service = self.intelligence.read().clone().ok_or_else(|| {
-                AppError::new("NOT_INITIALIZED", "Workspace has not been initialized")
+                AppError::new(
+                    ErrorCode::NotInitialized,
+                    "Workspace has not been initialized",
+                )
             })?;
             let response = tokio::task::spawn_blocking(move || service.execute(request))
                 .await
@@ -304,7 +308,7 @@ impl Application {
     fn actor(&self) -> AppResult<Arc<Workspace>> {
         self.actor.read().clone().ok_or_else(|| {
             AppError::new(
-                "NOT_INITIALIZED",
+                ErrorCode::NotInitialized,
                 "Daemon has not been initialized with a repository",
             )
         })
@@ -406,7 +410,7 @@ mod tests {
                 .initialize(config)
                 .await
                 .unwrap_err();
-            errors.push((error.0.code, error.0.message));
+            errors.push((error.code().as_str(), error.message().to_owned()));
         }
 
         assert_eq!(errors[0].0, "INVALID_ARGUMENT");
@@ -459,9 +463,9 @@ mod tests {
             let mut config = valid.clone();
             mutate(&mut config);
             let error = parse_daemon_config(&config).unwrap_err();
-            assert_eq!(error.0.code, "INVALID_CONFIG", "{expected_key}");
-            assert!(error.0.details.as_ref().unwrap()["path"].is_string());
-            assert!(error.0.message.contains(expected_key), "{expected_key}");
+            assert_eq!(error.code(), ErrorCode::InvalidConfig, "{expected_key}");
+            assert!(error.details().unwrap()["path"].is_string());
+            assert!(error.message().contains(expected_key), "{expected_key}");
         }
     }
 
@@ -487,7 +491,7 @@ mod tests {
 
         let error = manager.workspace(summary()).await.unwrap_err();
 
-        assert_eq!(error.0.code, "NOT_INITIALIZED");
+        assert_eq!(error.code(), ErrorCode::NotInitialized);
     }
 
     #[tokio::test]

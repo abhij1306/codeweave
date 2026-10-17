@@ -3,8 +3,7 @@
 //! `EditRequest` for the edit engine.
 
 use super::contract::{input_schema, Contract, Rejection};
-use crate::contracts::ErrorCode;
-use crate::model::AppResult;
+use crate::error::{AppError, AppResult, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -129,7 +128,8 @@ impl Change {
     /// Parse one item of a `changes` array.
     pub fn parse(value: Value) -> AppResult<Self> {
         let Some(object) = value.as_object() else {
-            return Err(ErrorCode::InvalidChangeField.error(
+            return Err(AppError::with_details(
+                ErrorCode::InvalidChangeField,
                 "transaction changes must be objects",
                 json!({"field": "changes"}),
             ));
@@ -139,15 +139,19 @@ impl Change {
             .and_then(Value::as_str)
             .filter(|kind| !kind.trim().is_empty())
             .ok_or_else(|| {
-                ErrorCode::MissingChangeField
-                    .error("change requires kind", json!({"field": "kind"}))
+                AppError::with_details(
+                    ErrorCode::MissingChangeField,
+                    "change requires kind",
+                    json!({"field": "kind"}),
+                )
             })?;
         let contracts = change_contracts();
         let contract = contracts
             .iter()
             .find(|contract| contract.name() == kind)
             .ok_or_else(|| {
-                ErrorCode::UnsupportedChangeKind.error(
+                AppError::with_details(
+                    ErrorCode::UnsupportedChangeKind,
                     format!("unsupported change kind '{kind}'"),
                     json!({
                         "kind": kind,
@@ -170,7 +174,8 @@ impl Change {
             .into_iter()
             .find(|(_, value)| value.trim().is_empty())
         {
-            Some((field, _)) => Err(ErrorCode::InvalidChangeField.error(
+            Some((field, _)) => Err(AppError::with_details(
+                ErrorCode::InvalidChangeField,
                 format!("change field '{field}' must be a non-empty string"),
                 json!({"field": field}),
             )),
@@ -512,7 +517,7 @@ mod tests {
             json!({"kind": "delete", "path": "  "}),
             json!({"kind": "replace_range", "path": "a.rs", "handle": "", "new_text": "x"}),
         ]
-        .map(|value| Change::parse(value).unwrap_err().0.code);
+        .map(|value| Change::parse(value).unwrap_err().code().as_str());
 
         assert_eq!(
             codes,
@@ -534,7 +539,7 @@ mod tests {
         let error = Change::parse(json!({"kind": "move", "path": "a.rs"})).unwrap_err();
 
         assert_eq!(
-            error.0.details.unwrap()["supported"],
+            error.details().unwrap()["supported"],
             json!([
                 "create",
                 "replace",

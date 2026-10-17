@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::ErrorCode;
 use crate::workspace::Stamp;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -150,7 +151,7 @@ async fn failed_git_status_is_reported_by_status_and_by_stage_responses() {
         .git(git_action(&json!({"action": "status"})))
         .await
         .unwrap_err();
-    assert_eq!(error.0.code, "GIT_FAILED");
+    assert_eq!(error.code(), ErrorCode::GitFailed);
     let staged = actor
         .git(git_action(
             &json!({"action": "stage", "paths": ["initial.rs"]}),

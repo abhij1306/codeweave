@@ -1,4 +1,4 @@
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::security::validate_relative;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
@@ -67,12 +67,12 @@ pub fn encode_handle(handle: &RangeHandle) -> AppResult<String> {
 pub fn decode_handle(input: &str) -> AppResult<RangeHandle> {
     let payload = input
         .strip_prefix("range:")
-        .ok_or_else(|| AppError::new("INVALID_HANDLE", "Unsupported range handle"))?;
+        .ok_or_else(|| AppError::new(ErrorCode::InvalidHandle, "Unsupported range handle"))?;
     let bytes = URL_SAFE_NO_PAD
         .decode(payload)
-        .map_err(|error| AppError::new("INVALID_HANDLE", error.to_string()))?;
+        .map_err(|error| AppError::new(ErrorCode::InvalidHandle, error.to_string()))?;
     serde_json::from_slice(&bytes)
-        .map_err(|error| AppError::new("INVALID_HANDLE", error.to_string()))
+        .map_err(|error| AppError::new(ErrorCode::InvalidHandle, error.to_string()))
 }
 
 pub fn content_hash(content: &str) -> String {

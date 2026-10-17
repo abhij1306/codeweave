@@ -6,7 +6,8 @@ mod lifecycle;
 mod output;
 mod readiness;
 
-use crate::model::{AppError, AppResult, PolicyConfig};
+use crate::error::{AppError, AppResult, ErrorCode};
+use crate::model::PolicyConfig;
 use crate::security::resolve_existing;
 use chrono::{DateTime, Utc};
 use execution::{execute, finalize_run_error, AbandonGuard, ExecutionRequest, TERMINATE_GRACE};
@@ -65,8 +66,8 @@ struct RunTable {
 impl RunTable {
     fn get(&self, run_id: &str) -> AppResult<SharedRecord> {
         self.runs.lock().get(run_id).cloned().ok_or_else(|| {
-            AppError::details(
-                "RUN_NOT_FOUND",
+            AppError::with_details(
+                ErrorCode::RunNotFound,
                 "Bash run not found",
                 json!({"run_id": run_id}),
             )
@@ -151,22 +152,22 @@ struct PreparedStartRequest {
 
 fn validate_policy(policy: &PolicyConfig) -> AppResult<()> {
     if policy.bash.executable.trim().is_empty() {
-        return Err(AppError::details(
-            "INVALID_POLICY",
+        return Err(AppError::with_details(
+            ErrorCode::InvalidPolicy,
             "policy.bash.executable must not be empty",
             json!({}),
         ));
     }
     if policy.bash.max_output_chars == 0 {
-        return Err(AppError::details(
-            "INVALID_POLICY",
+        return Err(AppError::with_details(
+            ErrorCode::InvalidPolicy,
             "policy.bash.maxOutputChars must be greater than zero",
             json!({"max_output_chars": policy.bash.max_output_chars}),
         ));
     }
     if policy.bash.default_timeout_ms == 0 || policy.bash.max_timeout_ms == 0 {
-        return Err(AppError::details(
-            "INVALID_POLICY",
+        return Err(AppError::with_details(
+            ErrorCode::InvalidPolicy,
             "policy.bash timeout values must be greater than zero",
             json!({
                 "default_timeout_ms": policy.bash.default_timeout_ms,
@@ -175,8 +176,8 @@ fn validate_policy(policy: &PolicyConfig) -> AppResult<()> {
         ));
     }
     if policy.bash.default_timeout_ms > policy.bash.max_timeout_ms {
-        return Err(AppError::details(
-            "INVALID_POLICY",
+        return Err(AppError::with_details(
+            ErrorCode::InvalidPolicy,
             "policy.bash.defaultTimeoutMs must be less than or equal to maxTimeoutMs",
             json!({
                 "default_timeout_ms": policy.bash.default_timeout_ms,
@@ -223,8 +224,8 @@ impl BashSupervisor {
 
     fn launcher(&self) -> AppResult<Arc<dyn Launcher>> {
         self.launcher.clone().ok_or_else(|| {
-            AppError::details(
-                "BASH_UNAVAILABLE",
+            AppError::with_details(
+                ErrorCode::BashUnavailable,
                 self.readiness
                     .failure_reason
                     .clone()
@@ -286,14 +287,17 @@ impl BashSupervisor {
             resolve_existing(root, &cwd_relative)?
         };
         if !cwd.is_dir() {
-            return Err(AppError::new("INVALID_CWD", "Bash cwd is not a directory"));
+            return Err(AppError::new(
+                ErrorCode::InvalidCwd,
+                "Bash cwd is not a directory",
+            ));
         }
         let timeout_ms = request
             .timeout_ms
             .unwrap_or(self.policy.bash.default_timeout_ms);
         if timeout_ms == 0 || timeout_ms > self.policy.bash.max_timeout_ms {
-            return Err(AppError::details(
-                "INVALID_TIMEOUT",
+            return Err(AppError::with_details(
+                ErrorCode::InvalidTimeout,
                 "timeout_ms must be greater than zero and no larger than policy.bash.maxTimeoutMs",
                 json!({
                     "timeout_ms": timeout_ms,
@@ -316,8 +320,8 @@ impl BashSupervisor {
             Ok(permit) => permit,
             Err(_) => {
                 let active = self.active_run_view();
-                return Err(AppError::details(
-                    "RUN_BUSY",
+                return Err(AppError::with_details(
+                    ErrorCode::RunBusy,
                     "Another command is already running",
                     json!({
                         "retryable": true,
@@ -382,7 +386,7 @@ impl BashSupervisor {
                     Ok(permit) => permit,
                     Err(_) => {
                         let error = AppError::new(
-                            "BASH_QUEUE_CLOSED",
+                            ErrorCode::BashQueueClosed,
                             "Bash execution queue is unavailable",
                         );
                         finalize_run_error(record, &error);
@@ -440,8 +444,8 @@ impl BashSupervisor {
                 result?;
                 self.status(&run_id)
             }
-            Some(Err(join_error)) => Err(AppError::details(
-                "BASH_EXECUTION_FAILED",
+            Some(Err(join_error)) => Err(AppError::with_details(
+                ErrorCode::BashExecutionFailed,
                 "Bash execution task terminated unexpectedly",
                 json!({"run_id": run_id, "detail": join_error.to_string()}),
             )),

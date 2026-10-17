@@ -1,5 +1,6 @@
 use super::util::stale_snapshot;
 use super::*;
+use crate::error::ErrorCode;
 use crate::requests::retrieval::CodeRetrieveRequest;
 use crate::retrieval::{
     prepare_retrieval_operation, PreparedRetrievalOperation, MAX_RETRIEVAL_OPERATIONS,
@@ -17,8 +18,8 @@ impl Workspace {
             ));
         }
         if operations.len() > MAX_RETRIEVAL_OPERATIONS {
-            return Err(AppError::details(
-                "TOO_MANY_RETRIEVAL_OPERATIONS",
+            return Err(AppError::with_details(
+                ErrorCode::TooManyRetrievalOperations,
                 format!("code_retrieve accepts at most {MAX_RETRIEVAL_OPERATIONS} operations"),
                 json!({
                     "requested": operations.len(),
@@ -46,7 +47,7 @@ impl Workspace {
                 errors.push(json!({
                     "id": fallback_id,
                     "operation": Value::Null,
-                    "error": error.0
+                    "error": error
                 }));
                 if fail_fast {
                     break;
@@ -61,15 +62,15 @@ impl Workspace {
                 .unwrap_or(fallback_id);
             let operation_name = operation.get("operation").cloned().unwrap_or(Value::Null);
             if !seen_ids.insert(id.clone()) {
-                let error = AppError::details(
-                    "DUPLICATE_RETRIEVAL_OPERATION_ID",
+                let error = AppError::with_details(
+                    ErrorCode::DuplicateRetrievalOperationId,
                     format!("duplicate retrieval operation id '{id}'"),
                     json!({"id": id}),
                 );
                 errors.push(json!({
                     "id": id,
                     "operation": operation_name,
-                    "error": error.0
+                    "error": error
                 }));
                 if fail_fast {
                     break;
@@ -85,7 +86,7 @@ impl Workspace {
                 errors.push(json!({
                     "id": id,
                     "operation": Value::Null,
-                    "error": error.0
+                    "error": error
                 }));
                 if fail_fast {
                     break;
@@ -103,7 +104,7 @@ impl Workspace {
                     errors.push(json!({
                         "id": id,
                         "operation": kind,
-                        "error": error.0
+                        "error": error
                     }));
                     if fail_fast {
                         break;

@@ -6,8 +6,7 @@
 //! carry. The type is therefore the single definition of the published schema,
 //! the runtime field checks and the typed value handlers receive.
 
-use crate::contracts::ErrorCode;
-use crate::model::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorCode};
 use schemars::generate::SchemaSettings;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -95,7 +94,8 @@ pub enum Rejection {
 impl Rejection {
     fn unknown(self, contract: &Contract, unknown: Vec<String>) -> AppError {
         match self {
-            Self::ChangeItem => ErrorCode::UnknownChangeField.error(
+            Self::ChangeItem => AppError::with_details(
+                ErrorCode::UnknownChangeField,
                 "change received unsupported fields",
                 json!({
                     "contract": contract.name,
@@ -103,8 +103,8 @@ impl Rejection {
                     "allowed": contract.allowed
                 }),
             ),
-            Self::Argument | Self::Bash | Self::Change => AppError::details(
-                "UNKNOWN_TOOL_FIELD",
+            Self::Argument | Self::Bash | Self::Change => AppError::with_details(
+                ErrorCode::UnknownToolField,
                 format!("tool '{}' received unsupported fields", contract.name),
                 json!({"unknown": unknown, "allowed": contract.allowed}),
             ),
@@ -119,10 +119,10 @@ impl Rejection {
             "required": contract.required
         });
         match self {
-            Self::Argument => AppError::details("INVALID_ARGUMENT", message, details),
-            Self::Bash => ErrorCode::InvalidBashRequest.error(message, details),
+            Self::Argument => AppError::with_details(ErrorCode::InvalidArgument, message, details),
+            Self::Bash => AppError::with_details(ErrorCode::InvalidBashRequest, message, details),
             Self::Change | Self::ChangeItem => {
-                ErrorCode::MissingChangeField.error(message, details)
+                AppError::with_details(ErrorCode::MissingChangeField, message, details)
             }
         }
     }
@@ -130,10 +130,10 @@ impl Rejection {
     /// A field that is present but has the wrong type or value.
     pub fn invalid(self, message: impl Into<String>, details: Value) -> AppError {
         match self {
-            Self::Argument => AppError::details("INVALID_ARGUMENT", message, details),
-            Self::Bash => ErrorCode::InvalidBashRequest.error(message, details),
+            Self::Argument => AppError::with_details(ErrorCode::InvalidArgument, message, details),
+            Self::Bash => AppError::with_details(ErrorCode::InvalidBashRequest, message, details),
             Self::Change | Self::ChangeItem => {
-                ErrorCode::InvalidChangeField.error(message, details)
+                AppError::with_details(ErrorCode::InvalidChangeField, message, details)
             }
         }
     }
@@ -367,7 +367,7 @@ mod tests {
             json!({"name": ""}),
             json!(["not", "an", "object"]),
         ]
-        .map(|value| parse(value).unwrap_err().0.code);
+        .map(|value| parse(value).unwrap_err().code().as_str());
 
         assert_eq!(
             codes,
@@ -392,9 +392,9 @@ mod tests {
             .parse::<Sample>(json!({}), Rejection::ChangeItem)
             .unwrap_err();
 
-        assert_eq!(unknown.0.code, "UNKNOWN_CHANGE_FIELD");
-        assert_eq!(unknown.0.details.unwrap()["unknown"], json!(["extra"]));
-        assert_eq!(missing.0.code, "MISSING_CHANGE_FIELD");
-        assert_eq!(missing.0.details.unwrap()["missing"], json!(["name"]));
+        assert_eq!(unknown.code(), ErrorCode::UnknownChangeField);
+        assert_eq!(unknown.details().unwrap()["unknown"], json!(["extra"]));
+        assert_eq!(missing.code(), ErrorCode::MissingChangeField);
+        assert_eq!(missing.details().unwrap()["missing"], json!(["name"]));
     }
 }

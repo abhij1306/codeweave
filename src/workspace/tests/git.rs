@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::ErrorCode;
 
 #[tokio::test]
 async fn git_diff_continuation_preserves_the_original_scope() {
@@ -76,7 +77,7 @@ async fn git_diff_continuation_preserves_the_original_scope() {
         })))
         .await
         .unwrap_err();
-    assert_eq!(error.0.code, "CONTINUATION_SCOPE_MISMATCH");
+    assert_eq!(error.code(), ErrorCode::ContinuationScopeMismatch);
 }
 
 #[tokio::test]
@@ -158,4 +159,150 @@ fn push_target_defaults_to_current_branch_and_rejects_git_syntax() {
         assert!(validated_push_target(&push_request(&params), "main").is_err());
     }
     assert!(validated_push_target(&push_request(&json!({})), "").is_err());
+}
+
+const SCRIPTED_HEADER: &str = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n";
+const SCRIPTED_DIFF: &str = concat!(
+    "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n",
+    "@@ -2 +2 @@\n-two\n+TWO\n",
+    "@@ -20 +20 @@\n-twenty\n+TWENTY\n",
+    "@@ -40 +40 @@\n-forty\n+FORTY\n",
+);
+
+/// A workspace whose repository answers every diff with [`SCRIPTED_DIFF`] and
+/// whose `a.rs` declares `twenty` on lines 19-21.
+fn scripted_diff_workspace(root: &Path) -> (Arc<Workspace>, Arc<ScriptedRepository>) {
+    let mut source = (1..=18)
+        .map(|line| format!("// line {line}\n"))
+        .collect::<String>();
+    source.push_str("fn twenty() {\n    let _ = 20;\n}\n");
+    fs::write(root.join("a.rs"), source).unwrap();
+    let repository = ScriptedRepository::new(RepoStatus {
+        is_git: true,
+        ..RepoStatus::default()
+    });
+    repository.diff_with(SCRIPTED_DIFF);
+    let actor = test_actor_with_repository(root, Arc::clone(&repository));
+    (actor, repository)
+}
+
+fn new_start_lines(response: &Value) -> Vec<u64> {
+    response["hunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hunk| hunk["new"]["start_line"].as_u64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn git_diff_line_focus_returns_only_overlapping_hunks() {
+    let root = tempdir().unwrap();
+    let (actor, _) = scripted_diff_workspace(root.path());
+
+    let focused = actor
+        .git(git_action(&json!({
+            "action": "diff", "paths": ["a.rs"], "start_line": 18, "end_line": 22
+        })))
+        .await
+        .unwrap();
+
+    assert_eq!(new_start_lines(&focused), [20]);
+    assert_eq!(
+        focused["output"],
+        format!("{SCRIPTED_HEADER}@@ -20 +20 @@\n-twenty\n+TWENTY\n")
+    );
+    assert_eq!(focused["truncated"], false);
+}
+
+#[tokio::test]
+async fn git_diff_hunk_ids_select_hunks_from_an_earlier_response() {
+    let root = tempdir().unwrap();
+    let (actor, _) = scripted_diff_workspace(root.path());
+    let all = actor
+        .git(git_action(&json!({"action": "diff", "paths": ["a.rs"]})))
+        .await
+        .unwrap();
+    assert_eq!(new_start_lines(&all), [2, 20, 40]);
+    let last = all["hunks"][2]["id"].clone();
+
+    let selected = actor
+        .git(git_action(
+            &json!({"action": "diff", "paths": ["a.rs"], "hunk_ids": [last]}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(new_start_lines(&selected), [40]);
+}
+
+#[tokio::test]
+async fn git_diff_symbol_focus_uses_the_indexed_declaration_range() {
+    let root = tempdir().unwrap();
+    let (actor, _) = scripted_diff_workspace(root.path());
+
+    let focused = actor
+        .git(git_action(
+            &json!({"action": "diff", "paths": ["a.rs"], "symbol": "twenty"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(new_start_lines(&focused), [20]);
+
+    let unknown = actor
+        .git(git_action(
+            &json!({"action": "diff", "paths": ["a.rs"], "symbol": "missing"}),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code(), ErrorCode::SymbolNotFound);
+
+    let without_path = actor
+        .git(git_action(&json!({"action": "diff", "symbol": "twenty"})))
+        .await
+        .unwrap_err();
+    assert_eq!(without_path.code(), ErrorCode::InvalidArgument);
+    assert_eq!(
+        without_path.message(),
+        "git_diff symbol focus requires exactly one path"
+    );
+}
+
+#[tokio::test]
+async fn git_diff_pages_replay_the_original_scope_until_the_snapshot_moves() {
+    let root = tempdir().unwrap();
+    let (actor, repository) = scripted_diff_workspace(root.path());
+
+    let first = actor
+        .git(git_action(
+            &json!({"action": "diff", "paths": ["a.rs"], "max_chars": 80}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(new_start_lines(&first), [2]);
+    let second = actor
+        .git(git_action(&json!({
+            "action": "diff", "continuation": first["continuation"], "max_chars": 80
+        })))
+        .await
+        .unwrap();
+    assert_eq!(new_start_lines(&second), [20]);
+    assert_eq!(second["truncated"], true);
+    assert_eq!(
+        repository.diff_requests(),
+        [
+            (false, vec!["a.rs".to_owned()]),
+            (false, vec!["a.rs".to_owned()])
+        ]
+    );
+
+    fs::write(root.path().join("b.rs"), "fn b() {}\n").unwrap();
+    actor.refresh(true).unwrap();
+    let stale = actor
+        .git(git_action(&json!({
+            "action": "diff", "continuation": second["continuation"], "max_chars": 80
+        })))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), ErrorCode::StaleContinuation);
 }

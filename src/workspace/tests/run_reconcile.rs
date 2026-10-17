@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::ErrorCode;
 
 #[test]
 fn workspace_diagnostics_exposes_bash_policy_and_limits() {
@@ -323,7 +324,7 @@ async fn unavailable_bash_validation_rejects_before_mutation() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.0.code, "BASH_UNAVAILABLE");
+    assert_eq!(error.code(), ErrorCode::BashUnavailable);
     assert_eq!(fs::read_to_string(path).unwrap(), original);
 }
 

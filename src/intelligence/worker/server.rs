@@ -65,8 +65,8 @@ impl Server {
         )?;
         server.capabilities = parse_initialize_result(&result, started.elapsed().as_millis())
             .map_err(|error| WorkerError::Protocol {
-                message: error.0.message,
-                details: error.0.details,
+                message: error.message().to_owned(),
+                details: error.details().cloned(),
             })?;
         server.notify(
             &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),

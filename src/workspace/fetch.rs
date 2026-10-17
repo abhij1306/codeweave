@@ -1,9 +1,9 @@
 use super::util::line_ending_label;
 use super::Workspace;
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::{
     decode_handle, encode_handle, slice_lines, FileEntry, RangeHandle, SymbolDefinition,
 };
-use crate::model::{AppError, AppResult};
 use crate::retrieval::ReadTarget;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
@@ -34,9 +34,9 @@ struct FetchContinuation {
 #[derive(Clone, Copy)]
 struct FetchPrecondition<'a> {
     expected_hash: &'a str,
-    missing_code: &'static str,
+    missing_code: ErrorCode,
     missing_message: &'static str,
-    stale_code: &'static str,
+    stale_code: ErrorCode,
     stale_message: &'static str,
 }
 
@@ -100,7 +100,7 @@ impl Workspace {
                     "index": index,
                     "kind": item.get("kind"),
                     "value": item.get("value"),
-                    "error": error.0,
+                    "error": error,
                 })),
             }
         }
@@ -171,7 +171,7 @@ impl Workspace {
                 let handle = decode_handle(value)?;
                 if handle.workspace_id != self.id {
                     return Err(AppError::new(
-                        "INVALID_HANDLE",
+                        ErrorCode::InvalidHandle,
                         "Handle belongs to another workspace",
                     ));
                 }
@@ -185,9 +185,9 @@ impl Workspace {
                     remaining,
                     Some(FetchPrecondition {
                         expected_hash: &handle.content_hash,
-                        missing_code: "STALE_HANDLE",
+                        missing_code: ErrorCode::StaleHandle,
                         missing_message: "Handle path no longer exists",
-                        stale_code: "STALE_HANDLE",
+                        stale_code: ErrorCode::StaleHandle,
                         stale_message: "File changed after handle creation",
                     }),
                 )
@@ -224,7 +224,7 @@ impl Workspace {
                 let continuation = decode_fetch_continuation(value)?;
                 if continuation.workspace_id != self.id {
                     return Err(AppError::new(
-                        "INVALID_CONTINUATION",
+                        ErrorCode::InvalidContinuation,
                         "Continuation belongs to another workspace",
                     ));
                 }
@@ -235,9 +235,9 @@ impl Workspace {
                     remaining,
                     Some(FetchPrecondition {
                         expected_hash: &continuation.content_hash,
-                        missing_code: "STALE_CONTINUATION",
+                        missing_code: ErrorCode::StaleContinuation,
                         missing_message: "Continuation path no longer exists",
-                        stale_code: "STALE_CONTINUATION",
+                        stale_code: ErrorCode::StaleContinuation,
                         stale_message: "File changed after continuation creation",
                     }),
                 )
@@ -266,8 +266,8 @@ impl Workspace {
         let requested_path = requested_path.or(qualified_path);
         let candidates = index.find_symbols(requested_path, symbol_name);
         if candidates.is_empty() {
-            return Err(AppError::details(
-                "SYMBOL_NOT_FOUND",
+            return Err(AppError::with_details(
+                ErrorCode::SymbolNotFound,
                 "Symbol not found",
                 json!({"symbol": symbol_name, "path": requested_path}),
             ));
@@ -296,8 +296,8 @@ impl Workspace {
                     })
                 })
                 .collect::<Vec<_>>();
-            return Err(AppError::details(
-                "AMBIGUOUS_SYMBOL",
+            return Err(AppError::with_details(
+                ErrorCode::AmbiguousSymbol,
                 "Symbol name matches multiple declarations; specify path or fetch a candidate handle",
                 json!({"symbol": symbol_name, "candidates": candidates}),
             ));
@@ -305,8 +305,8 @@ impl Workspace {
         let SymbolDefinition { path, symbol, .. } =
             candidates.into_iter().next().expect("checked non-empty");
         let file = index.get(&path).ok_or_else(|| {
-            AppError::details(
-                "PATH_NOT_INDEXED",
+            AppError::with_details(
+                ErrorCode::PathNotIndexed,
                 "Symbol path is not indexed",
                 json!({"path": path, "symbol": symbol_name}),
             )
@@ -342,8 +342,8 @@ impl Workspace {
         let view = self.state.read();
         let index = view.index();
         let file = index.get(path).ok_or_else(|| {
-            AppError::details(
-                "PATH_NOT_INDEXED",
+            AppError::with_details(
+                ErrorCode::PathNotIndexed,
                 "File is not indexed",
                 json!({"path": path}),
             )
@@ -373,8 +373,8 @@ impl Workspace {
         let file = index.get(path).ok_or_else(|| {
             precondition.map_or_else(
                 || {
-                    AppError::details(
-                        "PATH_NOT_INDEXED",
+                    AppError::with_details(
+                        ErrorCode::PathNotIndexed,
                         "File is not indexed",
                         json!({"path": path}),
                     )
@@ -384,7 +384,7 @@ impl Workspace {
         })?;
         if let Some(condition) = precondition {
             if file.hash() != condition.expected_hash {
-                return Err(AppError::details(
+                return Err(AppError::with_details(
                     condition.stale_code,
                     condition.stale_message,
                     json!({
@@ -498,8 +498,8 @@ fn read_target_from_item(item: &Value) -> AppResult<ReadTarget> {
             "bash_log" => ReadTarget::BashLog(value),
             "continuation" => ReadTarget::Continuation(value),
             kind => {
-                return Err(AppError::details(
-                    "INVALID_FETCH_KIND",
+                return Err(AppError::with_details(
+                    ErrorCode::InvalidFetchKind,
                     "Unknown fetch kind",
                     json!({"kind": kind}),
                 ))
@@ -622,9 +622,9 @@ fn encode_fetch_continuation(value: &FetchContinuation) -> AppResult<String> {
 fn decode_fetch_continuation(value: &str) -> AppResult<FetchContinuation> {
     let payload = value
         .strip_prefix("fetch:")
-        .ok_or_else(|| AppError::new("INVALID_CONTINUATION", "Unsupported continuation"))?;
+        .ok_or_else(|| AppError::new(ErrorCode::InvalidContinuation, "Unsupported continuation"))?;
     let bytes = URL_SAFE_NO_PAD
         .decode(payload)
-        .map_err(|error| AppError::new("INVALID_CONTINUATION", error.to_string()))?;
+        .map_err(|error| AppError::new(ErrorCode::InvalidContinuation, error.to_string()))?;
     Ok(serde_json::from_slice(&bytes)?)
 }

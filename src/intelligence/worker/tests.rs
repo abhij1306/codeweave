@@ -2,6 +2,7 @@
 //! bounded queueing, and status reporting.
 use super::super::test_support::{FakeServer, Fixture, Reply};
 use super::*;
+use crate::error::ErrorCode;
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 
@@ -145,8 +146,8 @@ fn a_server_error_reply_is_reported_without_restarting() {
         .unwrap_err();
 
     let error = AppError::from(error);
-    assert_eq!(error.0.code, "LSP_ERROR");
-    assert_eq!(error.0.details.unwrap()["message"], "internal");
+    assert_eq!(error.code(), ErrorCode::LspError);
+    assert_eq!(error.details().unwrap()["message"], "internal");
     assert_eq!(server.spawn_count(), 1);
     assert_eq!(worker.status()["readiness"], "ready");
 }
@@ -166,7 +167,7 @@ fn an_unsupported_operation_is_refused_before_any_request() {
         .execute(definition(), fixture.document("main.rs", "rust"))
         .unwrap_err();
 
-    assert_eq!(AppError::from(error).0.code, "LSP_UNSUPPORTED");
+    assert_eq!(AppError::from(error).code(), ErrorCode::LspUnsupported);
     assert!(server.messages("textDocument/definition").is_empty());
 }
 
@@ -239,7 +240,10 @@ fn a_disabled_worker_reports_disabled_and_refuses_requests() {
         .execute(definition(), fixture.document("main.rs", "rust"))
         .unwrap_err();
 
-    assert_eq!(AppError::from(error).0.code, "SEMANTIC_BACKEND_UNAVAILABLE");
+    assert_eq!(
+        AppError::from(error).code(),
+        ErrorCode::SemanticBackendUnavailable
+    );
     assert_eq!(worker.status()["readiness"], "disabled");
     assert_eq!(worker.status()["command"], "rust-analyzer");
 }

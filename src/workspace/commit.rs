@@ -3,8 +3,8 @@ use super::events::MutationRecord;
 use super::io_helpers::{atomic_write, remove_if_exists, restore_one};
 use super::state::StateWriter;
 use super::Workspace;
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::content_hash;
-use crate::model::{AppError, AppResult};
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -87,11 +87,11 @@ impl Workspace {
                 ledger.forget_internal(&absolute);
                 let report = self.compensate(writer, progress.completed(), false);
                 let manual_recovery_required = report.manual_recovery_required();
-                return Err(AppError::details(
+                return Err(AppError::with_details(
                     if manual_recovery_required {
-                        "PARTIAL_COMMIT"
+                        ErrorCode::PartialCommit
                     } else {
-                        "ATOMIC_WRITE_FAILED"
+                        ErrorCode::AtomicWriteFailed
                     },
                     error.to_string(),
                     json!({
@@ -125,7 +125,7 @@ impl Workspace {
             return Err(self.failed_after_apply(
                 writer,
                 &progress,
-                "INDEX_REFRESH_FAILED",
+                ErrorCode::IndexRefreshFailed,
                 error.to_string(),
             ));
         }
@@ -137,14 +137,14 @@ impl Workspace {
         &self,
         writer: &mut StateWriter<'_>,
         progress: &CommitProgress<'_>,
-        failure_code: &'static str,
+        failure_code: ErrorCode,
         message: String,
     ) -> AppError {
         let report = self.compensate(writer, progress.completed(), true);
         let manual_recovery_required = report.manual_recovery_required();
-        AppError::details(
+        AppError::with_details(
             if manual_recovery_required {
-                "PARTIAL_COMMIT"
+                ErrorCode::PartialCommit
             } else {
                 failure_code
             },
@@ -201,7 +201,7 @@ impl Workspace {
             });
             if let Err(error) = refreshed {
                 self.state.ledger().mark_pending(paths);
-                report.compensation_refresh_error = Some(json!(error.0));
+                report.compensation_refresh_error = Some(json!(error));
             }
         }
         report
