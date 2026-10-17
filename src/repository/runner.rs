@@ -312,6 +312,6 @@ mod tests {
         assert_eq!(truncate_output("short".to_owned(), 10), "short");
         let cut = truncate_output("é".repeat(40), 30);
         assert!(cut.len() <= 30);
-        assert_eq!(cut, format!("{}\n… output truncated …", "é"));
+        assert_eq!(cut, "éé\n… output truncated …");
     }
 }
