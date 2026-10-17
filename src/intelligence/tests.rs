@@ -3,8 +3,9 @@
 use super::preset::LspPreset;
 use super::test_support::{FakeServer, Fixture, Reply};
 use super::IntelligenceResponse;
-use crate::index::{content_hash, SearchParams};
+use crate::index::{content_hash, SearchScope};
 use crate::model::AppResult;
+use crate::reference_service::{ReferenceQuery, ReferenceScope, ReferenceService};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
@@ -293,23 +294,23 @@ fn reference_fallback_matches_code_retrieve_references() {
     let fixture = fixture();
     let service = fixture.service();
     let snapshot_id = fixture.live().snapshot_id();
-    let expected = fixture
-        .index()
-        .read()
-        .search(SearchParams {
-            workspace_id: "fixture",
-            snapshot_id: &snapshot_id,
-            mode: "references",
-            query: "open_workspace",
-            path_filters: &[],
-            case_sensitive: true,
-            max_results: 20,
-            context_lines: 0,
-            reference_scope: "all",
-            reference_kinds: &[],
-            definition_path: Some("src/lib.rs"),
-            definition_line: Some(1),
-        })
+    let expected = ReferenceService::new(&fixture.index().read())
+        .fallback(
+            &SearchScope {
+                workspace_id: "fixture",
+                snapshot_id: &snapshot_id,
+                paths: &[],
+                max_results: 20,
+            },
+            &ReferenceQuery {
+                symbol: "open_workspace".to_owned(),
+                scope: ReferenceScope::All,
+                kinds: Vec::new(),
+                definition_path: Some("src/lib.rs".to_owned()),
+                definition_line: Some(1),
+                context_lines: 0,
+            },
+        )
         .unwrap();
 
     let actual = run(&service, references()).unwrap();

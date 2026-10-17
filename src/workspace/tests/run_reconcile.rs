@@ -216,9 +216,12 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
     assert_eq!(fetch["reconcile_pending"], true);
     assert!(fetch["phase_ms"]["fetch_items"].is_number());
 
-    let search = actor
-        .search_index(&json!({"mode": "literal", "query": "pending_symbol"}))
+    let retrieved = actor
+        .code_retrieve(&json!({
+            "operations": [{"operation": "search_text", "pattern": "pending_symbol"}]
+        }))
         .unwrap();
+    let search = &retrieved["results"][0]["result"];
     assert_eq!(search["reconcile_pending"], true);
     assert_eq!(search["result_count"], 0);
     assert!(search["phase_ms"]["index_search"].is_number());

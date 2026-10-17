@@ -141,7 +141,7 @@ impl Workspace {
         operation: &serde_json::Map<String, Value>,
     ) -> AppResult<Value> {
         match prepare_retrieval_operation(kind, operation)? {
-            PreparedRetrievalOperation::Search(params) => self.search_index(&params),
+            PreparedRetrievalOperation::Search(request) => self.search_index(&request),
             PreparedRetrievalOperation::Read(read) => {
                 let result = self.read_target(&read.item, read.max_chars)?;
                 if read.compact {

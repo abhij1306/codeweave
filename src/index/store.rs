@@ -8,6 +8,16 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 /// Domain separator of snapshot ids. Changing it changes every snapshot id.
 const SNAPSHOT_DOMAIN: &str = "codeweave-index";
 
+/// One declaration found by `CodeIndex::find_symbols`.
+#[derive(Debug, Clone)]
+pub struct SymbolDefinition {
+    /// Workspace-relative path of the declaring file.
+    pub path: String,
+    pub symbol: Symbol,
+    /// Content hash of the declaring file.
+    pub hash: String,
+}
+
 /// The in-memory workspace index. Mutation goes through `insert` and
 /// `remove`, which keep the symbol postings and the snapshot digest current,
 /// so every query, including `snapshot_id`, only needs `&self`.
@@ -115,24 +125,17 @@ impl CodeIndex {
         self.symbol_index.iter()
     }
 
-    #[cfg(test)]
-    pub fn find_symbol(&self, path: Option<&str>, name: &str) -> Option<(String, Symbol, String)> {
-        self.find_symbols(path, name).into_iter().next()
-    }
-
     /// Return every declaration matching `name`, optionally constrained to one
     /// workspace-relative path. Besides leaf names, this accepts qualified method
     /// names such as `BrowserAttemptRunner.run` and `BrowserAttemptRunner::run`.
-    pub fn find_symbols(&self, path: Option<&str>, name: &str) -> Vec<(String, Symbol, String)> {
+    pub fn find_symbols(&self, path: Option<&str>, name: &str) -> Vec<SymbolDefinition> {
         let leaf_name = qualified_symbol_parts(name)
             .map(|(_, leaf)| leaf)
             .unwrap_or(name);
-        let found = |file: &FileEntry, symbol: &Symbol| {
-            (
-                file.path().to_owned(),
-                symbol.clone(),
-                file.hash().to_owned(),
-            )
+        let found = |file: &FileEntry, symbol: &Symbol| SymbolDefinition {
+            path: file.path().to_owned(),
+            symbol: symbol.clone(),
+            hash: file.hash().to_owned(),
         };
         if let Some(path) = path {
             let Some(file) = self.get(path) else {

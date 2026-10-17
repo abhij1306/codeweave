@@ -284,10 +284,14 @@ impl Workspace {
                             "AMBIGUOUS_SYMBOL"
                         },
                         "git_diff symbol focus requires one indexed declaration",
-                        json!({"path": scope.paths[0], "symbol": symbol, "candidates": symbols.into_iter().map(|(path, symbol, _)| json!({"path": path, "symbol": symbol})).collect::<Vec<_>>() }),
+                        json!({"path": scope.paths[0], "symbol": symbol, "candidates": symbols.into_iter().map(|found| json!({"path": found.path, "symbol": found.symbol})).collect::<Vec<_>>() }),
                     ));
                 }
-                let (_, symbol, _) = symbols.into_iter().next().expect("checked one symbol");
+                let symbol = symbols
+                    .into_iter()
+                    .next()
+                    .expect("checked one symbol")
+                    .symbol;
                 hunks.retain(|hunk| hunk_overlaps(hunk, symbol.start_line, symbol.end_line));
             }
             if let (Some(start), Some(end)) = (scope.start_line, scope.end_line) {

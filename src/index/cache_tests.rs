@@ -7,7 +7,7 @@ fn declaring_paths(index: &CodeIndex, name: &str) -> Vec<String> {
     index
         .find_symbols(None, name)
         .into_iter()
-        .map(|(path, _, _)| path)
+        .map(|found| found.path)
         .collect()
 }
 
