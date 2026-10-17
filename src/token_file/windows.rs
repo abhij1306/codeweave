@@ -12,7 +12,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
-use std::ptr::null_mut;
+use std::ptr::{null_mut, NonNull};
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
@@ -285,10 +285,10 @@ enum Entry {
 }
 
 /// A file's owner and DACL. Both point into `descriptor`, so they are valid
-/// while `self` lives.
+/// while `self` lives. `dacl` is `None` when the file has no DACL.
 struct SecurityInfo {
     owner: PSID,
-    dacl: *mut ACL,
+    dacl: Option<NonNull<ACL>>,
     descriptor: LocalMemory,
 }
 
@@ -317,7 +317,7 @@ impl SecurityInfo {
         }
         Ok(Self {
             owner,
-            dacl,
+            dacl: NonNull::new(dacl),
             descriptor,
         })
     }
@@ -337,25 +337,33 @@ impl SecurityInfo {
 
     /// The DACL's entries in order; empty when there is no DACL.
     fn entries(&self) -> io::Result<Vec<Entry>> {
-        if self.dacl.is_null() {
+        let Some(dacl) = self.dacl else {
             return Ok(Vec::new());
-        }
-        // SAFETY: a non-null `dacl` points to a valid ACL inside `descriptor`.
-        let count = u32::from(unsafe { (*self.dacl).AceCount });
+        };
+        // SAFETY: `dacl` is non-null and points to a valid ACL inside
+        // `descriptor`, which `self` keeps alive.
+        let count = u32::from(unsafe { dacl.as_ref() }.AceCount);
         let mut entries = Vec::new();
         for index in 0..count {
             let mut raw: *mut c_void = null_mut();
             // SAFETY: `index` is below the ACL's entry count and `raw` is a
             // valid out-pointer.
-            if unsafe { GetAce(self.dacl, index, &mut raw) } == 0 {
+            if unsafe { GetAce(dacl.as_ptr(), index, &mut raw) } == 0 {
                 return Err(io::Error::last_os_error());
             }
-            // SAFETY: every ACE starts with an `ACE_HEADER`.
-            let kind = u32::from(unsafe { (*(raw as *const ACE_HEADER)).AceType });
+            let Some(raw) = NonNull::new(raw) else {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "GetAce returned a null entry",
+                ));
+            };
+            // SAFETY: `raw` is a non-null ACE inside the ACL, and every ACE
+            // starts with an `ACE_HEADER`.
+            let kind = u32::from(unsafe { raw.cast::<ACE_HEADER>().as_ref() }.AceType);
             entries.push(if kind == ACCESS_ALLOWED_ACE_TYPE {
                 // SAFETY: the header says this is an `ACCESS_ALLOWED_ACE`,
                 // whose SID starts at `SidStart`.
-                let ace = unsafe { &*(raw as *const ACCESS_ALLOWED_ACE) };
+                let ace = unsafe { raw.cast::<ACCESS_ALLOWED_ACE>().as_ref() };
                 Entry::Allowed(&ace.SidStart as *const u32 as PSID)
             } else if kind == ACCESS_DENIED_ACE_TYPE {
                 Entry::Denied
@@ -368,7 +376,7 @@ impl SecurityInfo {
 
     /// Why the file is not private to the current user, if it is not.
     fn violation(&self) -> io::Result<Option<&'static str>> {
-        if !self.protected()? || self.dacl.is_null() || self.owner.is_null() {
+        if !self.protected()? || self.dacl.is_none() || self.owner.is_null() {
             return Ok(Some("must have a protected, explicit Windows DACL"));
         }
         let user = CurrentUser::query()?;
