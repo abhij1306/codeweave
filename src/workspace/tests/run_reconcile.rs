@@ -96,7 +96,7 @@ async fn completed_bash_status_does_not_attribute_later_workspace_writes() {
         .commit_plan(
             &mut actor.state.writer(),
             &[PlannedFile::new(
-                ".ai-bridge/codeweave-audit-success.md".to_owned(),
+                RelPath::new(".ai-bridge/codeweave-audit-success.md").unwrap(),
                 None,
                 Some("created after bash exit\n".to_owned()),
             )],
@@ -191,7 +191,7 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
         .state
         .ledger()
         .pending_handle()
-        .observe([actor.root.join("pending.rs")]);
+        .observe([actor.root.join(&RelPath::new("pending.rs").unwrap())]);
 
     let fetch = actor
         .read_targets(&json!({"path": "existing.rs", "max_chars": 5_000}))

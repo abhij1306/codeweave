@@ -73,7 +73,9 @@ fn status_on(branch: &str) -> RepoStatus {
 async fn refresh_status_through(actor: &Arc<Workspace>, site: &str, round: usize) {
     match site {
         "reconcile" => {
-            let path = actor.root.join(format!("watched_{round}.rs"));
+            let path = actor
+                .root
+                .join(&RelPath::new(&format!("watched_{round}.rs")).unwrap());
             fs::write(&path, "fn watched() {}\n").unwrap();
             actor.state.ledger().pending_handle().observe([path]);
             actor.summary().unwrap();
@@ -192,7 +194,7 @@ fn readers_never_observe_a_generation_paired_with_another_snapshot() {
                 .commit_plan(
                     &mut writer,
                     &[PlannedFile::new(
-                        "value.rs".to_owned(),
+                        RelPath::new("value.rs").unwrap(),
                         None,
                         Some(format!("fn value() -> i32 {{ {round} }}\n")),
                     )],

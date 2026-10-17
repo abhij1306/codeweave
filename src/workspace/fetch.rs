@@ -578,6 +578,7 @@ fn scope_from_bounds(start: Option<usize>, end: Option<usize>) -> FetchScope {
 }
 
 /// A client-supplied count as `usize`, saturating where `usize` is narrower.
+#[cfg(test)]
 fn saturating_usize(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }

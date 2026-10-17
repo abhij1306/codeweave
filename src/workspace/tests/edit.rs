@@ -140,7 +140,11 @@ fn failed_write_does_not_leave_an_internal_write_marker() {
     let root = tempdir().unwrap();
     fs::create_dir(root.path().join("blocked")).unwrap();
     let actor = test_actor(root.path());
-    let plan = vec![PlannedFile::new("blocked".to_owned(), None, None)];
+    let plan = vec![PlannedFile::new(
+        RelPath::new("blocked").unwrap(),
+        None,
+        None,
+    )];
 
     let error = actor
         .commit_plan(&mut actor.state.writer(), &plan, "failed-write")
@@ -152,10 +156,10 @@ fn failed_write_does_not_leave_an_internal_write_marker() {
     assert_eq!(details["restored_paths"], json!([]));
     assert_eq!(details["compensation_failures"], json!([]));
     assert_eq!(details["manual_recovery_required"], false);
-    assert!(!actor
-        .state
-        .ledger()
-        .consume_internal(&actor.root.join("blocked"), std::time::Instant::now()));
+    assert!(!actor.state.ledger().consume_internal(
+        &actor.root.join(&RelPath::new("blocked").unwrap()),
+        std::time::Instant::now()
+    ));
 }
 
 #[tokio::test]
