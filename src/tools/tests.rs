@@ -80,19 +80,29 @@ fn config(root: &Path, cache: &Path) -> DaemonConfig {
 }
 
 impl Fixture {
-    async fn call(&self, name: &str, arguments: Value) -> AppResult<Value> {
-        find(name)
-            .expect("registered tool")
-            .call(Arc::clone(&self.app), arguments)
+    /// Call a tool the way a transport does: the tool's structured content,
+    /// or its structured error.
+    async fn call(&self, name: &str, arguments: Value) -> Result<Value, Value> {
+        let Value::Object(arguments) = arguments else {
+            panic!("tool arguments are an object");
+        };
+        let result = call_tool(Arc::clone(&self.app), name, Some(arguments))
             .await
+            .expect("registered tool");
+        let structured = result.structured_content.expect("structured content");
+        if result.is_error == Some(true) {
+            Err(structured["error"].clone())
+        } else {
+            Ok(structured)
+        }
     }
 
     async fn error(&self, name: &str, arguments: Value) -> (String, String, Value) {
         let error = self.call(name, arguments).await.unwrap_err();
         (
-            error.0.code,
-            error.0.message,
-            error.0.details.unwrap_or(Value::Null),
+            error["code"].as_str().unwrap().to_owned(),
+            error["message"].as_str().unwrap().to_owned(),
+            error["details"].clone(),
         )
     }
 }
