@@ -82,7 +82,8 @@ fn parse_hunks(diff: &str) -> Vec<DiffHunk> {
     let mut active: Option<OpenHunk> = None;
     let finish = |active: &mut Option<OpenHunk>, path: &str, hunks: &mut Vec<DiffHunk>| {
         if let Some(OpenHunk { old, new, text }) = active.take() {
-            let id = content_hash(&format!("{path}\0{}\0{}\0{text}", old.start, new.start));
+            let id = content_hash(&format!("{path}\0{}\0{}\0{text}", old.start, new.start))
+                .into_string();
             hunks.push(DiffHunk {
                 id,
                 path: path.to_owned(),

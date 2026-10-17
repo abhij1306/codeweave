@@ -2,7 +2,8 @@ use super::util::line_ending_label;
 use super::Workspace;
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::{
-    decode_handle, encode_handle, slice_lines, FileEntry, RangeHandle, SymbolDefinition,
+    decode_handle, encode_handle, slice_lines, ContentHash, FileEntry, RangeHandle,
+    SymbolDefinition,
 };
 use crate::retrieval::ReadTarget;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -26,7 +27,7 @@ struct FetchContinuation {
     workspace_id: String,
     path: String,
     offset: usize,
-    content_hash: String,
+    content_hash: ContentHash,
     #[serde(default)]
     scope: FetchScope,
 }

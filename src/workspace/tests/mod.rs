@@ -258,7 +258,7 @@ fn mutation(path: &str, source: MutationSource, generation: u64) -> MutationReco
         mutation_id: format!("mutation-{path}"),
         path: path.to_owned(),
         before_hash: None,
-        after_hash: Some("hash".to_owned()),
+        after_hash: Some("hash".into()),
         source,
         request_id: "request".to_owned(),
         timestamp: Utc::now(),

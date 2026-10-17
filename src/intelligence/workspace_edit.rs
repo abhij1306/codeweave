@@ -4,7 +4,7 @@ use super::position::{lsp_position, offset_for_server_position};
 use super::protocol::PositionEncoding;
 use super::session::ResultFiles;
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::index::content_hash;
+use crate::index::{content_hash, ContentHash};
 use crate::requests::edit::Change;
 use serde_json::{json, Value};
 
@@ -14,7 +14,7 @@ pub(crate) struct RenameChange {
     pub(crate) path: String,
     pub(crate) old_text: String,
     pub(crate) new_text: String,
-    pub(crate) expected_hash: String,
+    pub(crate) expected_hash: ContentHash,
 }
 
 impl RenameChange {
@@ -37,7 +37,7 @@ impl RenameChange {
             old_text: self.old_text.clone(),
             new_text: self.new_text.clone(),
             expected_replacements: 1,
-            expected_hash: Some(self.expected_hash.clone()),
+            expected_hash: Some(self.expected_hash.to_string()),
             handle: None,
         }
     }

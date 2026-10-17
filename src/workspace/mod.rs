@@ -22,7 +22,7 @@ use state::ReconciledState;
 
 use crate::bash::BashSupervisor;
 use crate::error::{AppError, AppResult};
-use crate::index::{content_hash, CodeIndex, WorkspaceExclusions};
+use crate::index::{content_hash, CodeIndex, SnapshotId, WorkspaceExclusions};
 use crate::model::{PolicyConfig, WorkspaceConfig};
 use crate::repository::{CliGitBackend, RepositoryBackend};
 use crate::retrieval::{execute_index_search, SearchRequest};
@@ -110,7 +110,7 @@ impl Workspace {
         let phase_started = Instant::now();
         let root = WorkspaceRoot::open(Path::new(&config.path))?;
         let canonicalize_ms = phase_started.elapsed().as_millis();
-        let cache_key = content_hash(&root.path().to_string_lossy());
+        let cache_key = content_hash(&root.path().to_string_lossy()).into_string();
         let workspace_cache = cache_root.join("repos").join(cache_key);
         fs::create_dir_all(&workspace_cache)?;
         let exclusions = WorkspaceExclusions::new(root.path(), &config.exclude_paths)?;

@@ -1,3 +1,4 @@
+use crate::index::ContentHash;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
@@ -28,8 +29,8 @@ impl MutationSource {
 pub struct MutationRecord {
     pub mutation_id: String,
     pub path: String,
-    pub before_hash: Option<String>,
-    pub after_hash: Option<String>,
+    pub before_hash: Option<ContentHash>,
+    pub after_hash: Option<ContentHash>,
     pub source: MutationSource,
     pub request_id: String,
     pub timestamp: DateTime<Utc>,

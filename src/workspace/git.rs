@@ -1,6 +1,7 @@
 use super::state::MutationPermit;
 use super::{add_phase_metrics, Workspace};
 use crate::error::{AppError, AppResult, ErrorCode};
+use crate::index::SnapshotId;
 use crate::requests::git::{GitAction, GitDiffRequest, GitPushRequest};
 use crate::security::RelPath;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -34,7 +35,7 @@ impl GitDiffScope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GitDiffContinuation {
-    snapshot_id: String,
+    snapshot_id: SnapshotId,
     offset: usize,
     scope: GitDiffScope,
 }

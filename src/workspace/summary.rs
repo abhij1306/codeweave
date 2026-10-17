@@ -3,7 +3,7 @@ use super::*;
 impl Workspace {
     /// The current snapshot id after reconciling pending watcher paths: the
     /// precondition an edit without its own `snapshot_id` is planned against.
-    pub fn snapshot_id(&self) -> AppResult<String> {
+    pub fn snapshot_id(&self) -> AppResult<SnapshotId> {
         self.reconcile_pending()?;
         Ok(self.state.read().stamp().snapshot_id)
     }

@@ -8,7 +8,7 @@ use super::util::{
 use super::validation::ValidationOutcome;
 use super::Workspace;
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::index::{content_hash, decode_handle, CodeIndex};
+use crate::index::{content_hash, decode_handle, CodeIndex, ContentHash};
 use crate::requests::edit::{Change, EditRequest, InsertPosition, ResponseDetail};
 use crate::security::{normalize_path_text, RelPath};
 use crate::symbols::{extract_symbols, parse_has_error};
@@ -25,7 +25,7 @@ use uuid::Uuid;
 pub(super) struct PlannedFile {
     pub(super) path: RelPath,
     pub(super) before: Option<String>,
-    pub(super) before_hash: Option<String>,
+    pub(super) before_hash: Option<ContentHash>,
     pub(super) after: Option<String>,
 }
 

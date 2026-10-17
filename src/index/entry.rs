@@ -1,4 +1,5 @@
 use super::document::DocumentType;
+use super::ids::ContentHash;
 use crate::symbols::{language_name, Symbol};
 use std::path::Path;
 
@@ -12,7 +13,7 @@ pub struct FileEntry {
     /// ASCII-lowercased `content`, used for case-insensitive text search.
     search_content: String,
     line_count: usize,
-    hash: String,
+    hash: ContentHash,
     language: &'static str,
     document_type: DocumentType,
     symbols: Vec<Symbol>,
@@ -26,7 +27,7 @@ impl FileEntry {
     pub(super) fn with_symbols(
         path: String,
         content: String,
-        hash: String,
+        hash: ContentHash,
         symbols: Vec<Symbol>,
         size: u64,
         modified_ns: u128,
@@ -55,7 +56,7 @@ impl FileEntry {
         &self.content
     }
 
-    pub fn hash(&self) -> &str {
+    pub fn hash(&self) -> &ContentHash {
         &self.hash
     }
 
@@ -98,7 +99,7 @@ impl FileEntry {
             + self.path_lower.capacity()
             + self.content.capacity()
             + self.search_content.capacity()
-            + self.hash.capacity()
+            + self.hash.len()
             + self.symbols.capacity() * std::mem::size_of::<Symbol>()
             + self
                 .symbols

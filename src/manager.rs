@@ -269,7 +269,9 @@ impl Application {
                 IntelligenceResponse::Report(report) => Ok(report),
                 IntelligenceResponse::RenamePreview(rename) => {
                     let snapshot = actor.snapshot_id()?;
-                    let mut preview = actor.code_edit(rename.edit_request(Some(snapshot))).await?;
+                    let mut preview = actor
+                        .code_edit(rename.edit_request(Some(snapshot.into_string())))
+                        .await?;
                     if let Some(object) = preview.as_object_mut() {
                         object.insert("intelligence".to_owned(), rename.into_report());
                     }
@@ -286,7 +288,7 @@ impl Application {
         self.operation(async {
             let actor = self.actor()?;
             if request.snapshot_id.is_none() {
-                request.snapshot_id = Some(actor.snapshot_id()?);
+                request.snapshot_id = Some(actor.snapshot_id()?.into_string());
             }
             actor.code_edit(request).await
         })

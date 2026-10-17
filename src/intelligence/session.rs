@@ -20,7 +20,7 @@ use super::sync::DocumentSnapshot;
 use super::uri::UriCodec;
 use super::worker::{WorkerOperation, WorkerResponse};
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::index::content_hash;
+use crate::index::{content_hash, ContentHash};
 use crate::security::{RelPath, WorkspaceRoot};
 use serde_json::{json, Value};
 use std::collections::hash_map::Entry;
@@ -59,7 +59,7 @@ pub(crate) struct Session<'a> {
     workspace: Workspace<'a>,
     pub(crate) relative: String,
     pub(crate) content: String,
-    hash: String,
+    hash: ContentHash,
 }
 
 impl<'a> Session<'a> {
