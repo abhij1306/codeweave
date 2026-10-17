@@ -1,8 +1,8 @@
 //! Config loading and the bearer token file.
 
-use super::super::config::{
-    config_relative_path, default_port, load_config, load_or_create_bearer_token, AuthMode, Config,
-};
+#[cfg(unix)]
+use super::super::config::load_or_create_bearer_token;
+use super::super::config::{config_relative_path, default_port, load_config, AuthMode, Config};
 use std::path::{Path, PathBuf};
 
 #[test]
