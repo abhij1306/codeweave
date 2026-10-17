@@ -130,7 +130,9 @@ async fn fetched_windows_text_can_be_previewed_and_applied_exactly() {
     }]);
 
     let preview = actor
-        .code_edit(&json!({"preview": true, "changes": changes.clone()}))
+        .code_edit(edit_request(
+            &json!({"preview": true, "changes": changes.clone()}),
+        ))
         .await
         .unwrap();
     assert_eq!(preview["preview"], true);
@@ -139,7 +141,10 @@ async fn fetched_windows_text_can_be_previewed_and_applied_exactly() {
         b"before\r\nold value\r\nafter\r\n"
     );
 
-    let applied = actor.code_edit(&json!({"changes": changes})).await.unwrap();
+    let applied = actor
+        .code_edit(edit_request(&json!({"changes": changes})))
+        .await
+        .unwrap();
     assert_eq!(applied["applied"], true);
     assert_eq!(
         fs::read(&path).unwrap(),
@@ -156,9 +161,9 @@ fn outline_accepts_multiple_paths_and_reports_partial_errors() {
 
     let overview = |paths: serde_json::Value| {
         let response = actor
-            .code_retrieve(&json!({
+            .code_retrieve(retrieve_request(&json!({
                 "operations": [{"operation": "symbols_overview", "paths": paths}]
-            }))
+            })))
             .unwrap();
         response["results"][0]["result"].clone()
     };
@@ -289,12 +294,12 @@ fn code_retrieve_preserves_success_when_an_operation_fails() {
     let actor = test_actor(root.path());
 
     let result = actor
-        .code_retrieve(&json!({
+        .code_retrieve(retrieve_request(&json!({
             "operations": [
                 {"id": "file", "operation": "find_file", "name": "engine.rs"},
                 {"id": "invalid", "operation": "find_symbol"}
             ]
-        }))
+        })))
         .unwrap();
 
     assert_eq!(result["result_count"], 1);
@@ -311,14 +316,14 @@ fn code_retrieve_reports_malformed_entries_without_losing_successes() {
     let actor = test_actor(root.path());
 
     let result = actor
-        .code_retrieve(&json!({
+        .code_retrieve(retrieve_request(&json!({
             "operations": [
                 {"id": "file", "operation": "find_file", "name": "engine.rs"},
                 "not-an-object",
                 {"id": "missing-operation"},
                 {"id": "file", "operation": "find_symbol", "symbol": "extract"}
             ]
-        }))
+        })))
         .unwrap();
 
     assert_eq!(result["result_count"], 1);
@@ -340,12 +345,12 @@ fn code_retrieve_rejects_a_stale_snapshot() {
     let actor = test_actor(root.path());
 
     let error = actor
-        .code_retrieve(&json!({
+        .code_retrieve(retrieve_request(&json!({
             "snapshot_id": "snap_stale",
             "operations": [
                 {"operation": "find_file", "name": "engine.rs"}
             ]
-        }))
+        })))
         .unwrap_err();
 
     assert_eq!(error.0.code, "STALE_SNAPSHOT");

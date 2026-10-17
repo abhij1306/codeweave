@@ -17,16 +17,89 @@ use super::{validated_push_target, Workspace};
 use crate::index::content_hash;
 use crate::model::{AppError, AppResult, BashConfig, PolicyConfig, WorkspaceConfig};
 use crate::repository::{RepoStatus, RepositoryBackend};
+use crate::requests::bash::{
+    BashCancelRequest, BashOutputRequest, BashRequest, BashStartRequest, BashStatusRequest,
+};
+use crate::requests::edit::{CodePreviewRequest, CodeTransactionRequest, EditRequest};
+use crate::requests::git::{GitAction, GitPushRequest};
+use crate::requests::retrieval::CodeRetrieveRequest;
 use crate::test_bash_executable;
 use chrono::{Duration as ChronoDuration, Utc};
 use parking_lot::Mutex;
-use serde_json::json;
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+// The tests write requests as the JSON a client sends; these helpers parse
+// that JSON into the typed requests the workspace serves.
+
+fn typed<T: DeserializeOwned>(value: Value) -> T {
+    serde_json::from_value(value).expect("test request must parse")
+}
+
+/// `{"changes", "preview"?, ...}` as an edit request.
+fn edit_request(params: &Value) -> EditRequest {
+    let mut params = params.as_object().expect("edit params").clone();
+    let preview = params.remove("preview").and_then(|value| value.as_bool());
+    if preview == Some(true) {
+        typed::<CodePreviewRequest>(Value::Object(params)).into_edit()
+    } else {
+        typed::<CodeTransactionRequest>(Value::Object(params)).into_edit()
+    }
+    .expect("test edit must be valid")
+}
+
+/// `{"action": "<git action>", ...}` as a Git action.
+fn git_action(params: &Value) -> GitAction {
+    let mut params = params.as_object().expect("git params").clone();
+    let action = params.remove("action").expect("git action");
+    let params = Value::Object(params);
+    match action.as_str().expect("git action name") {
+        "status" => GitAction::Status,
+        "preflight" => GitAction::Preflight,
+        "diff" => GitAction::Diff(typed(params)),
+        "log" => GitAction::Log(typed(params)),
+        "show" => GitAction::Show(typed(params)),
+        "blame" => GitAction::Blame(typed(params)),
+        "stage" => GitAction::Stage(typed(params)),
+        "commit" => GitAction::Commit(typed(params)),
+        "restore" => GitAction::Restore(typed(params)),
+        "push" => GitAction::Push(typed(params)),
+        other => panic!("unknown git action {other}"),
+    }
+}
+
+/// Push arguments, confirmed.
+fn push_request(params: &Value) -> GitPushRequest {
+    let mut params = params.as_object().expect("push params").clone();
+    params.insert("confirm".to_owned(), Value::Bool(true));
+    typed(Value::Object(params))
+}
+
+/// `{"action"?: "start" | "status" | "output" | "cancel", ...}` as a Bash
+/// request.
+fn bash_request(params: &Value) -> BashRequest {
+    let mut params = params.as_object().expect("bash params").clone();
+    let action = params.remove("action");
+    let params = Value::Object(params);
+    match action.as_ref().and_then(Value::as_str).unwrap_or("start") {
+        "start" => typed::<BashStartRequest>(params).into_request(),
+        "status" => typed::<BashStatusRequest>(params).into_request(),
+        "output" => typed::<BashOutputRequest>(params).into_request(),
+        "cancel" => typed::<BashCancelRequest>(params).into_request(),
+        other => panic!("unknown bash action {other}"),
+    }
+    .expect("test bash request must be valid")
+}
+
+fn retrieve_request(params: &Value) -> CodeRetrieveRequest {
+    typed(params.clone())
+}
 
 fn test_policy() -> PolicyConfig {
     PolicyConfig {

@@ -2,10 +2,13 @@
 //! language servers behind the semantic seam.
 use super::preset::LspPreset;
 use super::test_support::{FakeServer, Fixture, Reply};
-use super::IntelligenceResponse;
+use super::{IntelligenceRequest, IntelligenceResponse};
 use crate::index::{content_hash, SearchScope};
 use crate::model::AppResult;
 use crate::reference_service::{ReferenceQuery, ReferenceScope, ReferenceService};
+use crate::requests::edit::{Change, EditRequest, ResponseDetail};
+use crate::requests::intelligence::CodeIntelligenceRequest;
+use crate::requests::{Contract, Rejection};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
@@ -20,9 +23,16 @@ fn range(line: u64, start: u64, end: u64) -> Value {
     json!({"start": {"line": line, "character": start}, "end": {"line": line, "character": end}})
 }
 
+/// Parse `params` through the tool's request contract, as the transport does.
+fn request(params: Value) -> AppResult<IntelligenceRequest> {
+    Contract::of::<CodeIntelligenceRequest>("code_intelligence")
+        .parse::<CodeIntelligenceRequest>(params, Rejection::Argument)?
+        .try_into()
+}
+
 fn run(service: &super::IntelligenceService, params: Value) -> AppResult<Value> {
     service
-        .execute(&params)
+        .execute(request(params)?)
         .map(IntelligenceResponse::into_value)
 }
 
@@ -134,31 +144,55 @@ fn rename_preview_compiles_server_edits_into_one_edit_request() {
     let server = answering_server(&fixture);
     let service = fixture.service_with(&server, LspPreset::Rust);
 
-    let IntelligenceResponse::RenamePreview(preview) = service.execute(&rename()).unwrap() else {
+    let IntelligenceResponse::RenamePreview(preview) =
+        service.execute(request(rename()).unwrap()).unwrap()
+    else {
         panic!("rename_preview must return a rename preview");
     };
-    let request = preview.edit_request(json!("snap_1"));
+    let request = preview.edit_request(Some("snap_1".to_owned()));
 
     assert_eq!(
         request,
-        json!({
-            "preview": true,
-            "snapshot_id": "snap_1",
-            "changes": [
-                {
-                    "kind": "replace", "path": "src/caller.rs", "old_text": CALLER,
-                    "new_text": "fn call() { open_repo(); }\n",
-                    "expected_replacements": 1, "expected_hash": content_hash(CALLER)
+        EditRequest {
+            changes: vec![
+                Change::Replace {
+                    path: "src/caller.rs".to_owned(),
+                    old_text: CALLER.to_owned(),
+                    new_text: "fn call() { open_repo(); }\n".to_owned(),
+                    expected_replacements: 1,
+                    expected_hash: Some(content_hash(CALLER)),
+                    handle: None,
                 },
-                {
-                    "kind": "replace", "path": "src/lib.rs", "old_text": LIB,
-                    "new_text": "pub fn open_repo() {}\n",
-                    "expected_replacements": 1, "expected_hash": content_hash(LIB)
-                }
-            ]
-        })
+                Change::Replace {
+                    path: "src/lib.rs".to_owned(),
+                    old_text: LIB.to_owned(),
+                    new_text: "pub fn open_repo() {}\n".to_owned(),
+                    expected_replacements: 1,
+                    expected_hash: Some(content_hash(LIB)),
+                    handle: None,
+                },
+            ],
+            snapshot_id: Some("snap_1".to_owned()),
+            preview: true,
+            validate: Vec::new(),
+            response_detail: ResponseDetail::Standard,
+        }
     );
-    assert_eq!(preview.into_report()["changes"], request["changes"]);
+    assert_eq!(
+        preview.into_report()["changes"],
+        json!([
+            {
+                "kind": "replace", "path": "src/caller.rs", "old_text": CALLER,
+                "new_text": "fn call() { open_repo(); }\n",
+                "expected_replacements": 1, "expected_hash": content_hash(CALLER)
+            },
+            {
+                "kind": "replace", "path": "src/lib.rs", "old_text": LIB,
+                "new_text": "pub fn open_repo() {}\n",
+                "expected_replacements": 1, "expected_hash": content_hash(LIB)
+            }
+        ])
+    );
 }
 
 #[test]

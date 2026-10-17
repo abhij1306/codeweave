@@ -24,7 +24,7 @@ async fn stale_snapshot_rebases_when_file_hash_is_current() {
     fs::write(root.path().join("unrelated.rs"), "fn unrelated() {}\n").unwrap();
     actor.refresh(true).unwrap();
     let result = actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "snapshot_id": old_snapshot,
             "preview": true,
             "changes": [{
@@ -34,7 +34,7 @@ async fn stale_snapshot_rebases_when_file_hash_is_current() {
                 "new_text": "{ 2 }",
                 "expected_hash": content_hash(original)
             }]
-        }))
+        })))
         .await
         .unwrap();
     assert_eq!(result["preview"], true);
@@ -101,10 +101,10 @@ fn changes_treats_since_generation_as_exclusive() {
         .ledger()
         .record(&[mutation("value.rs", "mcp_edit", 7)]);
 
-    let after_six = actor.changes(&json!({"since_generation": 6})).unwrap();
+    let after_six = actor.changes(6, None, 200).unwrap();
     assert_eq!(after_six["mutations"].as_array().unwrap().len(), 1);
 
-    let after_seven = actor.changes(&json!({"since_generation": 7})).unwrap();
+    let after_seven = actor.changes(7, None, 200).unwrap();
     assert!(after_seven["mutations"].as_array().unwrap().is_empty());
 }
 
@@ -121,7 +121,7 @@ fn changes_are_shared_across_clients() {
             .record(&[mutation(&format!("{client}.rs"), "mcp_edit", generation)]);
     }
 
-    let result = actor.changes(&json!({"since_generation": 0})).unwrap();
+    let result = actor.changes(0, None, 200).unwrap();
     let mutations = result["mutations"].as_array().unwrap();
 
     assert_eq!(mutations.len(), 2);

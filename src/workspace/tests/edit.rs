@@ -17,7 +17,7 @@ async fn exact_replace_prefers_normalized_crlf_match_over_raw_lf_suffix() {
     let handle = fetched["results"][0]["handle"].as_str().unwrap();
 
     actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [{
                 "kind": "replace",
                 "path": "windows.txt",
@@ -25,7 +25,7 @@ async fn exact_replace_prefers_normalized_crlf_match_over_raw_lf_suffix() {
                 "old_text": "\nold value",
                 "new_text": "\nnew value"
             }]
-        }))
+        })))
         .await
         .unwrap();
 
@@ -62,13 +62,18 @@ async fn handle_range_replace_preserves_windows_line_endings() {
     }]);
 
     let preview = actor
-        .code_edit(&json!({"preview": true, "changes": changes.clone()}))
+        .code_edit(edit_request(
+            &json!({"preview": true, "changes": changes.clone()}),
+        ))
         .await
         .unwrap();
     assert_eq!(preview["preview"], true);
     assert_eq!(fs::read(&path).unwrap(), b"first\r\nsecond\r\nthird\r\n");
 
-    actor.code_edit(&json!({"changes": changes})).await.unwrap();
+    actor
+        .code_edit(edit_request(&json!({"changes": changes})))
+        .await
+        .unwrap();
     assert_eq!(
         fs::read(&path).unwrap(),
         b"first\r\nupdated\r\ncontinued\r\nthird\r\n"
@@ -91,14 +96,14 @@ async fn replace_range_preserves_boundary_when_new_text_omits_newline() {
     let handle = fetched["results"][0]["handle"].as_str().unwrap();
 
     actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [{
                 "kind": "replace_range",
                 "path": "value.txt",
                 "handle": handle,
                 "new_text": "updated"
             }]
-        }))
+        })))
         .await
         .unwrap();
 
@@ -114,7 +119,7 @@ async fn exact_full_line_replace_preserves_boundary() {
     let actor = test_actor(root.path());
 
     actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [{
                 "kind": "replace",
                 "path": "value.txt",
@@ -122,7 +127,7 @@ async fn exact_full_line_replace_preserves_boundary() {
                 "new_text": "updated",
                 "expected_hash": content_hash(original)
             }]
-        }))
+        })))
         .await
         .unwrap();
 
@@ -172,7 +177,9 @@ async fn response_detail_shapes_edit_diff_payload() {
 
     // compact: no unified diff, but the per-file stat is still present.
     let compact = actor
-        .code_edit(&json!({"changes": change, "response_detail": "compact"}))
+        .code_edit(edit_request(
+            &json!({"changes": change, "response_detail": "compact"}),
+        ))
         .await
         .unwrap();
     assert_eq!(compact["applied"], true);
@@ -186,7 +193,9 @@ async fn response_detail_shapes_edit_diff_payload() {
     fs::write(root.path().join("value.rs"), original).unwrap();
     actor.refresh(true).unwrap();
     let debug = actor
-        .code_edit(&json!({"changes": change, "response_detail": "debug"}))
+        .code_edit(edit_request(
+            &json!({"changes": change, "response_detail": "debug"}),
+        ))
         .await
         .unwrap();
     assert_eq!(debug["diff_omitted"], false);
@@ -205,7 +214,7 @@ async fn standard_response_detail_caps_oversized_edit_diff() {
     let actor = test_actor_with_policy(root.path(), policy);
     let replaced: String = (0..4_000).map(|i| format!("edited {i}\n")).collect();
     let result = actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [{
                 "kind": "create",
                 "path": "big.txt",
@@ -213,7 +222,7 @@ async fn standard_response_detail_caps_oversized_edit_diff() {
                 "overwrite": true,
                 "expected_hash": content_hash(&original)
             }]
-        }))
+        })))
         .await
         .unwrap();
     assert_eq!(result["applied"], true);
@@ -255,7 +264,7 @@ async fn overlapping_exact_edits_in_one_transaction_are_rejected() {
     // Two `replace` changes whose matched byte ranges overlap on the same file
     // must be refused before anything is written.
     let error = actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [
                 {
                     "kind": "replace",
@@ -272,7 +281,7 @@ async fn overlapping_exact_edits_in_one_transaction_are_rejected() {
                     "expected_hash": content_hash(original)
                 }
             ]
-        }))
+        })))
         .await
         .unwrap_err();
 
@@ -300,7 +309,7 @@ async fn handle_edit_cannot_share_a_file_with_another_change() {
     let handle = fetched["results"][0]["handle"].as_str().unwrap();
 
     let error = actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [
                 {
                     "kind": "replace_range",
@@ -316,7 +325,7 @@ async fn handle_edit_cannot_share_a_file_with_another_change() {
                     "expected_hash": content_hash(original)
                 }
             ]
-        }))
+        })))
         .await
         .unwrap_err();
 
@@ -354,7 +363,7 @@ async fn symbol_anchored_insert_positions_place_content_relative_to_the_symbol()
         };
 
         let result = actor
-            .code_edit(&json!({
+            .code_edit(edit_request(&json!({
                 "changes": [{
                     "kind": "insert",
                     "path": "value.rs",
@@ -363,7 +372,7 @@ async fn symbol_anchored_insert_positions_place_content_relative_to_the_symbol()
                     "content": marker,
                     "expected_hash": content_hash(original)
                 }]
-            }))
+            })))
             .await
             .unwrap();
 
@@ -388,7 +397,7 @@ async fn same_file_multi_change_accumulates_on_the_in_progress_plan() {
     // must both land: the second is planned on top of the first via put_plan, not
     // re-read from disk. Only one expected_hash precondition is needed.
     let result = actor
-        .code_edit(&json!({
+        .code_edit(edit_request(&json!({
             "changes": [
                 {
                     "kind": "replace",
@@ -405,7 +414,7 @@ async fn same_file_multi_change_accumulates_on_the_in_progress_plan() {
                     "expected_hash": content_hash(original)
                 }
             ]
-        }))
+        })))
         .await
         .unwrap();
 

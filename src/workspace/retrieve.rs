@@ -1,5 +1,6 @@
 use super::util::stale_snapshot;
 use super::*;
+use crate::requests::retrieval::CodeRetrieveRequest;
 use crate::retrieval::{
     prepare_retrieval_operation, PreparedRetrievalOperation, MAX_RETRIEVAL_OPERATIONS,
 };
@@ -7,12 +8,9 @@ use crate::retrieval::{
 impl Workspace {
     /// Execute explicit repository discovery and read operations in one MCP call.
     /// Each entry is an atomic deterministic operation selected by the caller.
-    pub fn code_retrieve(&self, params: &Value) -> AppResult<Value> {
+    pub fn code_retrieve(&self, request: &CodeRetrieveRequest) -> AppResult<Value> {
         let started = Instant::now();
-        let operations = params
-            .get("operations")
-            .and_then(Value::as_array)
-            .ok_or_else(|| AppError::invalid("code_retrieve requires operations[]"))?;
+        let operations = &request.operations;
         if operations.is_empty() {
             return Err(AppError::invalid(
                 "code_retrieve operations[] cannot be empty",
@@ -30,13 +28,13 @@ impl Workspace {
         }
 
         let snapshot = self.state.read().stamp().snapshot_id;
-        if let Some(expected) = params.get("snapshot_id").and_then(Value::as_str) {
+        if let Some(expected) = request.snapshot_id.as_deref() {
             if expected != snapshot {
                 return Err(stale_snapshot(expected, &snapshot));
             }
         }
 
-        let fail_fast = bool_value(params, "fail_fast", false);
+        let fail_fast = request.fail_fast;
         let mut seen_ids = HashSet::new();
         let mut results = Vec::new();
         let mut errors = Vec::new();
@@ -143,7 +141,7 @@ impl Workspace {
         match prepare_retrieval_operation(kind, operation)? {
             PreparedRetrievalOperation::Search(request) => self.search_index(&request),
             PreparedRetrievalOperation::Read(read) => {
-                let result = self.read_target(&read.item, read.max_chars)?;
+                let result = self.read_target(&read.target, read.max_chars)?;
                 if read.compact {
                     Ok(super::fetch::compact_fetch_result(&result))
                 } else {
