@@ -170,7 +170,7 @@ impl StateWriter<'_> {
     pub(crate) fn update<R>(&mut self, change: impl FnOnce(&mut StateUpdate<'_>) -> R) -> R {
         let mut guard = self.shared.write();
         change(&mut StateUpdate {
-            state: &mut *guard,
+            state: &mut guard,
             workspace_id: self.workspace_id,
         })
     }
