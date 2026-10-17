@@ -70,7 +70,7 @@ impl Workspace {
                     path: path.clone(),
                     before_hash: None,
                     after_hash: state.index().get(path).map(|file| file.hash().to_owned()),
-                    source: "external".to_owned(),
+                    source: MutationSource::External,
                     request_id: "watcher".to_owned(),
                     timestamp: Utc::now(),
                     generation,

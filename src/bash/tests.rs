@@ -39,7 +39,7 @@ async fn explicit_invalid_bash_path_reports_unavailable_before_starting() {
     .unwrap();
     let readiness = supervisor.readiness();
     assert!(readiness.configured);
-    assert_eq!(readiness.readiness, "unavailable");
+    assert_eq!(readiness.readiness, Readiness::Unavailable);
     assert_eq!(readiness.resolved_executable, None);
 
     let error = supervisor
@@ -66,7 +66,7 @@ fn non_default_relative_bash_name_fails_closed_after_probe_failure() {
 
     let readiness = supervisor.readiness();
 
-    assert_eq!(readiness.readiness, "unavailable");
+    assert_eq!(readiness.readiness, Readiness::Unavailable);
     assert_eq!(readiness.resolved_executable, None);
 }
 
@@ -512,7 +512,7 @@ fn fake_supervisor(launcher: Arc<FakeLauncher>, policy: PolicyConfig) -> BashSup
         configured_executable: "bash".to_owned(),
         resolved_executable: Some("bash".to_owned()),
         shell_type: "bash".to_owned(),
-        readiness: "ready".to_owned(),
+        readiness: Readiness::Ready,
         failure_reason: None,
     };
     BashSupervisor::with_parts(policy, readiness, Some(launcher))

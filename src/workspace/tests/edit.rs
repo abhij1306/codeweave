@@ -140,11 +140,7 @@ fn failed_write_does_not_leave_an_internal_write_marker() {
     let root = tempdir().unwrap();
     fs::create_dir(root.path().join("blocked")).unwrap();
     let actor = test_actor(root.path());
-    let plan = vec![PlannedFile {
-        path: "blocked".to_owned(),
-        before: None,
-        after: None,
-    }];
+    let plan = vec![PlannedFile::new("blocked".to_owned(), None, None)];
 
     let error = actor
         .commit_plan(&mut actor.state.writer(), &plan, "failed-write")

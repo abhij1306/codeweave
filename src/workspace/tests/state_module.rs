@@ -191,11 +191,11 @@ fn readers_never_observe_a_generation_paired_with_another_snapshot() {
             actor
                 .commit_plan(
                     &mut writer,
-                    &[PlannedFile {
-                        path: "value.rs".to_owned(),
-                        before: None,
-                        after: Some(format!("fn value() -> i32 {{ {round} }}\n")),
-                    }],
+                    &[PlannedFile::new(
+                        "value.rs".to_owned(),
+                        None,
+                        Some(format!("fn value() -> i32 {{ {round} }}\n")),
+                    )],
                     "stamp-test",
                 )
                 .unwrap();

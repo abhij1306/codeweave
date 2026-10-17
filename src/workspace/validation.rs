@@ -21,8 +21,8 @@ impl Workspace {
         let mut remaining = commands.iter().peekable();
 
         while let Some(command) = remaining.next() {
-            let over_budget =
-                budget_ms != 0 && validation_started.elapsed().as_millis() as u64 >= budget_ms;
+            let over_budget = budget_ms != 0
+                && validation_started.elapsed() >= std::time::Duration::from_millis(budget_ms);
             if over_budget {
                 let mut deferred = vec![command.clone()];
                 deferred.extend(remaining.map(String::clone));

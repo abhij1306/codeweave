@@ -1,5 +1,5 @@
 use super::edit::PlannedFile;
-use super::events::MutationRecord;
+use super::events::{MutationRecord, MutationSource};
 use super::io_helpers::{atomic_write, remove_if_exists, restore_one};
 use super::state::StateWriter;
 use super::Workspace;
@@ -67,9 +67,9 @@ impl Workspace {
             .map(|item| MutationRecord {
                 mutation_id: MutationRecord::new_id(),
                 path: item.path.clone(),
-                before_hash: item.before.as_ref().map(|value| content_hash(value)),
-                after_hash: item.after.as_ref().map(|value| content_hash(value)),
-                source: "mcp_edit".to_owned(),
+                before_hash: item.before_hash.clone(),
+                after_hash: item.after.as_deref().map(content_hash),
+                source: MutationSource::McpEdit,
                 request_id: request_id.to_owned(),
                 timestamp,
                 generation,

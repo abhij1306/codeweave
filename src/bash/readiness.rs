@@ -14,13 +14,21 @@ pub struct BashReadiness {
     pub configured_executable: String,
     pub resolved_executable: Option<String>,
     pub shell_type: String,
-    pub readiness: String,
+    pub readiness: Readiness,
     pub failure_reason: Option<String>,
+}
+
+/// Whether a usable Bash executable was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Readiness {
+    Ready,
+    Unavailable,
 }
 
 impl BashReadiness {
     pub fn is_ready(&self) -> bool {
-        self.readiness == "ready" && self.resolved_executable.is_some()
+        self.readiness == Readiness::Ready && self.resolved_executable.is_some()
     }
 
     pub(super) fn executable(&self) -> Option<String> {
@@ -30,16 +38,16 @@ impl BashReadiness {
 
 fn bash_readiness(
     configured: &str,
-    readiness: &str,
+    readiness: Readiness,
     executable: Option<&Path>,
     failure_reason: Option<String>,
 ) -> BashReadiness {
     BashReadiness {
-        configured: readiness != "disabled",
+        configured: true,
         configured_executable: configured.to_owned(),
         resolved_executable: executable.map(|path| path.to_string_lossy().into_owned()),
         shell_type: "bash".to_owned(),
-        readiness: readiness.to_owned(),
+        readiness,
         failure_reason,
     }
 }
@@ -49,7 +57,7 @@ pub(super) fn resolve_bash(policy: &PolicyConfig) -> BashReadiness {
     if configured.is_empty() {
         return bash_readiness(
             configured,
-            "unavailable",
+            Readiness::Unavailable,
             None,
             Some("policy.bash.executable must not be empty".to_owned()),
         );
@@ -59,10 +67,10 @@ pub(super) fn resolve_bash(policy: &PolicyConfig) -> BashReadiness {
     let configured_path = PathBuf::from(configured);
     if configured_path.is_absolute() {
         return match probe_bash(&configured_path) {
-            Ok(()) => bash_readiness(configured, "ready", Some(&configured_path), None),
+            Ok(()) => bash_readiness(configured, Readiness::Ready, Some(&configured_path), None),
             Err(error) => bash_readiness(
                 configured,
-                "unavailable",
+                Readiness::Unavailable,
                 None,
                 Some(format!("Configured Bash executable is not usable: {error}")),
             ),
@@ -71,7 +79,7 @@ pub(super) fn resolve_bash(policy: &PolicyConfig) -> BashReadiness {
 
     match probe_bash(&configured_path) {
         Ok(()) => {
-            return bash_readiness(configured, "ready", Some(&configured_path), None);
+            return bash_readiness(configured, Readiness::Ready, Some(&configured_path), None);
         }
         Err(error) => failures.push(format!("{configured}: {error}")),
     }
@@ -79,7 +87,7 @@ pub(super) fn resolve_bash(policy: &PolicyConfig) -> BashReadiness {
     if is_default_bash_name(configured) {
         for candidate in discover_bash_candidates() {
             if probe_bash(&candidate).is_ok() {
-                return bash_readiness(configured, "ready", Some(&candidate), None);
+                return bash_readiness(configured, Readiness::Ready, Some(&candidate), None);
             }
         }
     }
@@ -92,7 +100,7 @@ pub(super) fn resolve_bash(policy: &PolicyConfig) -> BashReadiness {
             failures.join("; ")
         )
     };
-    bash_readiness(configured, "unavailable", None, Some(reason))
+    bash_readiness(configured, Readiness::Unavailable, None, Some(reason))
 }
 
 fn is_default_bash_name(configured: &str) -> bool {

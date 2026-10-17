@@ -73,9 +73,7 @@ impl Workspace {
         let max_chars = params
             .get("max_chars")
             .and_then(Value::as_u64)
-            .map_or(crate::retrieval::DEFAULT_READ_MAX_CHARS, |value| {
-                value as usize
-            })
+            .map_or(crate::retrieval::DEFAULT_READ_MAX_CHARS, saturating_usize)
             .min(crate::retrieval::MAX_READ_MAX_CHARS);
         let response_detail = params
             .get("response_detail")
@@ -117,7 +115,7 @@ impl Workspace {
                     .get("content")
                     .and_then(Value::as_str)
                     .zip(result.get("total_chars").and_then(Value::as_u64))
-                    .is_some_and(|(content, total)| content.len() < total as usize)
+                    .is_some_and(|(content, total)| content.len() < saturating_usize(total))
         });
         let mut result = json!({
             "snapshot_id": snapshot,
@@ -470,7 +468,7 @@ fn read_target_from_item(item: &Value) -> AppResult<ReadTarget> {
     let number = |field: &str| {
         item.get(field)
             .and_then(Value::as_u64)
-            .map(|value| value as usize)
+            .map(saturating_usize)
     };
     let value = text("value").ok_or_else(|| AppError::invalid("Missing or invalid 'value'"))?;
     Ok(
@@ -579,6 +577,11 @@ fn scope_from_bounds(start: Option<usize>, end: Option<usize>) -> FetchScope {
     }
 }
 
+/// A client-supplied count as `usize`, saturating where `usize` is narrower.
+fn saturating_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 fn bounded_content(
     mut base: Value,
     content: &str,
@@ -586,8 +589,8 @@ fn bounded_content(
     limit: usize,
     continuation: Option<&dyn Fn(usize) -> Option<String>>,
 ) -> Value {
-    let start = nearest_char_boundary(content, offset.min(content.len()));
-    let end = nearest_char_boundary(content, (start + limit).min(content.len()));
+    let start = content.floor_char_boundary(offset);
+    let end = content.floor_char_boundary(start.saturating_add(limit));
     let next = if end < content.len() {
         continuation.and_then(|builder| builder(end))
     } else {
@@ -603,13 +606,6 @@ fn bounded_content(
         object.insert("continuation".to_owned(), json!(next));
     }
     base
-}
-
-fn nearest_char_boundary(content: &str, mut index: usize) -> usize {
-    while index > 0 && !content.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 fn encode_fetch_continuation(value: &FetchContinuation) -> AppResult<String> {

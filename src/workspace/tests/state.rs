@@ -77,8 +77,8 @@ fn dirty_ownership_tracks_only_current_dirty_mcp_paths() {
     let actor = test_actor(root.path());
     let generation = actor.state.read().generation();
     actor.state.ledger().record(&[
-        mutation("still_dirty.rs", "mcp_edit", generation),
-        mutation("clean_now.rs", "mcp_edit", generation),
+        mutation("still_dirty.rs", MutationSource::McpEdit, generation),
+        mutation("clean_now.rs", MutationSource::McpEdit, generation),
     ]);
     set_dirty_files(&actor, vec!["still_dirty.rs".to_owned()]);
 
@@ -99,7 +99,7 @@ fn changes_treats_since_generation_as_exclusive() {
     actor
         .state
         .ledger()
-        .record(&[mutation("value.rs", "mcp_edit", 7)]);
+        .record(&[mutation("value.rs", MutationSource::McpEdit, 7)]);
 
     let after_six = actor.changes(6, None, 200).unwrap();
     assert_eq!(after_six["mutations"].as_array().unwrap().len(), 1);
@@ -115,10 +115,11 @@ fn changes_are_shared_across_clients() {
     let actor = test_actor(root.path());
     let generation = actor.state.read().generation();
     for client in ["client-a", "client-b"] {
-        actor
-            .state
-            .ledger()
-            .record(&[mutation(&format!("{client}.rs"), "mcp_edit", generation)]);
+        actor.state.ledger().record(&[mutation(
+            &format!("{client}.rs"),
+            MutationSource::McpEdit,
+            generation,
+        )]);
     }
 
     let result = actor.changes(0, None, 200).unwrap();
@@ -165,7 +166,7 @@ fn workspace_summary_caps_and_groups_large_change_sets() {
     let external = (0..45)
         .map(|index| format!("backend/artifacts/result_{index}.json"))
         .chain((0..5).map(|index| format!("src/feature_{index}.rs")))
-        .map(|path| mutation(&path, "external", 1))
+        .map(|path| mutation(&path, MutationSource::External, 1))
         .collect::<Vec<_>>();
     actor.state.ledger().record_external(&external);
     set_dirty_files(

@@ -140,11 +140,7 @@ fn string_prefix(text: &str, max_bytes: usize) -> (String, bool) {
     if text.len() <= max_bytes {
         return (text.to_owned(), false);
     }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (text[..end].to_owned(), true)
+    (text[..text.floor_char_boundary(max_bytes)].to_owned(), true)
 }
 
 fn read_utf8_prefix(path: &Path, max_bytes: usize) -> Option<(String, bool)> {

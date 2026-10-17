@@ -7,7 +7,7 @@ mod state_module;
 mod validation;
 
 use super::edit::PlannedFile;
-use super::events::MutationRecord;
+use super::events::{MutationRecord, MutationSource};
 use super::state::RunWindow;
 use super::util::{
     line_ending_label, line_range_bytes, normalize_line_endings_for_content,
@@ -244,13 +244,13 @@ fn test_actor_with_repository(root: &Path, repository: Arc<ScriptedRepository>) 
 }
 
 /// A mutation record for `path` from `source` at `generation`.
-fn mutation(path: &str, source: &str, generation: u64) -> MutationRecord {
+fn mutation(path: &str, source: MutationSource, generation: u64) -> MutationRecord {
     MutationRecord {
         mutation_id: format!("mutation-{path}"),
         path: path.to_owned(),
         before_hash: None,
         after_hash: Some("hash".to_owned()),
-        source: source.to_owned(),
+        source,
         request_id: "request".to_owned(),
         timestamp: Utc::now(),
         generation,

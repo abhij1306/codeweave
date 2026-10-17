@@ -19,7 +19,7 @@ pub use output::OutputStream;
 use output::{clamp_chars, continuation_offset, continuation_token};
 use parking_lot::Mutex;
 use readiness::resolve_bash;
-pub use readiness::BashReadiness;
+pub use readiness::{BashReadiness, Readiness};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;

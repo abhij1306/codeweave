@@ -12,11 +12,11 @@ mod summary;
 mod util;
 mod validation;
 
-pub use events::MutationRecord;
+pub use events::{MutationRecord, MutationSource};
 #[cfg(test)]
 use git::validated_push_target;
 pub use state::{Stamp, StateReader, StateView};
-use util::{char_boundary_at_or_before, summarize_changed_paths, ChangedPathSummary};
+use util::{summarize_changed_paths, ChangedPathSummary};
 
 use state::ReconciledState;
 

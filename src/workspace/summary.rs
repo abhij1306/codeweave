@@ -74,8 +74,7 @@ impl Workspace {
                 index.get(path).map(|file| {
                     let full_len = file.content().len();
                     if full_len > INSTRUCTION_INLINE_CAP {
-                        let safe_cap =
-                            char_boundary_at_or_before(file.content(), INSTRUCTION_INLINE_CAP);
+                        let safe_cap = file.content().floor_char_boundary(INSTRUCTION_INLINE_CAP);
                         let end = file.content()[..safe_cap]
                             .rfind('\n')
                             .map(|idx| idx + 1)

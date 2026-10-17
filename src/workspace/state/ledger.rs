@@ -3,7 +3,7 @@
 
 use crate::index::WorkspaceExclusions;
 use crate::security::relative_string;
-use crate::workspace::events::MutationRecord;
+use crate::workspace::events::{MutationRecord, MutationSource};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -229,7 +229,7 @@ impl ChangeLedger {
             .iter()
             .rev()
             .filter(|item| item.generation > since)
-            .filter(|item| source.is_none_or(|value| item.source == value))
+            .filter(|item| source.is_none_or(|value| item.source.as_str() == value))
             .take(limit)
             .cloned()
             .collect()
@@ -240,7 +240,7 @@ impl ChangeLedger {
         self.events
             .lock()
             .iter()
-            .filter(|item| item.source == "mcp_edit" && dirty.contains(&item.path))
+            .filter(|item| item.source == MutationSource::McpEdit && dirty.contains(&item.path))
             .map(|item| item.path.clone())
             .collect()
     }
@@ -262,7 +262,9 @@ impl ChangeLedger {
     pub(crate) fn attribute_since(&self, window: &RunWindow<'_>) -> HashSet<String> {
         let root = &self.pending.inner.root;
         let exclusions = &self.pending.inner.exclusions;
-        let candidates: Vec<MutationRecord> = self
+        // Copy only the path and time of each record in the window, so the log
+        // lock is not held across the metadata reads below.
+        let candidates: Vec<(String, DateTime<Utc>)> = self
             .events
             .lock()
             .iter()
@@ -270,7 +272,7 @@ impl ChangeLedger {
                 mutation.generation > window.start_generation
                     && mutation.generation <= window.end_generation
             })
-            .cloned()
+            .map(|mutation| (mutation.path.clone(), mutation.timestamp))
             .collect();
         let modified_by_end = |path: &str, ended: &DateTime<Utc>| {
             fs::metadata(root.join(path))
@@ -279,12 +281,12 @@ impl ChangeLedger {
         };
         let mutation_paths: HashSet<String> = candidates
             .into_iter()
-            .filter(|mutation| {
-                window.ended_at.is_none_or(|ended| {
-                    mutation.timestamp <= *ended || modified_by_end(&mutation.path, ended)
-                })
+            .filter(|(path, timestamp)| {
+                window
+                    .ended_at
+                    .is_none_or(|ended| timestamp <= ended || modified_by_end(path, ended))
             })
-            .map(|mutation| mutation.path)
+            .map(|(path, _)| path)
             .collect();
         let mut paths: HashSet<String> = window
             .current_dirty

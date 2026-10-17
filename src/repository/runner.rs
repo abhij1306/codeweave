@@ -217,11 +217,7 @@ pub(super) fn truncate_output(mut text: String, max_chars: usize) -> String {
     } else {
         ""
     };
-    let mut end = max_chars.saturating_sub(marker.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
+    text.truncate(text.floor_char_boundary(max_chars.saturating_sub(marker.len())));
     text.push_str(marker);
     text
 }

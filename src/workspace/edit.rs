@@ -2,9 +2,8 @@ use super::events::MutationRecord;
 use super::io_helpers::{diff_stat, read_optional, render_diff};
 use super::state::MutationPermit;
 use super::util::{
-    changes_without_independent_preconditions, char_boundary_at_or_before, line_offset,
-    line_range_bytes, matching_old_text, normalize_line_endings_for_content,
-    preserve_terminal_line_ending, stale_snapshot_for_paths,
+    changes_without_independent_preconditions, line_offset, line_range_bytes, matching_old_text,
+    normalize_line_endings_for_content, preserve_terminal_line_ending, stale_snapshot_for_paths,
 };
 use super::validation::ValidationOutcome;
 use super::Workspace;
@@ -19,11 +18,27 @@ use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
+/// One file a planned edit writes: its content before (absent for a new
+/// file) and after (absent for a deletion). The before hash is computed once
+/// and serves both the commit-time precondition and the mutation record.
 #[derive(Debug, Clone)]
 pub(super) struct PlannedFile {
     pub(super) path: String,
     pub(super) before: Option<String>,
+    pub(super) before_hash: Option<String>,
     pub(super) after: Option<String>,
+}
+
+impl PlannedFile {
+    pub(super) fn new(path: String, before: Option<String>, after: Option<String>) -> Self {
+        let before_hash = before.as_deref().map(content_hash);
+        Self {
+            path,
+            before,
+            before_hash,
+            after,
+        }
+    }
 }
 
 struct AppliedEdit {
@@ -80,7 +95,7 @@ impl DiffView {
             },
             _ if cap > 0 && diff.len() > cap => {
                 // Cut on a line boundary so the prefix stays a readable diff.
-                let safe_cap = char_boundary_at_or_before(diff, cap);
+                let safe_cap = diff.floor_char_boundary(cap);
                 let end = diff[..safe_cap]
                     .rfind('\n')
                     .map(|idx| idx + 1)
@@ -638,9 +653,9 @@ impl Workspace {
                     json!({"path": item.path}),
                 )
             })?;
-            let actual_hash = actual.as_ref().map(|value| content_hash(value));
-            let expected_hash = item.before.as_ref().map(|value| content_hash(value));
-            if actual_hash != expected_hash {
+            let actual_hash = actual.as_deref().map(content_hash);
+            let expected_hash = &item.before_hash;
+            if actual_hash != *expected_hash {
                 return Err(AppError::with_details(
                     ErrorCode::StaleFile,
                     "File changed after planning and before commit",
@@ -661,14 +676,7 @@ fn put_plan(
     if let Some(existing) = plan.get_mut(&path) {
         existing.after = after;
     } else {
-        plan.insert(
-            path.clone(),
-            PlannedFile {
-                path,
-                before,
-                after,
-            },
-        );
+        plan.insert(path.clone(), PlannedFile::new(path, before, after));
     }
 }
 
