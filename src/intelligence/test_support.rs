@@ -219,8 +219,10 @@ impl Fixture {
         }
     }
 
+    /// The canonical path of `relative`, as a language server initialized
+    /// with the canonical workspace root reports it.
     pub(crate) fn path(&self, relative: &str) -> std::path::PathBuf {
-        self.root.path().join(relative)
+        self.root.path().canonicalize().unwrap().join(relative)
     }
 
     pub(crate) fn uri(&self, relative: &str) -> String {
