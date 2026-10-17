@@ -1,7 +1,5 @@
 use crate::model::PolicyConfig;
 use serde::Serialize;
-#[cfg(windows)]
-use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
@@ -79,7 +77,7 @@ pub(super) fn resolve_bash(policy: &PolicyConfig) -> BashReadiness {
     }
 
     if is_default_bash_name(configured) {
-        for candidate in discover_bash_candidates(configured) {
+        for candidate in discover_bash_candidates() {
             if probe_bash(&candidate).is_ok() {
                 return bash_readiness(configured, "ready", Some(&candidate), None);
             }
@@ -162,10 +160,11 @@ fn probe_bash(executable: &Path) -> Result<(), String> {
     }
 }
 
-fn discover_bash_candidates(_configured: &str) -> Vec<PathBuf> {
+/// Further places a default `bash` name may resolve to on this platform.
+fn discover_bash_candidates() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
-        discover_windows_bash_candidates()
+        windows::discover_bash_candidates()
     }
     #[cfg(not(windows))]
     {
@@ -174,52 +173,60 @@ fn discover_bash_candidates(_configured: &str) -> Vec<PathBuf> {
 }
 
 #[cfg(windows)]
-fn discover_windows_bash_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    let mut push = |path: PathBuf| {
-        if !path.as_os_str().is_empty() && !candidates.iter().any(|existing| existing == &path) {
-            candidates.push(path);
-        }
-    };
+mod windows {
+    //! Git for Windows installs Bash outside `PATH`; look in its usual places.
+    use super::StdCommand;
+    use std::fs;
+    use std::path::PathBuf;
 
-    if let Ok(output) = StdCommand::new("where.exe").arg("bash.exe").output() {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let path = PathBuf::from(line.trim());
-            if path.is_file() {
-                push(path);
+    pub(super) fn discover_bash_candidates() -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        let mut push = |path: PathBuf| {
+            if !path.as_os_str().is_empty() && !candidates.iter().any(|existing| existing == &path)
+            {
+                candidates.push(path);
+            }
+        };
+
+        if let Ok(output) = StdCommand::new("where.exe").arg("bash.exe").output() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let path = PathBuf::from(line.trim());
+                if path.is_file() {
+                    push(path);
+                }
             }
         }
-    }
 
-    for root in [
-        std::env::var_os("ProgramW6432").map(PathBuf::from),
-        std::env::var_os("ProgramFiles").map(PathBuf::from),
-        std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
-        std::env::var_os("LocalAppData").map(|value| PathBuf::from(value).join("Programs")),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        push(root.join("Git").join("bin").join("bash.exe"));
-        push(root.join("Git").join("usr").join("bin").join("bash.exe"));
-    }
-
-    if let Ok(output) = StdCommand::new("where.exe").arg("git.exe").output() {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let git = PathBuf::from(line.trim());
-            let Some(parent) = git.parent() else {
-                continue;
-            };
-            push(parent.join("..").join("bin").join("bash.exe"));
-            push(parent.join("..").join("usr").join("bin").join("bash.exe"));
-        }
-    }
-
-    candidates
+        for root in [
+            std::env::var_os("ProgramW6432").map(PathBuf::from),
+            std::env::var_os("ProgramFiles").map(PathBuf::from),
+            std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
+            std::env::var_os("LocalAppData").map(|value| PathBuf::from(value).join("Programs")),
+        ]
         .into_iter()
-        .filter_map(|path| {
-            let path = fs::canonicalize(&path).unwrap_or(path);
-            path.is_file().then_some(path)
-        })
-        .collect()
+        .flatten()
+        {
+            push(root.join("Git").join("bin").join("bash.exe"));
+            push(root.join("Git").join("usr").join("bin").join("bash.exe"));
+        }
+
+        if let Ok(output) = StdCommand::new("where.exe").arg("git.exe").output() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let git = PathBuf::from(line.trim());
+                let Some(parent) = git.parent() else {
+                    continue;
+                };
+                push(parent.join("..").join("bin").join("bash.exe"));
+                push(parent.join("..").join("usr").join("bin").join("bash.exe"));
+            }
+        }
+
+        candidates
+            .into_iter()
+            .filter_map(|path| {
+                let path = fs::canonicalize(&path).unwrap_or(path);
+                path.is_file().then_some(path)
+            })
+            .collect()
+    }
 }

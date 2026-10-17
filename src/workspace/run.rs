@@ -1,5 +1,6 @@
 use super::state::RunWindow;
 use super::*;
+use crate::bash::{ChangeBaseline, FrozenChanges, RunStatus};
 
 impl Workspace {
     pub async fn run(self: &Arc<Self>, params: &Value) -> AppResult<Value> {
@@ -21,7 +22,7 @@ impl Workspace {
         let mut run_startup_ms = None;
         let mut result = match action {
             "start" => {
-                let (before, before_dirty) = self.generation_and_dirty();
+                let baseline = self.change_baseline();
                 let command = required_str(params, "command")?.to_owned();
                 let run_started = Instant::now();
                 let value = self
@@ -38,43 +39,19 @@ impl Workspace {
                     .await?;
                 run_startup_ms = Some(run_started.elapsed().as_millis());
                 if let Some(run_id) = value.get("run_id").and_then(Value::as_str) {
-                    self.bash.set_change_baseline(run_id, before, before_dirty);
+                    self.bash.set_change_baseline(run_id, baseline);
                 }
                 value
             }
-            "status" => {
-                let actor = Arc::clone(self);
-                let run_id = required_str(params, "run_id")?.to_owned();
-                tokio::task::spawn_blocking(move || actor.bash.status(&run_id))
-                    .await
-                    .map_err(AppError::internal)??
-            }
-            "output" => {
-                let actor = Arc::clone(self);
-                let run_id = required_str(params, "run_id")?.to_owned();
-                let continuation = params
-                    .get("continuation")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let stream = params
-                    .get("stream")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                tokio::task::spawn_blocking(move || {
-                    actor
-                        .bash
-                        .output_stream(&run_id, continuation.as_deref(), stream.as_deref())
-                })
-                .await
-                .map_err(AppError::internal)??
-            }
-            "cancel" => {
-                let actor = Arc::clone(self);
-                let run_id = required_str(params, "run_id")?.to_owned();
-                tokio::task::spawn_blocking(move || actor.bash.cancel(&run_id))
-                    .await
-                    .map_err(AppError::internal)??
-            }
+            // Status, output and cancel only read or signal in-memory state and
+            // never block, so they run inline.
+            "status" => self.bash.status(required_str(params, "run_id")?)?,
+            "output" => self.bash.output_stream(
+                required_str(params, "run_id")?,
+                params.get("continuation").and_then(Value::as_str),
+                params.get("stream").and_then(Value::as_str),
+            )?,
+            "cancel" => self.bash.cancel(required_str(params, "run_id")?)?,
             other => {
                 return Err(AppError::details(
                     "INVALID_RUN_ACTION",
@@ -83,13 +60,13 @@ impl Workspace {
                 ))
             }
         };
+        let terminal = result
+            .get("status")
+            .and_then(Value::as_str)
+            .and_then(RunStatus::parse)
+            .is_none_or(RunStatus::is_terminal);
         let reconcile_after_started = Instant::now();
         if is_poll {
-            let terminal = result
-                .get("status")
-                .and_then(Value::as_str)
-                .map(|status| !matches!(status, "queued" | "running" | "cancelling"))
-                .unwrap_or(true);
             self.reconcile_after_poll(terminal).await?;
         } else {
             self.reconcile_pending_async().await?;
@@ -100,34 +77,8 @@ impl Workspace {
             .and_then(Value::as_str)
             .map(str::to_owned)
         {
-            let terminal = result
-                .get("status")
-                .and_then(Value::as_str)
-                .map(|status| !matches!(status, "queued" | "running" | "cancelling"))
-                .unwrap_or(true);
-            let (current_generation, current_dirty) = self.generation_and_dirty();
-            // Attribution reads file metadata, so it runs on the blocking pool.
-            let actor = Arc::clone(self);
             let (start_generation, attribution_generation, changed_paths) =
-                tokio::task::spawn_blocking(move || {
-                    actor.bash.observe_changes(
-                        &run_id,
-                        current_generation,
-                        current_dirty,
-                        terminal,
-                        |start_generation, baseline_dirty, ended_at, current_dirty| {
-                            actor.state.ledger().attribute_since(&RunWindow {
-                                start_generation,
-                                end_generation: current_generation,
-                                ended_at,
-                                baseline_dirty,
-                                current_dirty,
-                            })
-                        },
-                    )
-                })
-                .await
-                .map_err(AppError::internal)??;
+                self.attribute_run_changes(&run_id, terminal).await?;
             let changed = summarize_changed_paths(changed_paths);
             if let Some(object) = result.as_object_mut() {
                 object.insert(
@@ -169,10 +120,55 @@ impl Workspace {
         Ok(result)
     }
 
-    /// The generation and dirty file set, read together from one view.
-    fn generation_and_dirty(&self) -> (u64, HashSet<String>) {
+    /// The current generation and dirty file set, read together from one view.
+    fn change_baseline(&self) -> ChangeBaseline {
         let view = self.state.read();
-        let dirty = view.repo_status().dirty_files.iter().cloned().collect();
-        (view.generation(), dirty)
+        ChangeBaseline {
+            generation: view.generation(),
+            dirty: Arc::new(view.repo_status().dirty_files.iter().cloned().collect()),
+        }
+    }
+
+    /// Paths a run changed, as (start generation, end generation, paths). The
+    /// supervisor supplies the run's baseline and end time; the change ledger
+    /// decides attribution. A terminal run's first result is frozen and reused.
+    async fn attribute_run_changes(
+        self: &Arc<Self>,
+        run_id: &str,
+        terminal: bool,
+    ) -> AppResult<(u64, u64, HashSet<String>)> {
+        let current = self.change_baseline();
+        let window = self.bash.change_window(run_id, current.clone())?;
+        let start_generation = window.baseline.generation;
+        if let Some(frozen) = window.frozen {
+            return Ok((start_generation, frozen.generation, frozen.paths));
+        }
+        let ended_at = if terminal { window.ended_at } else { None };
+        // Attribution reads file metadata, so it runs on the blocking pool.
+        let actor = Arc::clone(self);
+        let baseline_dirty = window.baseline.dirty;
+        let current_dirty = Arc::clone(&current.dirty);
+        let paths = tokio::task::spawn_blocking(move || {
+            actor.state.ledger().attribute_since(&RunWindow {
+                start_generation,
+                end_generation: current.generation,
+                ended_at: ended_at.as_ref(),
+                baseline_dirty: &baseline_dirty,
+                current_dirty: &current_dirty,
+            })
+        })
+        .await
+        .map_err(AppError::internal)?;
+        if !terminal {
+            return Ok((start_generation, current.generation, paths));
+        }
+        let frozen = self.bash.freeze_changes(
+            run_id,
+            FrozenChanges {
+                generation: current.generation,
+                paths,
+            },
+        )?;
+        Ok((start_generation, frozen.generation, frozen.paths))
     }
 }
