@@ -7,7 +7,7 @@
 //! the enum, so no caller compares code strings.
 
 use serde::{Serialize, Serializer};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::fmt;
 use std::io;
 
@@ -213,7 +213,7 @@ impl AppError {
                         Value::Object(object) => Some(object),
                         _ => None,
                     })
-                    .unwrap_or_else(Map::new);
+                    .unwrap_or_default();
                 object.insert("retryable".to_owned(), Value::Bool(false));
                 object.insert(
                     "retry_kind".to_owned(),
