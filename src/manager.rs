@@ -214,9 +214,7 @@ impl Application {
             }
             "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame" | "git_preflight"
             | "git_stage" | "git_commit" | "git_restore" | "git_push" => {
-                let actor = self.actor()?;
-                let params = params.clone();
-                run_blocking(move || actor.git(&params)).await
+                self.actor()?.git(params).await
             }
             "bash" | "bash_status" | "bash_output" | "bash_cancel" => {
                 let prepared = contracts::normalize_bash_request(method, params)?;
@@ -259,8 +257,7 @@ impl Application {
             PathBuf::from(&repo.path),
             config.intelligence.clone(),
             actor.id.clone(),
-            actor.reference_index(),
-            actor.reference_snapshot(),
+            actor.state_reader(),
         )?);
         let open_ms = open_started.elapsed().as_millis();
 

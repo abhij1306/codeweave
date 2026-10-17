@@ -29,7 +29,7 @@ impl Workspace {
             ));
         }
 
-        let snapshot = self.snapshot();
+        let snapshot = self.state.read().stamp().snapshot_id;
         if let Some(expected) = params.get("snapshot_id").and_then(Value::as_str) {
             if expected != snapshot {
                 return Err(stale_snapshot(expected, &snapshot));

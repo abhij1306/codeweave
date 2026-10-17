@@ -1,3 +1,4 @@
+use super::state::RunWindow;
 use super::*;
 
 impl Workspace {
@@ -20,14 +21,7 @@ impl Workspace {
         let mut run_startup_ms = None;
         let mut result = match action {
             "start" => {
-                let before = self.generation();
-                let before_dirty: HashSet<String> = self
-                    .repo_status
-                    .read()
-                    .dirty_files
-                    .iter()
-                    .cloned()
-                    .collect();
+                let (before, before_dirty) = self.generation_and_dirty();
                 let command = required_str(params, "command")?.to_owned();
                 let run_started = Instant::now();
                 let value = self
@@ -106,37 +100,34 @@ impl Workspace {
             .and_then(Value::as_str)
             .map(str::to_owned)
         {
-            let current_dirty: HashSet<String> = self
-                .repo_status
-                .read()
-                .dirty_files
-                .iter()
-                .cloned()
-                .collect();
             let terminal = result
                 .get("status")
                 .and_then(Value::as_str)
                 .map(|status| !matches!(status, "queued" | "running" | "cancelling"))
                 .unwrap_or(true);
-            let current_generation = self.generation();
-            let mutation_snapshot = self.mutations.lock().iter().cloned().collect::<Vec<_>>();
+            let (current_generation, current_dirty) = self.generation_and_dirty();
+            // Attribution reads file metadata, so it runs on the blocking pool.
+            let actor = Arc::clone(self);
             let (start_generation, attribution_generation, changed_paths) =
-                self.bash.observe_changes(
-                    &run_id,
-                    current_generation,
-                    current_dirty,
-                    terminal,
-                    |start_generation, baseline_dirty, ended_at, current_dirty| {
-                        self.observed_run_changed_paths(
-                            &mutation_snapshot,
-                            start_generation,
-                            baseline_dirty,
-                            current_generation,
-                            ended_at,
-                            current_dirty,
-                        )
-                    },
-                )?;
+                tokio::task::spawn_blocking(move || {
+                    actor.bash.observe_changes(
+                        &run_id,
+                        current_generation,
+                        current_dirty,
+                        terminal,
+                        |start_generation, baseline_dirty, ended_at, current_dirty| {
+                            actor.state.ledger().attribute_since(&RunWindow {
+                                start_generation,
+                                end_generation: current_generation,
+                                ended_at,
+                                baseline_dirty,
+                                current_dirty,
+                            })
+                        },
+                    )
+                })
+                .await
+                .map_err(AppError::internal)??;
             let changed = summarize_changed_paths(changed_paths);
             if let Some(object) = result.as_object_mut() {
                 object.insert(
@@ -178,53 +169,10 @@ impl Workspace {
         Ok(result)
     }
 
-    pub(super) fn observed_run_changed_paths(
-        &self,
-        mutations: &[MutationRecord],
-        start_generation: u64,
-        baseline_dirty: &HashSet<String>,
-        end_generation: u64,
-        ended_at: Option<&DateTime<Utc>>,
-        current_dirty: &HashSet<String>,
-    ) -> HashSet<String> {
-        let mutation_paths: HashSet<String> = mutations
-            .iter()
-            .filter(|mutation| {
-                mutation.generation > start_generation
-                    && mutation.generation <= end_generation
-                    && ended_at
-                        .map(|ended| {
-                            mutation.timestamp <= *ended
-                                || self.path_modified_at_or_before(&mutation.path, ended)
-                        })
-                        .unwrap_or(true)
-            })
-            .map(|mutation| mutation.path.clone())
-            .collect();
-        let mut paths: HashSet<String> = current_dirty
-            .symmetric_difference(baseline_dirty)
-            .filter(|path| {
-                ended_at.is_none()
-                    || mutation_paths.contains(*path)
-                    || ended_at
-                        .map(|ended| self.path_modified_at_or_before(path, ended))
-                        .unwrap_or(true)
-            })
-            .cloned()
-            .collect();
-        paths.extend(mutation_paths);
-        paths.retain(|path| !self.exclusions.is_ignored(Path::new(path), false));
-        paths
-    }
-
-    pub(super) fn path_modified_at_or_before(&self, path: &str, ended_at: &DateTime<Utc>) -> bool {
-        let Ok(metadata) = fs::metadata(self.root.join(path)) else {
-            return false;
-        };
-        let Ok(modified) = metadata.modified() else {
-            return false;
-        };
-        let modified: DateTime<Utc> = modified.into();
-        modified <= *ended_at
+    /// The generation and dirty file set, read together from one view.
+    fn generation_and_dirty(&self) -> (u64, HashSet<String>) {
+        let view = self.state.read();
+        let dirty = view.repo_status().dirty_files.iter().cloned().collect();
+        (view.generation(), dirty)
     }
 }
