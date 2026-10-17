@@ -194,7 +194,7 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
     assert!(fetch["phase_ms"]["fetch_items"].is_number());
 
     let retrieved = actor
-        .code_retrieve(retrieve_request(&json!({
+        .code_retrieve(&retrieve_request(&json!({
             "operations": [{"operation": "search_text", "pattern": "pending_symbol"}]
         })))
         .unwrap();

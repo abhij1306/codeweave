@@ -675,7 +675,7 @@ mod tests {
     fn diff_view_truncates_on_utf8_boundary() {
         let diff = format!("{}é\nnext\n", "a".repeat(10));
 
-        let view = DiffView::build(&diff, &[], "standard", 11);
+        let view = DiffView::build(&diff, &[], ResponseDetail::Standard, 11);
 
         assert!(view.truncated);
         assert_eq!(view.diff.as_str().unwrap(), "aaaaaaaaaa");

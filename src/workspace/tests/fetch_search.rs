@@ -161,7 +161,7 @@ fn outline_accepts_multiple_paths_and_reports_partial_errors() {
 
     let overview = |paths: serde_json::Value| {
         let response = actor
-            .code_retrieve(retrieve_request(&json!({
+            .code_retrieve(&retrieve_request(&json!({
                 "operations": [{"operation": "symbols_overview", "paths": paths}]
             })))
             .unwrap();
@@ -244,7 +244,7 @@ fn code_retrieve_batches_explicit_primitives_in_one_round_trip() {
 
     let result = actor
         .code_retrieve(
-            &json!({
+            &retrieve_request(&json!({
                 "operations": [
                     {"id": "file", "operation": "find_file", "name": "Cargo.toml"},
                     {"id": "symbol", "operation": "find_symbol", "symbol": "extract", "paths": ["engine.rs"]},
@@ -252,7 +252,7 @@ fn code_retrieve_batches_explicit_primitives_in_one_round_trip() {
                     {"id": "outline", "operation": "symbols_overview", "paths": ["engine.rs"]},
                     {"id": "read", "operation": "read", "target": "symbol", "value": "extract", "path": "engine.rs"}
                 ]
-            }),
+            })),
         )
         .unwrap();
 
@@ -294,7 +294,7 @@ fn code_retrieve_preserves_success_when_an_operation_fails() {
     let actor = test_actor(root.path());
 
     let result = actor
-        .code_retrieve(retrieve_request(&json!({
+        .code_retrieve(&retrieve_request(&json!({
             "operations": [
                 {"id": "file", "operation": "find_file", "name": "engine.rs"},
                 {"id": "invalid", "operation": "find_symbol"}
@@ -316,7 +316,7 @@ fn code_retrieve_reports_malformed_entries_without_losing_successes() {
     let actor = test_actor(root.path());
 
     let result = actor
-        .code_retrieve(retrieve_request(&json!({
+        .code_retrieve(&retrieve_request(&json!({
             "operations": [
                 {"id": "file", "operation": "find_file", "name": "engine.rs"},
                 "not-an-object",
@@ -345,7 +345,7 @@ fn code_retrieve_rejects_a_stale_snapshot() {
     let actor = test_actor(root.path());
 
     let error = actor
-        .code_retrieve(retrieve_request(&json!({
+        .code_retrieve(&retrieve_request(&json!({
             "snapshot_id": "snap_stale",
             "operations": [
                 {"operation": "find_file", "name": "engine.rs"}
