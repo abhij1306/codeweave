@@ -43,3 +43,19 @@ internal write, for example an editor save or a build step.
 **Mutation record**: One entry in the mutation log: a path, its before and after
 hashes, the source (`mcp_edit` or `external`), the request id, a timestamp and
 the generation that published it. The log is bounded and lost on restart.
+
+**Bash run**: One command started through the Bash supervisor (`src/bash`). Its
+record holds the status, the process group, the output buffers, the change
+baseline and, once terminal, the frozen changed paths. At most 128 completed runs
+are kept.
+
+**Run status**: `queued`, `running` or `cancelling` while active; `succeeded`,
+`failed`, `timed_out` or `cancelled` once terminal. A terminal status never
+changes.
+
+**Process group**: The handle to everything a run's process started. Stopping it
+sends a polite stop, then a forced kill after a grace period; dropping the last
+handle kills what is left.
+
+**Change baseline**: The generation and dirty file set a Bash run's change
+attribution starts from, taken when the run starts.

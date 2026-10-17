@@ -19,8 +19,12 @@ change the reconciled state only through its single writer. Mutation records are
 bounded in memory, carry an instance-local generation, and disappear on restart.
 Git is the durable history. `CONTEXT.md` defines these terms.
 
-Each Bash run owns its process, output buffers, change baseline, and frozen
-terminal changed-path result. Runs execute sequentially. A foreground request
+Each Bash run owns its process group, output buffers, change baseline, and frozen
+terminal changed-path result. One state machine (`src/bash/lifecycle.rs`) moves a
+run from queued to a terminal status and sets its end fields exactly once. Output
+is decoded and stripped of ANSI escapes once at ingest into bounded per-stream
+tails. The supervisor hands the workspace the run's baseline and end time; the
+change ledger decides which paths the run changed. Runs execute sequentially. A foreground request
 may be promoted to background after its response budget, without changing the
 run or starting a duplicate process. At most 128 completed runs are retained;
 active runs are never evicted.
@@ -64,7 +68,10 @@ filesystem commit.
   and logs a warning.
 - File reads use canonical repository-relative paths and never escape the root.
 - Bash cancellation and timeout terminate the process tree and preserve bounded
-  partial output.
+  partial output. Termination never blocks an async path: the group gets a stop
+  request, a tracked task force-kills it after a grace period, and dropping the
+  last handle to the group kills it.
+- The Bash run table lock is never held while a run record is locked.
 - Semantic results are current only when the synchronized document hash still
   matches both disk and the live index, and every other file the result names
   matches its index entry; otherwise fallback evidence (or, for rename preview,
