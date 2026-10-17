@@ -2,7 +2,7 @@
 //!
 //! The only adapter, [`CliGitBackend`], drives the `git` executable. It is
 //! split by concern: `runner` starts one bounded `git` process and classifies
-//! its failure into a typed [`runner::GitError`], `porcelain` parses
+//! its failure into a typed `GitError`, `porcelain` parses
 //! `git status --porcelain=v2`, `diff` parses unified diffs into structured
 //! hunks, and `cli` maps each backend operation onto `git` arguments.
 
