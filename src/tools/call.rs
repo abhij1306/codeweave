@@ -145,7 +145,7 @@ mod tests {
             json!({
                 "content": [{
                     "type": "text",
-                    "text": "{\"error\":{\"code\":\"STALE_FILE\",\"message\":\"file changed\",\"retryable\":true,\"retry_kind\":\"retry_same_request\",\"details\":null}}"
+                    "text": "{\"error\":{\"code\":\"STALE_FILE\",\"details\":null,\"message\":\"file changed\",\"retry_kind\":\"retry_same_request\",\"retryable\":true}}"
                 }],
                 "structuredContent": {"error": {
                     "code": "STALE_FILE",
