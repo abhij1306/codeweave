@@ -87,22 +87,29 @@ impl ServerCapabilities {
         })
     }
 
-    pub(crate) fn require(&self, operation: &str) -> AppResult<()> {
-        let supported = match operation {
+    /// Capabilities of a server that has not advertised anything yet.
+    pub(crate) fn none() -> Self {
+        Self {
+            references_provider: false,
+            definition_provider: false,
+            rename_provider: false,
+            diagnostics_provider: false,
+            pull_diagnostics_provider: false,
+            sync_kind: TextDocumentSyncKind::None,
+            position_encoding: PositionEncoding::Utf16,
+            server_name: None,
+            server_version: None,
+            initialization_ms: 0,
+        }
+    }
+
+    pub(crate) fn supports(&self, operation: &str) -> bool {
+        match operation {
             "definition" => self.definition_provider,
             "references" => self.references_provider,
             "rename" => self.rename_provider,
             "diagnostics" => self.diagnostics_provider,
             _ => false,
-        };
-        if supported {
-            Ok(())
-        } else {
-            Err(AppError::details(
-                "LSP_UNSUPPORTED",
-                format!("Language server does not advertise {operation} support"),
-                json!({"operation": operation}),
-            ))
         }
     }
 }
@@ -198,7 +205,7 @@ pub(crate) fn server_request_result(method: &str, params: &Value, root: &Path) -
             Value::Array((0..count).map(|_| Value::Null).collect())
         }
         "workspace/workspaceFolders" => json!([{
-            "uri": super::normalize::path_uri(root),
+            "uri": super::uri::path_uri(root),
             "name": root.file_name().and_then(|name| name.to_str()).unwrap_or("workspace")
         }]),
         "workspace/applyEdit" => json!({

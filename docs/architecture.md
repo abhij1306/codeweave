@@ -54,6 +54,12 @@ filesystem commit.
 - Bash cancellation and timeout terminate the process tree and preserve bounded
   partial output.
 - Semantic results are current only when the synchronized document hash still
-  matches both disk and the live index; otherwise fallback evidence is returned.
+  matches both disk and the live index, and every other file the result names
+  matches its index entry; otherwise fallback evidence (or, for rename preview,
+  `INTELLIGENCE_STALE`) is returned. One session module enforces this for
+  every operation.
+- Each configured language server runs on one worker thread behind a bounded
+  queue. Requests carry deadlines the worker honors; dropping the
+  intelligence service stops the thread and terminates the server.
 - Published diagnostic URIs are resolved to canonical workspace paths before
   cache matching, including equivalent Windows URI casing and encoding.

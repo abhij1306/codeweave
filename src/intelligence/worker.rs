@@ -1,37 +1,46 @@
-use super::normalize::position_params;
-use super::protocol::{
-    initialize_params, parse_initialize_result, server_request_result, ServerCapabilities,
-};
-use super::sync::{
-    plan_sync, verify_current, DocumentSnapshot, DocumentState, SynchronizedDocument,
-};
+//! One worker thread per configured language server. The thread owns the
+//! server process; callers talk to it through a bounded queue and every
+//! request carries a deadline the worker honors.
+mod error;
+mod server;
+
+pub(crate) use error::WorkerError;
+
+use super::backend::SemanticBackend;
+use super::preset::LspPreset;
+use super::protocol::ServerCapabilities;
+use super::request::Position;
+use super::sync::{DocumentSnapshot, SynchronizedDocument};
+use super::transport::{RpcTransport, StdioRpcTransport, TransportFactory};
+use super::uri::UriCodec;
 use crate::model::{AppError, AppResult, LanguageServerSettings};
 use parking_lot::RwLock;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
-use std::io;
+use server::{RequestContext, Server};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
-
-use super::preset::LspPreset;
-use super::transport::{RpcTransport, StdioRpcTransport, TransportFactory};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// Requests waiting for the worker beyond this are refused with `LSP_BUSY`.
+const QUEUE_CAPACITY: usize = 16;
+/// Extra time the caller waits past the request deadline for the worker's reply.
+const REPLY_GRACE: Duration = Duration::from_millis(250);
+const LATENCY_SAMPLES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub(crate) enum WorkerOperation {
     Definition {
-        line: usize,
-        column: usize,
+        position: Position,
     },
     References {
-        line: usize,
-        column: usize,
+        position: Position,
     },
     Rename {
-        line: usize,
-        column: usize,
+        position: Position,
         new_name: String,
     },
     Diagnostics,
@@ -47,12 +56,12 @@ impl WorkerOperation {
         }
     }
 
-    fn method(&self) -> Option<&'static str> {
+    fn method(&self) -> &'static str {
         match self {
-            Self::Definition { .. } => Some("textDocument/definition"),
-            Self::References { .. } => Some("textDocument/references"),
-            Self::Rename { .. } => Some("textDocument/rename"),
-            Self::Diagnostics => None,
+            Self::Definition { .. } => "textDocument/definition",
+            Self::References { .. } => "textDocument/references",
+            Self::Rename { .. } => "textDocument/rename",
+            Self::Diagnostics => "textDocument/diagnostic",
         }
     }
 }
@@ -64,9 +73,28 @@ pub(crate) struct WorkerResponse {
     pub(crate) capabilities: ServerCapabilities,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Readiness {
+    Disabled,
+    Lazy,
+    Starting,
+    Ready,
+}
+
+impl Readiness {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Lazy => "lazy",
+            Self::Starting => "starting",
+            Self::Ready => "ready",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WorkerStatus {
-    readiness: &'static str,
+    readiness: Readiness,
     restart_count: u64,
     last_error: Option<String>,
     capabilities: Option<ServerCapabilities>,
@@ -77,10 +105,10 @@ struct WorkerStatus {
     warm_request_samples_ms: VecDeque<u128>,
 }
 
-impl Default for WorkerStatus {
-    fn default() -> Self {
+impl WorkerStatus {
+    fn new(readiness: Readiness) -> Self {
         Self {
-            readiness: "lazy",
+            readiness,
             restart_count: 0,
             last_error: None,
             capabilities: None,
@@ -91,28 +119,61 @@ impl Default for WorkerStatus {
             warm_request_samples_ms: VecDeque::new(),
         }
     }
+
+    fn record_latency(&mut self, elapsed_ms: u128) {
+        self.request_count += 1;
+        self.last_request_ms = Some(elapsed_ms);
+        if self.first_request_ms.is_none() {
+            self.first_request_ms = Some(elapsed_ms);
+        } else {
+            self.warm_request_samples_ms.push_back(elapsed_ms);
+            if self.warm_request_samples_ms.len() > LATENCY_SAMPLES {
+                self.warm_request_samples_ms.pop_front();
+            }
+        }
+    }
 }
 
-enum WorkerCommand {
-    Execute {
-        operation: WorkerOperation,
-        document: DocumentSnapshot,
-        response: Sender<AppResult<WorkerResponse>>,
-    },
+struct Command {
+    operation: WorkerOperation,
+    document: DocumentSnapshot,
+    deadline: Instant,
+    reply: Sender<Result<WorkerResponse, WorkerError>>,
+}
+
+/// The caller's side of a running worker thread.
+struct WorkerThread {
+    sender: Option<SyncSender<Command>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for WorkerThread {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 pub(crate) struct LspWorker {
     preset: LspPreset,
-    configured: bool,
     command: String,
     args: Vec<String>,
     timeout: Duration,
-    sender: Option<Sender<WorkerCommand>>,
+    thread: Option<WorkerThread>,
     status: Arc<RwLock<WorkerStatus>>,
 }
 
 impl LspWorker {
-    pub(crate) fn new(root: PathBuf, preset: LspPreset, settings: LanguageServerSettings) -> Self {
+    /// Start the worker for one preset. A disabled preset gets no thread.
+    pub(crate) fn spawn(
+        root: &Path,
+        preset: LspPreset,
+        settings: &LanguageServerSettings,
+    ) -> AppResult<Self> {
         let command = if settings.command.is_empty() {
             preset.default_command().to_owned()
         } else {
@@ -127,130 +188,159 @@ impl LspWorker {
         } else {
             settings.args.clone()
         };
-        let command_for_factory = command.clone();
-        let args_for_factory = args.clone();
-        let root_for_factory = root.clone();
+        let (spawn_command, spawn_args, cwd) = (command.clone(), args.clone(), root.to_owned());
         let factory: TransportFactory = Arc::new(move || {
-            StdioRpcTransport::spawn(&command_for_factory, &args_for_factory, &root_for_factory)
+            StdioRpcTransport::spawn(&spawn_command, &spawn_args, &cwd)
                 .map(|process| Box::new(process) as Box<dyn RpcTransport>)
         });
         Self::with_factory(root, preset, settings, command, args, factory)
     }
 
     fn with_factory(
-        root: PathBuf,
+        root: &Path,
         preset: LspPreset,
-        settings: LanguageServerSettings,
+        settings: &LanguageServerSettings,
         command: String,
         args: Vec<String>,
         factory: TransportFactory,
-    ) -> Self {
-        let configured = settings.enabled;
+    ) -> AppResult<Self> {
         let timeout = Duration::from_millis(settings.timeout_ms.max(1));
-        let status = Arc::new(RwLock::new(WorkerStatus {
-            readiness: if configured { "lazy" } else { "disabled" },
-            ..WorkerStatus::default()
-        }));
-        let sender = configured.then(|| {
-            let (sender, receiver) = mpsc::channel();
-            let worker_status = Arc::clone(&status);
-            let worker_name = format!("codeweave-lsp-{}", preset.key());
-            thread::Builder::new()
-                .name(worker_name)
-                .spawn(move || {
-                    WorkerRuntime::new(root, preset, timeout, factory, worker_status).run(receiver);
-                })
-                .expect("LSP worker thread must start");
-            sender
-        });
-        Self {
+        let readiness = if settings.enabled {
+            Readiness::Lazy
+        } else {
+            Readiness::Disabled
+        };
+        let status = Arc::new(RwLock::new(WorkerStatus::new(readiness)));
+        let thread = if settings.enabled {
+            let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
+            let stop = Arc::new(AtomicBool::new(false));
+            let runtime = WorkerRuntime {
+                root: root.to_owned(),
+                codec: UriCodec::new(root),
+                preset,
+                timeout,
+                factory,
+                status: Arc::clone(&status),
+                stop: Arc::clone(&stop),
+                server: ServerState::Stopped,
+            };
+            let handle = thread::Builder::new()
+                .name(format!("codeweave-lsp-{}", preset.key()))
+                .spawn(move || runtime.run(receiver))
+                .map_err(|error| {
+                    AppError::details(
+                        "LSP_WORKER_START_FAILED",
+                        format!("Cannot start the language-server worker thread: {error}"),
+                        json!({"language": preset.key()}),
+                    )
+                })?;
+            Some(WorkerThread {
+                sender: Some(sender),
+                stop,
+                thread: Some(handle),
+            })
+        } else {
+            None
+        };
+        Ok(Self {
             preset,
-            configured,
             command,
             args,
             timeout,
-            sender,
+            thread,
             status,
-        }
+        })
     }
 
+    /// A worker over an arbitrary transport, for tests.
     #[cfg(test)]
-    fn test_with_factory(
-        root: PathBuf,
+    pub(crate) fn with_transport(
+        root: &Path,
         preset: LspPreset,
         timeout: Duration,
         factory: TransportFactory,
     ) -> Self {
+        let settings = LanguageServerSettings {
+            enabled: true,
+            command: "fixture".to_owned(),
+            args: Vec::new(),
+            timeout_ms: timeout.as_millis() as u64,
+        };
         Self::with_factory(
             root,
             preset,
-            LanguageServerSettings {
-                enabled: true,
-                command: "fixture".to_owned(),
-                args: Vec::new(),
-                timeout_ms: timeout.as_millis() as u64,
-            },
+            &settings,
             "fixture".to_owned(),
             Vec::new(),
             factory,
         )
+        .expect("test worker thread starts")
     }
 
-    pub(crate) fn configured(&self) -> bool {
-        self.configured
+    /// The longest a caller waits for one request, including one restart.
+    fn request_budget(&self) -> Duration {
+        self.timeout.saturating_mul(4) + Duration::from_secs(2)
     }
+}
 
-    pub(crate) fn preset(&self) -> LspPreset {
+impl SemanticBackend for LspWorker {
+    fn preset(&self) -> LspPreset {
         self.preset
     }
 
-    pub(crate) fn execute(
+    fn configured(&self) -> bool {
+        self.thread.is_some()
+    }
+
+    fn execute(
         &self,
         operation: WorkerOperation,
         document: DocumentSnapshot,
-    ) -> AppResult<WorkerResponse> {
-        let sender = self.sender.as_ref().ok_or_else(|| {
-            AppError::new(
-                "SEMANTIC_BACKEND_UNAVAILABLE",
-                format!("{} language server is disabled", self.preset.key()),
-            )
-        })?;
-        let (response_tx, response_rx) = mpsc::channel();
+    ) -> Result<WorkerResponse, WorkerError> {
+        let language = self.preset.key();
+        let sender = self
+            .thread
+            .as_ref()
+            .ok_or(WorkerError::Disabled { language })?
+            .sender
+            .as_ref()
+            .ok_or(WorkerError::Stopped)?;
+        let budget = self.request_budget();
+        let (reply, response) = mpsc::channel();
         sender
-            .send(WorkerCommand::Execute {
+            .try_send(Command {
                 operation,
                 document,
-                response: response_tx,
+                deadline: Instant::now() + budget,
+                reply,
             })
-            .map_err(|_| {
-                AppError::new("LSP_WORKER_STOPPED", "Language-server worker has stopped")
+            .map_err(|error| match error {
+                TrySendError::Full(_) => WorkerError::Busy { language },
+                TrySendError::Disconnected(_) => WorkerError::Stopped,
             })?;
-        // A restart cycle can spend one timeout initializing and one timeout on the
-        // request for each of two attempts. Keep the existing fixed scheduling buffer.
-        let wait = self.timeout.saturating_mul(4) + Duration::from_secs(2);
-        response_rx.recv_timeout(wait).map_err(|error| {
-            AppError::details(
-                "LSP_TIMEOUT",
-                "Language-server worker did not answer before its deadline",
-                json!({"language": self.preset.key(), "error": error.to_string()}),
-            )
-        })?
+        match response.recv_timeout(budget + REPLY_GRACE) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(WorkerError::TimedOut {
+                language,
+                stderr_tail: None,
+            }),
+            Err(RecvTimeoutError::Disconnected) => Err(WorkerError::Stopped),
+        }
     }
 
-    pub(crate) fn status(&self) -> Value {
+    fn status(&self) -> Value {
         let status = self.status.read().clone();
         let initialization_ms = status
             .capabilities
             .as_ref()
             .map(|capabilities| capabilities.initialization_ms);
-        let warm_request_p50_ms = latency_p50(&status.warm_request_samples_ms);
         json!({
             "language": self.preset.key(),
-            "configured": self.configured,
+            "configured": self.thread.is_some(),
             "command": self.command,
             "args": self.args,
             "timeout_ms": self.timeout.as_millis(),
-            "readiness": status.readiness,
+            "readiness": status.readiness.as_str(),
             "restart_count": status.restart_count,
             "last_error": status.last_error,
             "synchronized_document_count": status.synchronized_document_count,
@@ -259,7 +349,7 @@ impl LspWorker {
                 "initialization": initialization_ms,
                 "first_request": status.first_request_ms,
                 "last_request": status.last_request_ms,
-                "warm_request_p50": warm_request_p50_ms,
+                "warm_request_p50": latency_p50(&status.warm_request_samples_ms),
                 "request_count": status.request_count
             },
             "fallback": "tree_sitter_then_lexical"
@@ -267,363 +357,137 @@ impl LspWorker {
     }
 }
 
+#[derive(Default)]
+enum ServerState {
+    #[default]
+    Stopped,
+    Ready(Box<Server>),
+}
+
 struct WorkerRuntime {
     root: PathBuf,
+    codec: UriCodec,
     preset: LspPreset,
     timeout: Duration,
     factory: TransportFactory,
     status: Arc<RwLock<WorkerStatus>>,
-    process: Option<Box<dyn RpcTransport>>,
-    next_id: u64,
-    capabilities: Option<ServerCapabilities>,
-    documents: HashMap<PathBuf, DocumentState>,
-    diagnostics: HashMap<String, Value>,
+    stop: Arc<AtomicBool>,
+    server: ServerState,
 }
 
 impl WorkerRuntime {
-    fn new(
-        root: PathBuf,
-        preset: LspPreset,
-        timeout: Duration,
-        factory: TransportFactory,
-        status: Arc<RwLock<WorkerStatus>>,
-    ) -> Self {
-        Self {
-            root,
-            preset,
-            timeout,
-            factory,
-            status,
-            process: None,
-            next_id: 1,
-            capabilities: None,
-            documents: HashMap::new(),
-            diagnostics: HashMap::new(),
-        }
-    }
-
-    fn run(mut self, receiver: Receiver<WorkerCommand>) {
+    fn run(mut self, receiver: Receiver<Command>) {
         while let Ok(command) = receiver.recv() {
-            match command {
-                WorkerCommand::Execute {
-                    operation,
-                    document,
-                    response,
-                } => {
-                    let started = Instant::now();
-                    let result = self.execute_with_restart(operation, document);
-                    let elapsed_ms = started.elapsed().as_millis();
-                    {
-                        let mut status = self.status.write();
-                        status.request_count += 1;
-                        status.last_request_ms = Some(elapsed_ms);
-                        if status.first_request_ms.is_none() {
-                            status.first_request_ms = Some(elapsed_ms);
-                        } else {
-                            status.warm_request_samples_ms.push_back(elapsed_ms);
-                            if status.warm_request_samples_ms.len() > 64 {
-                                status.warm_request_samples_ms.pop_front();
-                            }
-                        }
-                    }
-                    let _ = response.send(result);
-                }
-            }
+            let result = if self.stop.load(Ordering::Acquire) {
+                Err(WorkerError::Stopped)
+            } else if Instant::now() >= command.deadline {
+                // The caller has given up; never start abandoned work.
+                Err(WorkerError::TimedOut {
+                    language: self.preset.key(),
+                    stderr_tail: None,
+                })
+            } else {
+                let started = Instant::now();
+                let result = self.execute_with_restart(
+                    &command.operation,
+                    &command.document,
+                    command.deadline,
+                );
+                self.status
+                    .write()
+                    .record_latency(started.elapsed().as_millis());
+                result
+            };
+            let _ = command.reply.send(result);
         }
     }
 
+    /// Run once; after a restartable failure, retry once on a fresh server
+    /// if the deadline allows.
     fn execute_with_restart(
         &mut self,
-        operation: WorkerOperation,
-        document: DocumentSnapshot,
-    ) -> AppResult<WorkerResponse> {
-        for attempt in 0..2 {
-            match self.execute_once(&operation, &document) {
-                Ok(response) => {
-                    let mut status = self.status.write();
-                    status.readiness = "ready";
-                    status.last_error = None;
-                    status.synchronized_document_count = self.documents.len();
-                    return Ok(response);
-                }
-                Err(error) => {
-                    let restartable = matches!(
-                        error.0.code.as_str(),
-                        "LSP_TIMEOUT" | "LSP_TRANSPORT_ERROR" | "LSP_PROTOCOL_ERROR"
-                    );
-                    {
-                        let mut status = self.status.write();
-                        status.last_error = Some(error.0.message.clone());
-                    }
-                    if attempt == 0 && restartable {
-                        self.reset(true);
-                        continue;
-                    }
-                    if restartable {
-                        self.reset(false);
-                    }
-                    return Err(error);
-                }
+        operation: &WorkerOperation,
+        document: &DocumentSnapshot,
+        deadline: Instant,
+    ) -> Result<WorkerResponse, WorkerError> {
+        let first = self.execute_once(operation, document, deadline);
+        let result = match first {
+            Err(error)
+                if error.restartable()
+                    && Instant::now() < deadline
+                    && !self.stop.load(Ordering::Acquire) =>
+            {
+                self.record_failure(&error, true);
+                self.execute_once(operation, document, deadline)
             }
+            other => other,
+        };
+        match &result {
+            Ok(_) => self.record_success(),
+            Err(error) => self.record_failure(error, false),
         }
-        unreachable!()
+        result
     }
 
     fn execute_once(
         &mut self,
         operation: &WorkerOperation,
         document: &DocumentSnapshot,
-    ) -> AppResult<WorkerResponse> {
-        self.ensure_started()?;
-        let capabilities = self.capabilities.clone().expect("started capabilities");
-        capabilities.require(operation.capability_name())?;
-        let sync = plan_sync(&mut self.documents, document, capabilities.sync_kind)?;
-        if let Some(notification) = sync.notification {
-            self.send(&notification)?;
-            if sync.changed {
-                self.diagnostics.remove(&document.uri);
-            }
-        }
-
-        let result = match operation {
-            WorkerOperation::Diagnostics => {
-                if let Some(cached) = self.diagnostics.get(&document.uri) {
-                    cached.clone()
-                } else if capabilities.pull_diagnostics_provider {
-                    let report = self.request(
-                        "textDocument/diagnostic",
-                        json!({"textDocument": {"uri": document.uri}}),
-                    )?;
-                    let diagnostics = diagnostic_report_items(report)?;
-                    self.diagnostics
-                        .insert(document.uri.clone(), diagnostics.clone());
-                    diagnostics
-                } else {
-                    self.wait_for_diagnostics(&document.uri)?
-                }
-            }
-            _ => {
-                let mut params = match operation {
-                    WorkerOperation::Definition { line, column }
-                    | WorkerOperation::References { line, column }
-                    | WorkerOperation::Rename { line, column, .. } => position_params(
-                        &document.path,
-                        &document.content,
-                        *line,
-                        *column,
-                        capabilities.position_encoding,
-                    )?,
-                    WorkerOperation::Diagnostics => unreachable!(),
-                };
-                match operation {
-                    WorkerOperation::References { .. } => {
-                        params["context"] = json!({"includeDeclaration": false});
-                    }
-                    WorkerOperation::Rename { new_name, .. } => {
-                        params["newName"] = json!(new_name);
-                    }
-                    WorkerOperation::Definition { .. } => {}
-                    WorkerOperation::Diagnostics => unreachable!(),
-                }
-                self.request(operation.method().expect("request method"), params)?
+        deadline: Instant,
+    ) -> Result<WorkerResponse, WorkerError> {
+        let context = RequestContext {
+            root: &self.root,
+            codec: &self.codec,
+            language: self.preset.key(),
+            timeout: self.timeout,
+            deadline,
+            stop: &self.stop,
+        };
+        let mut server = match std::mem::take(&mut self.server) {
+            ServerState::Ready(server) => server,
+            ServerState::Stopped => {
+                self.status.write().readiness = Readiness::Starting;
+                let transport = (self.factory)().map_err(|error| WorkerError::StartFailed {
+                    language: context.language,
+                    message: error.to_string(),
+                })?;
+                let server = Server::initialize(transport, &context)?;
+                let mut status = self.status.write();
+                status.readiness = Readiness::Ready;
+                status.capabilities = Some(server.capabilities().clone());
+                Box::new(server)
             }
         };
-        verify_current(document)?;
-        Ok(WorkerResponse {
-            result,
-            synchronized: sync.synchronized,
-            capabilities,
-        })
+        let result = server.execute(operation, document, &context);
+        let discard = matches!(&result, Err(error) if error.restartable() || matches!(error, WorkerError::Stopped));
+        if !discard {
+            self.server = ServerState::Ready(server);
+        }
+        // A discarded server is dropped here, which terminates its process.
+        result
     }
 
-    fn ensure_started(&mut self) -> AppResult<()> {
-        if self.process.is_some() {
-            return Ok(());
-        }
-        {
-            let mut status = self.status.write();
-            status.readiness = "starting";
-        }
-        let mut process = (self.factory)().map_err(|error| {
-            AppError::details(
-                "LSP_START_FAILED",
-                error.to_string(),
-                json!({"language": self.preset.key()}),
-            )
-        })?;
-        let id = self.next_request_id();
-        let started = Instant::now();
-        process
-            .send(&json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "initialize",
-                "params": initialize_params(&super::normalize::path_uri(&self.root))
-            }))
-            .map_err(transport_error)?;
-        let result = self.wait_for_response_on(&mut *process, id)?;
-        let capabilities = parse_initialize_result(&result, started.elapsed().as_millis())?;
-        process
-            .send(&json!({"jsonrpc":"2.0","method":"initialized","params":{}}))
-            .map_err(transport_error)?;
-        self.process = Some(process);
-        self.capabilities = Some(capabilities.clone());
+    fn record_success(&self) {
         let mut status = self.status.write();
-        status.readiness = "ready";
-        status.capabilities = Some(capabilities);
+        status.readiness = Readiness::Ready;
         status.last_error = None;
-        Ok(())
+        if let ServerState::Ready(server) = &self.server {
+            status.synchronized_document_count = server.document_count();
+        }
     }
 
-    fn reset(&mut self, count_restart: bool) {
-        self.process = None;
-        self.capabilities = None;
-        self.documents.clear();
-        self.diagnostics.clear();
+    fn record_failure(&self, error: &WorkerError, restarting: bool) {
         let mut status = self.status.write();
-        if count_restart {
+        status.last_error = Some(error.to_app_error().0.message);
+        if restarting {
             status.restart_count += 1;
         }
-        status.readiness = "lazy";
-        status.capabilities = None;
-        status.synchronized_document_count = 0;
-    }
-
-    fn next_request_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-
-    fn send(&mut self, value: &Value) -> AppResult<()> {
-        self.process
-            .as_mut()
-            .expect("started")
-            .send(value)
-            .map_err(transport_error)
-    }
-
-    fn request(&mut self, method: &str, params: Value) -> AppResult<Value> {
-        let id = self.next_request_id();
-        self.send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
-        let mut process = self.process.take().expect("started");
-        let result = self.wait_for_response_on(&mut *process, id);
-        self.process = Some(process);
-        result
-    }
-
-    fn wait_for_response_on(
-        &mut self,
-        process: &mut dyn RpcTransport,
-        id: u64,
-    ) -> AppResult<Value> {
-        let deadline = Instant::now() + self.timeout;
-        loop {
-            let message = receive_before(process, deadline)?;
-            if message.get("id").and_then(Value::as_u64) == Some(id)
-                && message.get("method").is_none()
-            {
-                if let Some(error) = message.get("error") {
-                    return Err(AppError::details(
-                        "LSP_ERROR",
-                        format!("{} language-server request failed", self.preset.key()),
-                        error.clone(),
-                    ));
-                }
-                return message.get("result").cloned().ok_or_else(|| {
-                    AppError::new(
-                        "LSP_PROTOCOL_ERROR",
-                        "JSON-RPC response contains neither result nor error",
-                    )
-                });
-            }
-            self.handle_message(process, message)?;
+        if matches!(self.server, ServerState::Stopped) {
+            status.readiness = Readiness::Lazy;
+            status.capabilities = None;
+            status.synchronized_document_count = 0;
         }
     }
-
-    fn wait_for_diagnostics(&mut self, uri: &str) -> AppResult<Value> {
-        let deadline = Instant::now() + self.timeout;
-        let mut process = self.process.take().expect("started");
-        let result = loop {
-            let message = receive_before(&mut *process, deadline)?;
-            if message.get("method").and_then(Value::as_str)
-                == Some("textDocument/publishDiagnostics")
-                && message["params"]["uri"]
-                    .as_str()
-                    .is_some_and(|published| diagnostic_uri_matches(&self.root, uri, published))
-            {
-                let diagnostics = message["params"]["diagnostics"].clone();
-                self.diagnostics.insert(uri.to_owned(), diagnostics.clone());
-                break Ok(diagnostics);
-            }
-            self.handle_message(&mut *process, message)?;
-        };
-        self.process = Some(process);
-        result
-    }
-
-    fn handle_message(&mut self, process: &mut dyn RpcTransport, message: Value) -> AppResult<()> {
-        if message.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
-        {
-            if let Some(uri) = message["params"]["uri"].as_str() {
-                self.diagnostics
-                    .insert(uri.to_owned(), message["params"]["diagnostics"].clone());
-            }
-            return Ok(());
-        }
-        if let (Some(id), Some(method)) = (
-            message.get("id").cloned(),
-            message.get("method").and_then(Value::as_str),
-        ) {
-            let result = server_request_result(method, &message["params"], &self.root);
-            process
-                .send(&json!({"jsonrpc":"2.0","id":id,"result":result}))
-                .map_err(transport_error)?;
-        }
-        Ok(())
-    }
-}
-
-fn receive_before(process: &mut dyn RpcTransport, deadline: Instant) -> AppResult<Value> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(AppError::new(
-            "LSP_TIMEOUT",
-            "Language-server response timed out",
-        ));
-    }
-    process.receive(remaining).map_err(|error| {
-        if error.kind() == io::ErrorKind::TimedOut {
-            AppError::new("LSP_TIMEOUT", "Language-server response timed out")
-        } else {
-            transport_error(error)
-        }
-    })
-}
-
-fn diagnostic_report_items(report: Value) -> AppResult<Value> {
-    if report.is_array() {
-        return Ok(report);
-    }
-    if let Some(items) = report.get("items").filter(|items| items.is_array()) {
-        return Ok(items.clone());
-    }
-    Err(AppError::details(
-        "LSP_PROTOCOL_ERROR",
-        "Language-server diagnostic response does not contain an items array",
-        json!({"response": report}),
-    ))
-}
-
-fn diagnostic_uri_matches(root: &Path, requested: &str, published: &str) -> bool {
-    requested == published
-        || match (
-            super::normalize::uri_path(root, requested),
-            super::normalize::uri_path(root, published),
-        ) {
-            (Ok(requested), Ok(published)) => requested == published,
-            _ => false,
-        }
 }
 
 fn latency_p50(samples: &VecDeque<u128>) -> Option<u128> {
@@ -633,10 +497,6 @@ fn latency_p50(samples: &VecDeque<u128>) -> Option<u128> {
     let mut values = samples.iter().copied().collect::<Vec<_>>();
     values.sort_unstable();
     Some(values[(values.len() - 1) / 2])
-}
-
-fn transport_error(error: io::Error) -> AppError {
-    AppError::new("LSP_TRANSPORT_ERROR", error.to_string())
 }
 
 #[cfg(test)]

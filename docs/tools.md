@@ -21,6 +21,45 @@ and labels any Tree-sitter result as `diagnostic_scope: "syntax_only"`.
 `max_results` limits returned diagnostics to at most 200; `total_count`,
 `result_count`, and `truncated` describe the bounded result.
 
+### `code_intelligence` request validation
+
+`path` must be workspace-relative. `line` (one-based, at least 1) is required
+for `definition`, `references`, and `rename_preview`; `column` (zero-based
+UTF-16 units) defaults to 0; `max_results` defaults to 20 and must be 1-200
+for both `references` and `diagnostics`; `rename_preview` requires `new_name`.
+A field of the wrong type or outside its range is `INVALID_ARGUMENT`; it is
+never replaced by a default. JSON `null` counts as omitted.
+
+### Freshness and fallback
+
+A semantic result is returned only when the text the language server answered
+against has the same hash as the target on disk and in the live index, both
+before and after the request, and every other file the result points into
+still matches its index entry. All four operations apply the same check. A
+violation is `INTELLIGENCE_STALE`, with `details.phase`:
+
+| `phase` | Meaning | Outcome |
+| --- | --- | --- |
+| `before_request` | The target is not indexed, or disk no longer matches the index. | Request error for every operation. |
+| `after_request` | Disk or the index changed while the server worked. | `fallback_reason` (definition, references, diagnostics); error for `rename_preview`. |
+| `result_file` | A file named in the result no longer matches its index entry. | Same as `after_request`. |
+
+`INTELLIGENCE_STALE` replaces the former `LSP_INDEX_STALE` and
+`LSP_STALE_DOCUMENT` codes. Other fallback reasons keep their codes:
+`LSP_TIMEOUT`, `LSP_TRANSPORT_ERROR` (a server that exits reports
+`details.cause: "server_exited"` and a bounded `details.stderr_tail`, without
+waiting out the timeout), `LSP_PROTOCOL_ERROR`, `LSP_ERROR`,
+`LSP_UNSUPPORTED`, `LSP_SYNC_UNSUPPORTED`, `LSP_START_FAILED`, and
+`LSP_WORKER_STOPPED`. `LSP_BUSY` is new: each language server queues at most
+16 waiting requests and refuses more. A request whose deadline passes while
+queued is dropped without reaching the server.
+
+LSP result URIs are decoded lexically to workspace-relative paths, and every
+file they name is read through the confined workspace reader. A URI outside
+the root is `OUTSIDE_ROOT`; one naming a symlink or other non-regular file is
+`INVALID_LSP_RESPONSE`. Rename-preview `expected_hash` values are the hashes
+of that confined, index-checked content.
+
 Retrieval handles bind ranges to a workspace, snapshot, path, and content hash.
 Complete-range replacement uses `code_replace_range` with that handle.
 
