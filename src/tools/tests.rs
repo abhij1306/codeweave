@@ -233,7 +233,8 @@ async fn preview_plans_without_writing_and_transaction_applies() {
         .unwrap();
     let after = std::fs::read_to_string(fixture.root.path().join("lib.rs")).unwrap();
 
-    assert_eq!(preview["applied"], false);
+    assert_eq!(preview["preview"], true);
+    assert_eq!(preview["files"], json!(["lib.rs"]));
     assert_eq!(before, "fn value() -> i32 { 1 }\n");
     assert_eq!(applied["applied"], true);
     assert_eq!(after, "fn value() -> i32 { 2 }\n");
