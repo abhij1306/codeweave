@@ -1,17 +1,16 @@
 use super::events::MutationRecord;
-use super::io_helpers::{diff_stat, read_optional, render_diff};
+use super::io_helpers::{diff_stat, render_diff};
 use super::state::MutationPermit;
 use super::util::{
-    changes_without_independent_preconditions, char_boundary_at_or_before, line_offset,
-    line_range_bytes, matching_old_text, normalize_line_endings_for_content,
-    preserve_terminal_line_ending, stale_snapshot_for_paths,
+    changes_without_independent_preconditions, line_offset, line_range_bytes, matching_old_text,
+    normalize_line_endings_for_content, preserve_terminal_line_ending, stale_snapshot_for_paths,
 };
 use super::validation::ValidationOutcome;
 use super::Workspace;
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::index::{content_hash, decode_handle, CodeIndex};
+use crate::index::{content_hash, decode_handle, CodeIndex, ContentHash};
 use crate::requests::edit::{Change, EditRequest, InsertPosition, ResponseDetail};
-use crate::security::validate_relative;
+use crate::security::{normalize_path_text, RelPath};
 use crate::symbols::{extract_symbols, parse_has_error};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -19,11 +18,27 @@ use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
+/// One file a planned edit writes: its content before (absent for a new
+/// file) and after (absent for a deletion). The before hash is computed once
+/// and serves both the commit-time precondition and the mutation record.
 #[derive(Debug, Clone)]
 pub(super) struct PlannedFile {
-    pub(super) path: String,
+    pub(super) path: RelPath,
     pub(super) before: Option<String>,
+    pub(super) before_hash: Option<ContentHash>,
     pub(super) after: Option<String>,
+}
+
+impl PlannedFile {
+    pub(super) fn new(path: RelPath, before: Option<String>, after: Option<String>) -> Self {
+        let before_hash = before.as_deref().map(content_hash);
+        Self {
+            path,
+            before,
+            before_hash,
+            after,
+        }
+    }
 }
 
 struct AppliedEdit {
@@ -80,7 +95,7 @@ impl DiffView {
             },
             _ if cap > 0 && diff.len() > cap => {
                 // Cut on a line boundary so the prefix stays a readable diff.
-                let safe_cap = char_boundary_at_or_before(diff, cap);
+                let safe_cap = diff.floor_char_boundary(cap);
                 let end = diff[..safe_cap]
                     .rfind('\n')
                     .map(|idx| idx + 1)
@@ -260,7 +275,7 @@ impl Workspace {
         let view = writer.read();
         let index = view.index();
         self.preflight_overlaps(changes, index)?;
-        let mut plan: HashMap<String, PlannedFile> = HashMap::new();
+        let mut plan: HashMap<RelPath, PlannedFile> = HashMap::new();
         for change in changes {
             self.plan_change(
                 change,
@@ -332,7 +347,7 @@ impl Workspace {
         let mut change_counts = HashMap::<String, usize>::new();
         let mut handle_paths = HashSet::new();
         for change in changes {
-            let path = change.path().replace('\\', "/");
+            let path = normalize_path_text(change.path()).into_owned();
             *change_counts.entry(path.clone()).or_default() += 1;
             if change.handle().is_some() {
                 handle_paths.insert(path);
@@ -365,7 +380,7 @@ impl Workspace {
                 Change::ReplaceRange { .. } => None,
                 _ => continue,
             };
-            let path = change.path().replace('\\', "/");
+            let path = normalize_path_text(change.path()).into_owned();
             let content = index
                 .get(&path)
                 .ok_or_else(|| {
@@ -430,15 +445,14 @@ impl Workspace {
         &self,
         change: &Change,
         has_snapshot: bool,
-        plan: &mut HashMap<String, PlannedFile>,
+        plan: &mut HashMap<RelPath, PlannedFile>,
         index: &CodeIndex,
     ) -> AppResult<()> {
-        let path = change.path().replace('\\', "/");
-        validate_relative(&path)?;
+        let path = RelPath::new(change.path())?;
         let expected_hash = change.expected_hash();
         let edit_handle = change.handle().map(decode_handle).transpose()?;
         if let Some(handle) = &edit_handle {
-            if handle.workspace_id != self.id || handle.path != path {
+            if handle.workspace_id != self.id || handle.path != path.as_str() {
                 return Err(AppError::new(
                     ErrorCode::InvalidHandle,
                     "Edit handle does not match workspace/path",
@@ -454,9 +468,8 @@ impl Workspace {
             .unwrap_or_else(|| index.get(&path).map(|file| file.content().to_owned()));
         let original_hash = plan
             .get(&path)
-            .and_then(|item| item.before.as_ref())
-            .map(|content| content_hash(content))
-            .or_else(|| before.as_ref().map(|content| content_hash(content)));
+            .and_then(|item| item.before_hash.clone())
+            .or_else(|| before.as_deref().map(content_hash));
         let edits_existing_file = !matches!(change, Change::Create { .. }) || before.is_some();
         if edits_existing_file && !has_snapshot && expected_hash.is_none() && handle_hash.is_none()
         {
@@ -608,8 +621,7 @@ impl Workspace {
                 put_plan(plan, path, Some(current), None);
             }
             Change::Rename { to, .. } => {
-                let to = to.replace('\\', "/");
-                validate_relative(&to)?;
+                let to = RelPath::new(to)?;
                 let current = before.ok_or_else(|| {
                     AppError::new(ErrorCode::PathNotFound, "Rename source does not exist")
                 })?;
@@ -631,16 +643,16 @@ impl Workspace {
 
     fn recheck_preconditions(&self, plan: &[PlannedFile]) -> AppResult<()> {
         for item in plan {
-            let actual = read_optional(&self.root, &item.path).map_err(|error| {
+            let actual = self.root.read_to_string(&item.path).map_err(|error| {
                 AppError::with_details(
                     ErrorCode::ReadFailed,
                     error.to_string(),
                     json!({"path": item.path}),
                 )
             })?;
-            let actual_hash = actual.as_ref().map(|value| content_hash(value));
-            let expected_hash = item.before.as_ref().map(|value| content_hash(value));
-            if actual_hash != expected_hash {
+            let actual_hash = actual.as_deref().map(content_hash);
+            let expected_hash = &item.before_hash;
+            if actual_hash != *expected_hash {
                 return Err(AppError::with_details(
                     ErrorCode::StaleFile,
                     "File changed after planning and before commit",
@@ -653,22 +665,15 @@ impl Workspace {
 }
 
 fn put_plan(
-    plan: &mut HashMap<String, PlannedFile>,
-    path: String,
+    plan: &mut HashMap<RelPath, PlannedFile>,
+    path: RelPath,
     before: Option<String>,
     after: Option<String>,
 ) {
     if let Some(existing) = plan.get_mut(&path) {
         existing.after = after;
     } else {
-        plan.insert(
-            path.clone(),
-            PlannedFile {
-                path,
-                before,
-                after,
-            },
-        );
+        plan.insert(path.clone(), PlannedFile::new(path, before, after));
     }
 }
 

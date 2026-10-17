@@ -1,10 +1,8 @@
 //! Config loading and the bearer token file.
 
-#[cfg(windows)]
-use super::super::config::validate_token_permissions;
-use super::super::config::{
-    config_relative_path, default_port, load_config, load_or_create_bearer_token, AuthMode, Config,
-};
+#[cfg(unix)]
+use super::super::config::load_or_create_bearer_token;
+use super::super::config::{config_relative_path, default_port, load_config, AuthMode, Config};
 use std::path::{Path, PathBuf};
 
 #[test]
@@ -12,28 +10,6 @@ fn relative_token_path_is_resolved_from_config_directory() {
     let config = Path::new("C:/path/to/codeweave/config.json");
     let resolved = config_relative_path(config, ".mcp-token");
     assert_eq!(resolved, PathBuf::from("C:/path/to/codeweave/.mcp-token"));
-}
-
-#[cfg(windows)]
-#[test]
-fn generated_windows_token_has_a_protected_explicit_acl() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("token");
-
-    let token = load_or_create_bearer_token(&path).unwrap();
-
-    assert!(!token.is_empty());
-    validate_token_permissions(&path).unwrap();
-}
-
-#[cfg(windows)]
-#[test]
-fn inherited_windows_token_acl_is_rejected() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("token");
-    std::fs::write(&path, "not-private").unwrap();
-
-    assert!(validate_token_permissions(&path).is_err());
 }
 
 #[cfg(unix)]

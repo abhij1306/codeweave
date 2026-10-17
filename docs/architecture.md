@@ -39,6 +39,22 @@ the `git_diff` scope policy: it resolves a symbol focus to a line range through
 the index, asks the diff for the hunks matching the scope, and pages them with
 snapshot-bound continuations.
 
+All workspace filesystem access goes through one root handle, `WorkspaceRoot`
+(`src/security.rs`). It is opened once per workspace on the canonical root and
+holds a confined `cap_std` directory, so every read and write (index scans,
+edits and their restores, Git untracked-file previews, intelligence
+reads, Bash working directories) resolves inside the root at the moment of
+access. A symlink or a directory swapped for a link cannot lead outside it.
+Paths reach the handle as `RelPath`, a normalized workspace-relative path that
+rejects absolute, root and parent components when it is built. File identity
+uses typed values from `src/index/ids.rs`: `ContentHash` (the SHA-256 of a
+file's text) and `SnapshotId` (the indexed file set at one HEAD). Both serialize
+as their plain string, so the wire format does not change.
+
+Error codes are one `ErrorCode` enum (`src/error.rs`) that serializes to the
+public code strings listed in `docs/tools.md`; retry and request policy are
+methods on it.
+
 ## Public contract
 
 The MCP surface is fixed at 25 tools: workspace, retrieval and intelligence;
@@ -91,7 +107,9 @@ filesystem commit.
 - Every `git status` refresh goes through one setter: success stores the status
   and clears `repo_status_stale`; failure keeps the previous status, sets the flag
   and logs a warning.
-- File reads use canonical repository-relative paths and never escape the root.
+- File reads and writes take a `RelPath` and go through the workspace's
+  `WorkspaceRoot` handle, so they never escape the root, including through
+  symlinks.
 - Bash cancellation and timeout terminate the process tree and preserve bounded
   partial output. Termination never blocks an async path: the group gets a stop
   request, a tracked task force-kills it after a grace period, and dropping the

@@ -5,9 +5,8 @@ use super::porcelain::{normalized_path, parse_porcelain_v2};
 use super::runner::{run_git, truncate_output, GitFailure, GIT_DEFAULT_TIMEOUT, GIT_PUSH_TIMEOUT};
 use super::{RepoStatus, RepositoryBackend};
 use crate::error::{AppError, AppResult, ErrorCode};
+use crate::security::{RelPath, WorkspaceRoot};
 use serde_json::json;
-use std::fs;
-use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -69,8 +68,13 @@ impl CliGitBackend {
     }
 
     /// New-file patches, each with one hunk, for the untracked files among
-    /// `paths`. Symlinks are shown by target and never followed.
-    fn untracked_diff(root: &Path, paths: &[String], max_chars: usize) -> AppResult<String> {
+    /// `paths`, read through the root handle. Symlinks are shown by target and
+    /// never followed.
+    fn untracked_diff(
+        root: &WorkspaceRoot,
+        paths: &[RelPath],
+        max_chars: usize,
+    ) -> AppResult<String> {
         let mut args = vec![
             "ls-files".to_owned(),
             "--others".to_owned(),
@@ -78,39 +82,40 @@ impl CliGitBackend {
             "-z".to_owned(),
             "--".to_owned(),
         ];
-        args.extend(paths.iter().filter_map(|path| normalized_path(path)));
-        let untracked = Self::run(root, &args, usize::MAX)?;
+        args.extend(
+            paths
+                .iter()
+                .filter(|path| !path.is_empty())
+                .map(RelPath::to_string),
+        );
+        let untracked = Self::run(root.path(), &args, usize::MAX)?;
         let mut diff = String::new();
         for path in untracked.split('\0').filter(|path| !path.is_empty()) {
-            let Some(normalized) = normalized_path(path) else {
+            let Some(path) = normalized_path(path).and_then(|path| RelPath::new(&path).ok()) else {
                 continue;
             };
-            let full_path = root.join(&normalized);
-            let Ok(metadata) = fs::symlink_metadata(&full_path) else {
-                continue;
+            // Both modes are six characters, so the budget does not depend on
+            // which one applies.
+            let header = |mode: &str| {
+                format!("diff --git a/{path} b/{path}\nnew file mode {mode}\n--- /dev/null\n+++ b/{path}\n")
             };
-            let is_symlink = metadata.file_type().is_symlink();
-            if !is_symlink && !metadata.is_file() {
-                continue;
-            }
-            let mode = if is_symlink { "120000" } else { "100644" };
-            let header = format!(
-                "diff --git a/{0} b/{0}\nnew file mode {1}\n--- /dev/null\n+++ b/{0}\n",
-                normalized, mode
-            );
-            let remaining = max_chars.saturating_sub(diff.len().saturating_add(header.len()));
-            let content = if is_symlink {
-                let Ok(target) = fs::read_link(&full_path) else {
+            let remaining =
+                max_chars.saturating_sub(diff.len().saturating_add(header("100644").len()));
+            let (mode, (content, content_truncated)) =
+                if let Ok(Some(target)) = root.read_link(&path) {
+                    (
+                        "120000",
+                        string_prefix(&target.to_string_lossy(), remaining),
+                    )
+                } else if let Ok(Some((bytes, truncated))) = root.read_prefix(&path, remaining) {
+                    let Some(content) = utf8_prefix(bytes, truncated) else {
+                        continue;
+                    };
+                    ("100644", content)
+                } else {
                     continue;
                 };
-                string_prefix(&target.to_string_lossy(), remaining)
-            } else {
-                let Some(content) = read_utf8_prefix(&full_path, remaining) else {
-                    continue;
-                };
-                content
-            };
-            let (content, content_truncated) = content;
+            let header = header(mode);
             diff.push_str(&header);
             match content.lines().count() {
                 0 => {}
@@ -140,22 +145,12 @@ fn string_prefix(text: &str, max_bytes: usize) -> (String, bool) {
     if text.len() <= max_bytes {
         return (text.to_owned(), false);
     }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (text[..end].to_owned(), true)
+    (text[..text.floor_char_boundary(max_bytes)].to_owned(), true)
 }
 
-fn read_utf8_prefix(path: &Path, max_bytes: usize) -> Option<(String, bool)> {
-    let file = fs::File::open(path).ok()?;
-    let limit = u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX);
-    let mut bytes = Vec::new();
-    file.take(limit).read_to_end(&mut bytes).ok()?;
-    let truncated = bytes.len() > max_bytes;
-    if truncated {
-        bytes.truncate(max_bytes);
-    }
+/// `bytes` as text. A prefix cut inside a character drops the partial
+/// character; any other invalid UTF-8 is `None`.
+fn utf8_prefix(mut bytes: Vec<u8>, truncated: bool) -> Option<(String, bool)> {
     let valid_len = match std::str::from_utf8(&bytes) {
         Ok(_) => bytes.len(),
         Err(error) if truncated && error.error_len().is_none() => error.valid_up_to(),
@@ -166,7 +161,7 @@ fn read_utf8_prefix(path: &Path, max_bytes: usize) -> Option<(String, bool)> {
 }
 
 impl RepositoryBackend for CliGitBackend {
-    fn status(&self, root: &Path) -> AppResult<RepoStatus> {
+    fn status(&self, root: &WorkspaceRoot) -> AppResult<RepoStatus> {
         let args = [
             "status",
             "--porcelain=v2",
@@ -175,7 +170,7 @@ impl RepositoryBackend for CliGitBackend {
             "--untracked-files=all",
         ]
         .map(str::to_owned);
-        match run_git(root, &args, GIT_DEFAULT_TIMEOUT, "git") {
+        match run_git(root.path(), &args, GIT_DEFAULT_TIMEOUT, "git") {
             Ok(stdout) => Ok(parse_porcelain_v2(&String::from_utf8_lossy(&stdout))),
             Err(error) if matches!(error.failure, GitFailure::NotRepository { .. }) => {
                 Ok(RepoStatus::default())
@@ -186,9 +181,9 @@ impl RepositoryBackend for CliGitBackend {
 
     fn diff(
         &self,
-        root: &Path,
+        root: &WorkspaceRoot,
         staged: bool,
-        paths: &[String],
+        paths: &[RelPath],
         max_chars: usize,
     ) -> AppResult<Diff> {
         let mut args = vec![
@@ -201,9 +196,9 @@ impl RepositoryBackend for CliGitBackend {
         }
         if !paths.is_empty() {
             args.push("--".to_owned());
-            args.extend(paths.iter().cloned());
+            args.extend(paths.iter().map(RelPath::to_string));
         }
-        let mut diff = Self::run(root, &args, max_chars)?;
+        let mut diff = Self::run(root.path(), &args, max_chars)?;
         if staged || paths.is_empty() || diff.len() >= max_chars {
             return Ok(Diff::parse(diff));
         }
@@ -215,9 +210,9 @@ impl RepositoryBackend for CliGitBackend {
         Ok(Diff::parse(truncate_output(diff, max_chars)))
     }
 
-    fn log(&self, root: &Path, limit: usize) -> AppResult<String> {
+    fn log(&self, root: &WorkspaceRoot, limit: usize) -> AppResult<String> {
         Self::run(
-            root,
+            root.path(),
             &[
                 "log".into(),
                 format!("-n{limit}"),
@@ -228,9 +223,9 @@ impl RepositoryBackend for CliGitBackend {
         )
     }
 
-    fn show(&self, root: &Path, reference: &str, max_chars: usize) -> AppResult<String> {
+    fn show(&self, root: &WorkspaceRoot, reference: &str, max_chars: usize) -> AppResult<String> {
         Self::run(
-            root,
+            root.path(),
             &[
                 "show".into(),
                 "--stat".into(),
@@ -243,8 +238,8 @@ impl RepositoryBackend for CliGitBackend {
 
     fn blame(
         &self,
-        root: &Path,
-        path: &str,
+        root: &WorkspaceRoot,
+        path: &RelPath,
         start: Option<usize>,
         end: Option<usize>,
         max_chars: usize,
@@ -254,32 +249,32 @@ impl RepositoryBackend for CliGitBackend {
             args.push(format!("-L{start},{end}"));
         }
         args.push("--".to_owned());
-        args.push(path.to_owned());
-        Self::run(root, &args, max_chars)
+        args.push(path.to_string());
+        Self::run(root.path(), &args, max_chars)
     }
 
-    fn stage(&self, root: &Path, paths: &[String]) -> AppResult<String> {
+    fn stage(&self, root: &WorkspaceRoot, paths: &[RelPath]) -> AppResult<String> {
         if paths.is_empty() {
             return Err(AppError::invalid("git stage requires paths"));
         }
         let mut args = vec!["add".to_owned(), "--".to_owned()];
-        args.extend(paths.iter().cloned());
-        Self::run(root, &args, 20_000)?;
+        args.extend(paths.iter().map(RelPath::to_string));
+        Self::run(root.path(), &args, 20_000)?;
         Ok(format!("Staged {} path(s)", paths.len()))
     }
 
-    fn commit(&self, root: &Path, message: &str) -> AppResult<String> {
+    fn commit(&self, root: &WorkspaceRoot, message: &str) -> AppResult<String> {
         if message.trim().is_empty() {
             return Err(AppError::invalid("git commit requires message"));
         }
         Self::run(
-            root,
+            root.path(),
             &["commit".into(), "-m".into(), message.into()],
             50_000,
         )
     }
 
-    fn restore(&self, root: &Path, paths: &[String], staged: bool) -> AppResult<String> {
+    fn restore(&self, root: &WorkspaceRoot, paths: &[RelPath], staged: bool) -> AppResult<String> {
         if paths.is_empty() {
             return Err(AppError::invalid("git restore requires paths"));
         }
@@ -288,24 +283,33 @@ impl RepositoryBackend for CliGitBackend {
             args.push("--staged".to_owned());
         }
         args.push("--".to_owned());
-        args.extend(paths.iter().cloned());
-        Self::run(root, &args, 20_000)?;
+        args.extend(paths.iter().map(RelPath::to_string));
+        Self::run(root.path(), &args, 20_000)?;
         Ok(format!("Restored {} path(s)", paths.len()))
     }
 
-    fn push(&self, root: &Path, remote: &str, branch: &str) -> AppResult<String> {
+    fn push(&self, root: &WorkspaceRoot, remote: &str, branch: &str) -> AppResult<String> {
         let mut args = vec!["push".to_owned(), remote.to_owned()];
         if !branch.is_empty() {
             args.push(branch.to_owned());
         }
-        Self::run_with_timeout(root, &args, 20_000, GIT_PUSH_TIMEOUT)
+        Self::run_with_timeout(root.path(), &args, 20_000, GIT_PUSH_TIMEOUT)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
+
+    fn workspace(root: &Path) -> WorkspaceRoot {
+        WorkspaceRoot::open(root).unwrap()
+    }
+
+    fn rel(path: &str) -> RelPath {
+        RelPath::new(path).unwrap()
+    }
 
     fn git(root: &Path, args: &[&str]) {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
@@ -331,7 +335,7 @@ mod tests {
     fn status_outside_a_repository_is_an_empty_non_git_status() {
         let root = tempdir().unwrap();
 
-        let status = CliGitBackend.status(root.path()).unwrap();
+        let status = CliGitBackend.status(&workspace(root.path())).unwrap();
 
         assert_eq!(status, RepoStatus::default());
         assert!(!status.is_git);
@@ -344,7 +348,7 @@ mod tests {
         fs::write(root.path().join("new.py"), "print('hello')\n").unwrap();
 
         let diff = CliGitBackend
-            .diff(root.path(), false, &["new.py".to_owned()], 20_000)
+            .diff(&workspace(root.path()), false, &[rel("new.py")], 20_000)
             .unwrap();
 
         assert!(diff.text.contains("new file mode 100644"));
@@ -366,9 +370,9 @@ mod tests {
 
         let diff = CliGitBackend
             .diff(
-                root.path(),
+                &workspace(root.path()),
                 false,
-                &["tracked.py".to_owned(), "new.py".to_owned()],
+                &[rel("tracked.py"), rel("new.py")],
                 20_000,
             )
             .unwrap();
@@ -391,7 +395,7 @@ mod tests {
         fs::write(root.path().join("large.txt"), "x".repeat(10_000)).unwrap();
 
         let diff = CliGitBackend
-            .diff(root.path(), false, &["large.txt".to_owned()], 200)
+            .diff(&workspace(root.path()), false, &[rel("large.txt")], 200)
             .unwrap();
 
         assert!(diff.text.len() <= 200);
@@ -411,7 +415,7 @@ mod tests {
         symlink(&secret, root.path().join("linked.txt")).unwrap();
 
         let diff = CliGitBackend
-            .diff(root.path(), false, &["linked.txt".to_owned()], 20_000)
+            .diff(&workspace(root.path()), false, &[rel("linked.txt")], 20_000)
             .unwrap();
 
         assert!(diff.text.contains("new file mode 120000"));

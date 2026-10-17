@@ -39,8 +39,11 @@ impl WorkspaceExclusions {
                 json!({"patterns": patterns}),
             )
         })?;
+        // Scans walk the canonical workspace root, so match against it even
+        // when the caller names the root through a link (macOS `/var`).
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         Ok(Self {
-            normalized_root: normalized_absolute_path(root),
+            normalized_root: normalized_absolute_path(&root),
             matcher,
             patterns: patterns.to_vec(),
         })

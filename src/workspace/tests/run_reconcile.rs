@@ -22,10 +22,11 @@ async fn bash_status_fetch_and_run_local_changed_paths_are_bounded() {
     fs::write(root.path().join("main.rs"), "fn main() {}\n").unwrap();
     let actor = test_actor(root.path());
     let generation = actor.state.read().generation();
-    actor
-        .state
-        .ledger()
-        .record(&[mutation("unrelated/generated.txt", "external", generation)]);
+    actor.state.ledger().record(&[mutation(
+        "unrelated/generated.txt",
+        MutationSource::External,
+        generation,
+    )]);
 
     let started = actor
         .run(bash_request(&json!({
@@ -94,11 +95,11 @@ async fn completed_bash_status_does_not_attribute_later_workspace_writes() {
     actor
         .commit_plan(
             &mut actor.state.writer(),
-            &[PlannedFile {
-                path: ".ai-bridge/codeweave-audit-success.md".to_owned(),
-                before: None,
-                after: Some("created after bash exit\n".to_owned()),
-            }],
+            &[PlannedFile::new(
+                RelPath::new(".ai-bridge/codeweave-audit-success.md").unwrap(),
+                None,
+                Some("created after bash exit\n".to_owned()),
+            )],
             "later-write",
         )
         .unwrap();
@@ -136,7 +137,11 @@ fn run_change_detection_includes_new_mutations_to_already_dirty_files() {
     let generation = actor.state.read().generation();
     let dirty_files = HashSet::from(["existing.rs".to_owned()]);
     let ledger = actor.state.ledger();
-    ledger.record(&[mutation("existing.rs", "external", generation + 1)]);
+    ledger.record(&[mutation(
+        "existing.rs",
+        MutationSource::External,
+        generation + 1,
+    )]);
 
     let observed = ledger.attribute_since(&RunWindow {
         start_generation: generation,
@@ -162,7 +167,7 @@ fn delayed_reconcile_uses_file_modification_time_for_run_attribution() {
     let ledger = actor.state.ledger();
     ledger.record(&[MutationRecord {
         timestamp: ended_at + ChronoDuration::seconds(1),
-        ..mutation("existing.rs", "external", generation + 1)
+        ..mutation("existing.rs", MutationSource::External, generation + 1)
     }]);
 
     let observed = ledger.attribute_since(&RunWindow {
@@ -186,7 +191,7 @@ fn read_tools_report_pending_reconciliation_without_blocking() {
         .state
         .ledger()
         .pending_handle()
-        .observe([actor.root.join("pending.rs")]);
+        .observe([actor.root.join(&RelPath::new("pending.rs").unwrap())]);
 
     let fetch = actor
         .read_targets(&json!({"path": "existing.rs", "max_chars": 5_000}))
@@ -410,7 +415,7 @@ fn process_local_changes_include_external_mutations() {
     actor
         .state
         .ledger()
-        .record(&[mutation("value.rs", "external", 99)]);
+        .record(&[mutation("value.rs", MutationSource::External, 99)]);
 
     let result = actor.changes(0, None, 200).unwrap();
     assert_eq!(result["mutations"].as_array().unwrap().len(), 1);

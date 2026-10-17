@@ -1,8 +1,8 @@
+use super::ids::ContentHash;
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::security::validate_relative;
+use crate::security::RelPath;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// A line range bound to a workspace, path, and content hash. Handles travel
 /// through clients, so decoding validates the range and path invariants.
@@ -18,7 +18,7 @@ pub struct RangeHandle {
     #[serde(rename = "b")]
     pub end_line: usize,
     #[serde(rename = "h")]
-    pub content_hash: String,
+    pub content_hash: ContentHash,
 }
 
 #[derive(Deserialize)]
@@ -32,7 +32,7 @@ struct RangeHandleWire {
     #[serde(rename = "b")]
     end_line: usize,
     #[serde(rename = "h")]
-    content_hash: String,
+    content_hash: ContentHash,
 }
 
 impl TryFrom<RangeHandleWire> for RangeHandle {
@@ -45,8 +45,7 @@ impl TryFrom<RangeHandleWire> for RangeHandle {
                 wire.start_line, wire.end_line
             ));
         }
-        let traverses = wire.path.split(['/', '\\']).any(|segment| segment == "..");
-        if wire.path.is_empty() || traverses || validate_relative(&wire.path).is_err() {
+        if wire.path.is_empty() || RelPath::new(&wire.path).is_err() {
             return Err("range handle path must be a workspace-relative path".to_owned());
         }
         Ok(Self {
@@ -75,8 +74,9 @@ pub fn decode_handle(input: &str) -> AppResult<RangeHandle> {
         .map_err(|error| AppError::new(ErrorCode::InvalidHandle, error.to_string()))
 }
 
-pub fn content_hash(content: &str) -> String {
-    hex(&Sha256::digest(content.as_bytes()))
+/// The hash of `content`; see [`ContentHash::of`].
+pub fn content_hash(content: &str) -> ContentHash {
+    ContentHash::of(content)
 }
 
 /// Lowercase hexadecimal encoding shared by content hashes and snapshot ids.

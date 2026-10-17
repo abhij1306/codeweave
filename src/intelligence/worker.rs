@@ -265,7 +265,7 @@ impl LspWorker {
             enabled: true,
             command: "fixture".to_owned(),
             args: Vec::new(),
-            timeout_ms: timeout.as_millis() as u64,
+            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         };
         Self::with_factory(
             root,

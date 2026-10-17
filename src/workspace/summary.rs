@@ -3,7 +3,7 @@ use super::*;
 impl Workspace {
     /// The current snapshot id after reconciling pending watcher paths: the
     /// precondition an edit without its own `snapshot_id` is planned against.
-    pub fn snapshot_id(&self) -> AppResult<String> {
+    pub fn snapshot_id(&self) -> AppResult<SnapshotId> {
         self.reconcile_pending()?;
         Ok(self.state.read().stamp().snapshot_id)
     }
@@ -16,7 +16,7 @@ impl Workspace {
         let index = view.index();
         Ok(json!({
             "workspace_id": self.id,
-            "root": self.root,
+            "root": self.root.path(),
             "generation": view.generation(),
             "snapshot_id": view.snapshot_id(),
             "file_count": index.file_count(),
@@ -74,8 +74,7 @@ impl Workspace {
                 index.get(path).map(|file| {
                     let full_len = file.content().len();
                     if full_len > INSTRUCTION_INLINE_CAP {
-                        let safe_cap =
-                            char_boundary_at_or_before(file.content(), INSTRUCTION_INLINE_CAP);
+                        let safe_cap = file.content().floor_char_boundary(INSTRUCTION_INLINE_CAP);
                         let end = file.content()[..safe_cap]
                             .rfind('\n')
                             .map(|idx| idx + 1)
@@ -111,7 +110,7 @@ impl Workspace {
             )]
         };
         let mut result = json!({
-            "workspace_id": self.id, "name": self.name, "root": self.root, "generation": view.generation(), "snapshot_id": view.snapshot_id(),
+            "workspace_id": self.id, "name": self.name, "root": self.root.path(), "generation": view.generation(), "snapshot_id": view.snapshot_id(),
             "file_count": index.file_count(), "languages": index.languages(), "repository": repository, "instructions": instructions,
             "capabilities": {
                 "bash_available": bash_available,

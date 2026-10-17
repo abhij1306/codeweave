@@ -1,6 +1,7 @@
 //! Persistent cache behaviour, observed through `CodeIndex::scan_cached`.
 
 use super::{CodeIndex, WorkspaceExclusions};
+use crate::security::WorkspaceRoot;
 use std::fs;
 
 fn declaring_paths(index: &CodeIndex, name: &str) -> Vec<String> {
@@ -20,7 +21,7 @@ fn changing_exclusions_invalidates_the_index_cache() {
     fs::write(workspace.path().join("generated/value.txt"), "value").unwrap();
     let no_exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
     CodeIndex::scan_cached(
-        workspace.path(),
+        &WorkspaceRoot::open(workspace.path()).unwrap(),
         2_000_000,
         &[],
         &no_exclusions,
@@ -30,8 +31,14 @@ fn changing_exclusions_invalidates_the_index_cache() {
     let exclusions =
         WorkspaceExclusions::new(workspace.path(), &["generated/".to_owned()]).unwrap();
 
-    let (index, cache_hit) =
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+    let (index, cache_hit) = CodeIndex::scan_cached(
+        &WorkspaceRoot::open(workspace.path()).unwrap(),
+        2_000_000,
+        &[],
+        &exclusions,
+        &cache_file,
+    )
+    .unwrap();
 
     assert!(!cache_hit);
     assert!(index.get("generated/value.txt").is_none());
@@ -45,8 +52,14 @@ fn mismatched_cache_schema_is_rejected() {
     fs::write(workspace.path().join("value.rs"), "fn value() {}\n").unwrap();
     let exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
 
-    let (_, initial_hit) =
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+    let (_, initial_hit) = CodeIndex::scan_cached(
+        &WorkspaceRoot::open(workspace.path()).unwrap(),
+        2_000_000,
+        &[],
+        &exclusions,
+        &cache_file,
+    )
+    .unwrap();
     assert!(!initial_hit);
 
     let mut cache: serde_json::Value =
@@ -54,8 +67,14 @@ fn mismatched_cache_schema_is_rejected() {
     cache["schema"] = serde_json::json!("invalid-schema");
     fs::write(&cache_file, serde_json::to_vec(&cache).unwrap()).unwrap();
 
-    let (_, cache_hit) =
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+    let (_, cache_hit) = CodeIndex::scan_cached(
+        &WorkspaceRoot::open(workspace.path()).unwrap(),
+        2_000_000,
+        &[],
+        &exclusions,
+        &cache_file,
+    )
+    .unwrap();
 
     assert!(!cache_hit);
 }
@@ -72,10 +91,22 @@ fn warm_cache_scan_reports_a_hit_and_indexes_the_same_symbols() {
     let cache_file = cache_dir.path().join("index.json");
     let exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
 
-    let (_, first_hit) =
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
-    let (second, second_hit) =
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+    let (_, first_hit) = CodeIndex::scan_cached(
+        &WorkspaceRoot::open(workspace.path()).unwrap(),
+        2_000_000,
+        &[],
+        &exclusions,
+        &cache_file,
+    )
+    .unwrap();
+    let (second, second_hit) = CodeIndex::scan_cached(
+        &WorkspaceRoot::open(workspace.path()).unwrap(),
+        2_000_000,
+        &[],
+        &exclusions,
+        &cache_file,
+    )
+    .unwrap();
 
     assert!(!first_hit);
     assert!(second_hit);
@@ -90,11 +121,24 @@ fn cache_hit_never_serves_symbols_or_content_of_changed_files() {
     let cache_file = cache_dir.path().join("index.json");
     let exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
     fs::write(&source, "fn old() {}\n").unwrap();
-    CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+    CodeIndex::scan_cached(
+        &WorkspaceRoot::open(workspace.path()).unwrap(),
+        2_000_000,
+        &[],
+        &exclusions,
+        &cache_file,
+    )
+    .unwrap();
     fs::write(&source, "fn new() {}\n").unwrap();
 
-    let (index, cache_hit) =
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+    let (index, cache_hit) = CodeIndex::scan_cached(
+        &WorkspaceRoot::open(workspace.path()).unwrap(),
+        2_000_000,
+        &[],
+        &exclusions,
+        &cache_file,
+    )
+    .unwrap();
 
     assert!(cache_hit);
     assert_eq!(index.get("lib.rs").unwrap().content(), "fn new() {}\n");
@@ -111,10 +155,22 @@ fn corrupt_cache_is_a_miss_and_is_rewritten() {
     fs::write(&cache_file, b"{\"schema\": truncated").unwrap();
     let exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
 
-    let (index, corrupt_hit) =
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
-    let (_, rewritten_hit) =
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+    let (index, corrupt_hit) = CodeIndex::scan_cached(
+        &WorkspaceRoot::open(workspace.path()).unwrap(),
+        2_000_000,
+        &[],
+        &exclusions,
+        &cache_file,
+    )
+    .unwrap();
+    let (_, rewritten_hit) = CodeIndex::scan_cached(
+        &WorkspaceRoot::open(workspace.path()).unwrap(),
+        2_000_000,
+        &[],
+        &exclusions,
+        &cache_file,
+    )
+    .unwrap();
 
     assert!(!corrupt_hit);
     assert_eq!(declaring_paths(&index, "value"), ["value.rs"]);
@@ -130,7 +186,14 @@ fn cache_rewrite_replaces_the_previous_file_without_leftovers() {
     let exclusions = WorkspaceExclusions::new(workspace.path(), &[]).unwrap();
 
     for _ in 0..2 {
-        CodeIndex::scan_cached(workspace.path(), 2_000_000, &[], &exclusions, &cache_file).unwrap();
+        CodeIndex::scan_cached(
+            &WorkspaceRoot::open(workspace.path()).unwrap(),
+            2_000_000,
+            &[],
+            &exclusions,
+            &cache_file,
+        )
+        .unwrap();
     }
 
     let names: Vec<_> = fs::read_dir(cache_dir.path())

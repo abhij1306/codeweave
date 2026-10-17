@@ -38,14 +38,6 @@ pub(super) fn line_offset(content: &str, line: usize) -> usize {
     content.len()
 }
 
-pub(super) fn char_boundary_at_or_before(value: &str, mut index: usize) -> usize {
-    index = index.min(value.len());
-    while index > 0 && !value.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
 pub(super) fn line_ending_label(content: &str) -> &'static str {
     let crlf = content.matches("\r\n").count();
     let lf = content.bytes().filter(|byte| *byte == b'\n').count() - crlf;

@@ -1,5 +1,6 @@
 //! The intelligence service's only window onto the reconciled workspace state.
 //! Every index and snapshot read goes through this type.
+use crate::index::{ContentHash, SnapshotId};
 use crate::reference_service::ReferenceService;
 use crate::workspace::StateReader;
 
@@ -7,7 +8,7 @@ use crate::workspace::StateReader;
 #[derive(Debug, Clone)]
 pub(crate) struct IndexedFile {
     pub(crate) content: String,
-    pub(crate) hash: String,
+    pub(crate) hash: ContentHash,
 }
 
 #[derive(Clone)]
@@ -31,7 +32,7 @@ impl LiveIndex {
             })
     }
 
-    pub(crate) fn hash(&self, relative: &str) -> Option<String> {
+    pub(crate) fn hash(&self, relative: &str) -> Option<ContentHash> {
         self.state
             .read()
             .index()
@@ -39,8 +40,8 @@ impl LiveIndex {
             .map(|entry| entry.hash().to_owned())
     }
 
-    pub(crate) fn snapshot_id(&self) -> String {
-        self.state.read().snapshot_id().to_owned()
+    pub(crate) fn snapshot_id(&self) -> SnapshotId {
+        self.state.read().snapshot_id().clone()
     }
 
     /// Run `query` against the shared reference service under one index read.

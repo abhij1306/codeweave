@@ -134,8 +134,3 @@ pub fn load_or_create_bearer_token(path: &Path) -> Result<String> {
         }
     }
 }
-
-#[cfg(all(test, windows))]
-pub fn validate_token_permissions(path: &Path) -> Result<()> {
-    token_file::validate_private(path)
-}

@@ -1,5 +1,5 @@
 //! Full-text, hash-versioned document synchronization with a language server.
-use crate::index::content_hash;
+use crate::index::{content_hash, ContentHash};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -9,7 +9,7 @@ pub(crate) struct DocumentSnapshot {
     pub(crate) uri: String,
     pub(crate) language_id: &'static str,
     pub(crate) content: String,
-    pub(crate) hash: String,
+    pub(crate) hash: ContentHash,
 }
 
 impl DocumentSnapshot {
@@ -25,13 +25,13 @@ impl DocumentSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SynchronizedDocument {
-    pub(crate) hash: String,
+    pub(crate) hash: ContentHash,
     pub(crate) version: i64,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct DocumentState {
-    hash: String,
+    hash: ContentHash,
     version: i64,
 }
 

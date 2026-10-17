@@ -1,5 +1,6 @@
 use super::entry::FileEntry;
 use super::handle::hex;
+use super::ids::{ContentHash, SnapshotId};
 use crate::security::normalize_path_text;
 use crate::symbols::Symbol;
 use sha2::{Digest, Sha256};
@@ -15,7 +16,7 @@ pub struct SymbolDefinition {
     pub path: String,
     pub symbol: Symbol,
     /// Content hash of the declaring file.
-    pub hash: String,
+    pub hash: ContentHash,
 }
 
 /// The in-memory workspace index. Mutation goes through `insert` and
@@ -80,7 +81,7 @@ impl CodeIndex {
     }
 
     /// Identity of the indexed file set at a repository `head`.
-    pub fn snapshot_id(&self, head: &str) -> String {
+    pub fn snapshot_id(&self, head: &str) -> SnapshotId {
         let mut digest = Sha256::new();
         digest.update(SNAPSHOT_DOMAIN.as_bytes());
         digest.update([0]);
@@ -88,7 +89,7 @@ impl CodeIndex {
         digest.update([0]);
         digest.update((self.files.len() as u64).to_le_bytes());
         digest.update(self.snapshot_acc);
-        format!("snap_{}", hex(&digest.finalize()))
+        SnapshotId::from(format!("snap_{}", hex(&digest.finalize())))
     }
 
     pub fn get(&self, path: &str) -> Option<&FileEntry> {

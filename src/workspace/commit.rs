@@ -1,10 +1,11 @@
 use super::edit::PlannedFile;
-use super::events::MutationRecord;
-use super::io_helpers::{atomic_write, remove_if_exists, restore_one};
+use super::events::{MutationRecord, MutationSource};
+use super::io_helpers::{atomic_write, restore_one};
 use super::state::StateWriter;
 use super::Workspace;
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::content_hash;
+use crate::security::RelPath;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -32,7 +33,7 @@ impl<'a> CommitProgress<'a> {
         &self.plan[..self.completed_count.min(self.plan.len())]
     }
 
-    fn completed_paths(&self) -> Vec<&'a String> {
+    fn completed_paths(&self) -> Vec<&'a RelPath> {
         self.completed().iter().map(|item| &item.path).collect()
     }
 }
@@ -66,10 +67,10 @@ impl Workspace {
             .iter()
             .map(|item| MutationRecord {
                 mutation_id: MutationRecord::new_id(),
-                path: item.path.clone(),
-                before_hash: item.before.as_ref().map(|value| content_hash(value)),
-                after_hash: item.after.as_ref().map(|value| content_hash(value)),
-                source: "mcp_edit".to_owned(),
+                path: item.path.to_string(),
+                before_hash: item.before_hash.clone(),
+                after_hash: item.after.as_deref().map(content_hash),
+                source: MutationSource::McpEdit,
                 request_id: request_id.to_owned(),
                 timestamp,
                 generation,
@@ -81,7 +82,7 @@ impl Workspace {
             ledger.record_internal(absolute.clone(), Instant::now());
             let result = match &item.after {
                 Some(content) => atomic_write(&self.root, &item.path, content),
-                None => remove_if_exists(&self.root, &item.path),
+                None => self.root.remove_file(&item.path),
             };
             if let Err(error) = result {
                 ledger.forget_internal(&absolute);
@@ -178,7 +179,7 @@ impl Workspace {
         let mut report = CompensationReport::default();
         for item in completed.iter().rev() {
             match restore_one(&self.root, item) {
-                Ok(()) => report.restored_paths.push(item.path.clone()),
+                Ok(()) => report.restored_paths.push(item.path.to_string()),
                 Err(error) => report.compensation_failures.push(json!({
                     "path": item.path,
                     "error": error.to_string()

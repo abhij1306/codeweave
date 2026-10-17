@@ -6,7 +6,7 @@ use super::exclusions::{excluded_dir, excluded_path, WorkspaceExclusions};
 use super::handle::content_hash;
 use super::store::CodeIndex;
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::security::{read_workspace_file, relative_string, validate_relative};
+use crate::security::{RelPath, WorkspaceRoot};
 use crate::symbols::extract_symbols;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 impl CodeIndex {
     pub fn scan(
-        root: &Path,
+        root: &WorkspaceRoot,
         max_file_bytes: usize,
         artifact_paths: &[String],
         exclusions: &WorkspaceExclusions,
@@ -32,14 +32,14 @@ impl CodeIndex {
     /// Scan using the persistent cache at `cache_file`, then rewrite it.
     /// Returns the index and whether a matching cache was found.
     pub fn scan_cached(
-        root: &Path,
+        root: &WorkspaceRoot,
         max_file_bytes: usize,
         artifact_paths: &[String],
         exclusions: &WorkspaceExclusions,
         cache_file: &Path,
     ) -> AppResult<(Self, bool)> {
         let key = CacheKey {
-            root: root.to_string_lossy().into_owned(),
+            root: root.path().to_string_lossy().into_owned(),
             max_file_bytes,
             artifact_paths,
             exclude_paths: exclusions.patterns(),
@@ -61,18 +61,21 @@ impl CodeIndex {
     /// directory tree they named. Returns the paths whose indexed content changed.
     pub fn refresh_paths(
         &mut self,
-        root: &Path,
+        root: &WorkspaceRoot,
         paths: &HashSet<PathBuf>,
         max_file_bytes: usize,
         exclusions: &WorkspaceExclusions,
     ) -> AppResult<Vec<String>> {
         let mut changed = Vec::new();
         for absolute in paths {
-            let relative = relative_string(root, absolute);
+            let relative = root.relative(absolute);
             if relative.is_empty() || relative == "." {
                 continue;
             }
-            if !absolute.is_file() {
+            let Ok(file) = RelPath::new(&relative) else {
+                continue;
+            };
+            if !root.is_regular_file(&file) {
                 changed.extend(self.remove_tree(&relative));
                 continue;
             }
@@ -96,7 +99,7 @@ impl CodeIndex {
 }
 
 fn scan_workspace(
-    root: &Path,
+    root: &WorkspaceRoot,
     max_file_bytes: usize,
     artifact_paths: &[String],
     exclusions: &WorkspaceExclusions,
@@ -106,21 +109,22 @@ fn scan_workspace(
     scan_directory(
         &mut index,
         root,
-        root,
+        root.path(),
         max_file_bytes,
         true,
         exclusions,
         cache,
     )?;
-    let canonical_root = root.canonicalize()?;
+    // `WorkspaceRoot::open` canonicalized the root.
+    let canonical_root = root.path();
     for relative in artifact_paths {
-        let relative = validate_relative(relative)?;
-        let candidate = canonical_root.join(relative);
+        let relative = RelPath::new(relative)?;
+        let candidate = canonical_root.join(relative.as_path());
         if !candidate.exists() {
             continue;
         }
         let resolved = candidate.canonicalize()?;
-        if !resolved.starts_with(&canonical_root) {
+        if !resolved.starts_with(canonical_root) {
             return Err(AppError::new(
                 ErrorCode::OutsideRoot,
                 "Artifact path resolves outside workspace",
@@ -128,7 +132,7 @@ fn scan_workspace(
         }
         scan_directory(
             &mut index,
-            &canonical_root,
+            root,
             &resolved,
             max_file_bytes,
             false,
@@ -141,7 +145,7 @@ fn scan_workspace(
 
 fn scan_directory(
     index: &mut CodeIndex,
-    root: &Path,
+    root: &WorkspaceRoot,
     scan_root: &Path,
     max_file_bytes: usize,
     respect_ignores: bool,
@@ -192,15 +196,18 @@ fn scan_directory(
 /// non-regular files are skipped. Cached symbols are reused only when the
 /// content hash matches.
 fn read_entry(
-    root: &Path,
+    root: &WorkspaceRoot,
     path: &Path,
     max_file_bytes: usize,
     cache: &SymbolCache,
 ) -> AppResult<Option<FileEntry>> {
-    let relative = relative_string(root, path);
-    let Some(file) = read_workspace_file(root, &relative, max_file_bytes)? else {
+    let Ok(relative) = RelPath::new(&root.relative(path)) else {
         return Ok(None);
     };
+    let Some(file) = root.read_file(&relative, max_file_bytes)? else {
+        return Ok(None);
+    };
+    let relative = relative.into_string();
     if file.bytes.iter().take(8_192).any(|byte| *byte == 0) {
         return Ok(None);
     }

@@ -32,10 +32,10 @@ mod ledger;
 pub(crate) use ledger::{temp_file_name, ChangeLedger, RunWindow};
 
 use crate::error::{AppError, AppResult};
-use crate::index::{CodeIndex, WorkspaceExclusions};
+use crate::index::{CodeIndex, SnapshotId, WorkspaceExclusions};
 use crate::repository::RepoStatus;
+use crate::security::WorkspaceRoot;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The identity of one reconciled state: an instance-local generation counter and
@@ -43,7 +43,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Stamp {
     pub generation: u64,
-    pub snapshot_id: String,
+    pub snapshot_id: SnapshotId,
 }
 
 struct Reconciled {
@@ -51,7 +51,7 @@ struct Reconciled {
     repo_status: RepoStatus,
     repo_status_stale: bool,
     generation: u64,
-    snapshot_id: String,
+    snapshot_id: SnapshotId,
 }
 
 impl Reconciled {
@@ -85,7 +85,7 @@ impl ReconciledState {
     /// from an empty status marked stale, like any later failed refresh.
     pub(crate) fn new(
         workspace_id: &str,
-        root: PathBuf,
+        root: WorkspaceRoot,
         exclusions: WorkspaceExclusions,
         index: CodeIndex,
         repo_status: AppResult<RepoStatus>,
@@ -102,7 +102,7 @@ impl ReconciledState {
             repo_status,
             repo_status_stale,
             generation: 1,
-            snapshot_id: String::new(),
+            snapshot_id: SnapshotId::from(String::new()),
         };
         reconciled.recompute_snapshot();
         Self {
@@ -267,7 +267,7 @@ impl StateView<'_> {
         self.guard.generation
     }
 
-    pub fn snapshot_id(&self) -> &str {
+    pub fn snapshot_id(&self) -> &SnapshotId {
         &self.guard.snapshot_id
     }
 }
@@ -288,7 +288,7 @@ impl StateReader {
                 repo_status: RepoStatus::default(),
                 repo_status_stale: false,
                 generation: 1,
-                snapshot_id: snapshot_id.into(),
+                snapshot_id: SnapshotId::from(snapshot_id.into()),
             })),
         }
     }

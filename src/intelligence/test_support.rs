@@ -9,6 +9,7 @@ use super::uri::{path_uri, UriCodec};
 use super::worker::LspWorker;
 use crate::index::{CodeIndex, WorkspaceExclusions};
 use crate::model::IntelligenceSettings;
+use crate::security::WorkspaceRoot;
 use crate::workspace::StateReader;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -205,15 +206,23 @@ impl Fixture {
             fs::write(path, content).unwrap();
         }
         let exclusions = WorkspaceExclusions::new(root.path(), &[]).unwrap();
-        let index = CodeIndex::scan(root.path(), 1_000_000, &[], &exclusions).unwrap();
+        let index = CodeIndex::scan(
+            &WorkspaceRoot::open(root.path()).unwrap(),
+            1_000_000,
+            &[],
+            &exclusions,
+        )
+        .unwrap();
         Self {
             root,
             state: StateReader::detached(index, "snap_fixture"),
         }
     }
 
+    /// The canonical path of `relative`, as a language server initialized
+    /// with the canonical workspace root reports it.
     pub(crate) fn path(&self, relative: &str) -> std::path::PathBuf {
-        self.root.path().join(relative)
+        self.root.path().canonicalize().unwrap().join(relative)
     }
 
     pub(crate) fn uri(&self, relative: &str) -> String {
@@ -247,7 +256,7 @@ impl Fixture {
         backends: Vec<Arc<dyn SemanticBackend>>,
     ) -> IntelligenceService {
         IntelligenceService::with_backends(
-            self.root.path().to_path_buf(),
+            WorkspaceRoot::open(self.root.path()).unwrap(),
             "fixture".to_owned(),
             self.live(),
             Backends::new(backends),
@@ -257,7 +266,7 @@ impl Fixture {
     /// A service with every language server disabled.
     pub(crate) fn service(&self) -> IntelligenceService {
         IntelligenceService::new(
-            self.root.path().to_path_buf(),
+            WorkspaceRoot::open(self.root.path()).unwrap(),
             IntelligenceSettings::default(),
             "fixture".to_owned(),
             self.state.clone(),

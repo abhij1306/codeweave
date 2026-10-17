@@ -90,7 +90,7 @@ fn definition_returns_semantic_locations_from_the_server() {
     );
     assert_eq!(
         result["synchronization"]["synchronized_hash"],
-        content_hash(LIB)
+        content_hash(LIB).as_str()
     );
     assert_eq!(result["synchronization"]["document_version"], 1);
     assert_eq!(
@@ -160,7 +160,7 @@ fn rename_preview_compiles_server_edits_into_one_edit_request() {
                     old_text: CALLER.to_owned(),
                     new_text: "fn call() { open_repo(); }\n".to_owned(),
                     expected_replacements: 1,
-                    expected_hash: Some(content_hash(CALLER)),
+                    expected_hash: Some(content_hash(CALLER).into_string()),
                     handle: None,
                 },
                 Change::Replace {
@@ -168,7 +168,7 @@ fn rename_preview_compiles_server_edits_into_one_edit_request() {
                     old_text: LIB.to_owned(),
                     new_text: "pub fn open_repo() {}\n".to_owned(),
                     expected_replacements: 1,
-                    expected_hash: Some(content_hash(LIB)),
+                    expected_hash: Some(content_hash(LIB).into_string()),
                     handle: None,
                 },
             ],

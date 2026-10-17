@@ -13,14 +13,14 @@ use crate::error::{AppError, AppResult, ErrorCode};
 use crate::model::IntelligenceSettings;
 use crate::reference_service::{Freshness, SemanticReferenceMetadata};
 use crate::requests::edit::{EditRequest, ResponseDetail};
+use crate::security::WorkspaceRoot;
 use crate::workspace::StateReader;
 use serde_json::{json, Value};
-use std::path::PathBuf;
 
 const REFERENCE_CAVEAT: &str = "Language-server locations were produced from a full-text synchronized document hash that still matches disk and the live index.";
 
 pub struct IntelligenceService {
-    root: PathBuf,
+    root: WorkspaceRoot,
     codec: UriCodec,
     workspace_id: String,
     live: LiveIndex,
@@ -67,12 +67,12 @@ impl IntelligenceResponse {
 
 impl IntelligenceService {
     pub fn new(
-        root: PathBuf,
+        root: WorkspaceRoot,
         settings: IntelligenceSettings,
         workspace_id: String,
         state: StateReader,
     ) -> AppResult<Self> {
-        let backends = Backends::spawn(&root, &settings)?;
+        let backends = Backends::spawn(root.path(), &settings)?;
         Ok(Self::with_backends(
             root,
             workspace_id,
@@ -82,13 +82,13 @@ impl IntelligenceService {
     }
 
     pub(crate) fn with_backends(
-        root: PathBuf,
+        root: WorkspaceRoot,
         workspace_id: String,
         live: LiveIndex,
         backends: Backends,
     ) -> Self {
         Self {
-            codec: UriCodec::new(&root),
+            codec: UriCodec::new(root.path()),
             root,
             workspace_id,
             live,
