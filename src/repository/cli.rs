@@ -114,14 +114,8 @@ impl CliGitBackend {
             diff.push_str(&header);
             match content.lines().count() {
                 0 => {}
-                1 => diff.push_str(
-                    "@@ -0,0 +1 @@
-",
-                ),
-                lines => diff.push_str(&format!(
-                    "@@ -0,0 +1,{lines} @@
-"
-                )),
+                1 => diff.push_str("@@ -0,0 +1 @@\n"),
+                lines => diff.push_str(&format!("@@ -0,0 +1,{lines} @@\n")),
             }
             for line in content.lines() {
                 diff.push('+');
@@ -355,11 +349,7 @@ mod tests {
 
         assert!(diff.text.contains("new file mode 100644"));
         assert!(diff.text.contains("+++ b/new.py"));
-        assert!(diff.text.contains(
-            "@@ -0,0 +1 @@
-+print('hello')
-"
-        ));
+        assert!(diff.text.contains("@@ -0,0 +1 @@\n+print('hello')\n"));
         assert_eq!(diff.hunks.len(), 1);
         assert_eq!(diff.hunks[0].path, "new.py");
         assert!(diff.hunks[0].overlaps(1, 1));
