@@ -1,24 +1,17 @@
 use anyhow::Result;
-use codeweave_rust::{manager::Application, model, security};
-use serde_json::Value;
-use std::{
-    io,
-    net::TcpListener,
-    path::{Path, PathBuf},
-    process::Command as ProcessCommand,
-    sync::Arc,
-};
+use codeweave_rust::{manager::Application, security};
+use std::{io, net::TcpListener, path::Path, process::Command as ProcessCommand, sync::Arc};
 
 use crate::token_file;
 
 use super::args::{Cli, Transport};
-use super::config::{config_relative_path, load_config, validate_auth_mode};
+use super::config::{config_relative_path, load_config, AuthMode, Config};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Check {
-    pub(super) name: &'static str,
-    pub(super) ok: bool,
-    pub(super) detail: String,
+pub struct Check {
+    pub name: &'static str,
+    pub ok: bool,
+    pub detail: String,
 }
 
 fn executable_on_path(command: &str) -> bool {
@@ -65,9 +58,9 @@ impl Check {
 
 /// Run the same preflight work as normal startup, retaining individual failures
 /// so `doctor` can explain every actionable problem in one invocation.
-pub(super) async fn doctor_checks(cli: &Cli) -> Vec<Check> {
+pub async fn doctor_checks(cli: &Cli) -> Vec<Check> {
     let mut checks = Vec::new();
-    let (server, config) = match load_config(&cli.config) {
+    let Config { server, daemon } = match load_config(&cli.config) {
         Ok(value) => {
             checks.push(Check::ok(
                 "config",
@@ -83,50 +76,31 @@ pub(super) async fn doctor_checks(cli: &Cli) -> Vec<Check> {
             return checks;
         }
     };
-    let bash_config: model::BashConfig = serde_json::from_value(config["policy"]["bash"].clone())
-        .expect("load_config already validated policy.bash");
-
-    match validate_auth_mode(&server.auth_mode) {
-        Ok(()) => checks.push(Check::ok(
-            "auth",
-            format!("{} authentication", server.auth_mode),
-        )),
-        Err(error) => checks.push(Check::fail(
-            "auth",
-            format!("{error}; set server.authMode to bearer or none"),
-        )),
-    }
+    checks.push(Check::ok(
+        "auth",
+        format!("{} authentication", server.auth_mode.as_str()),
+    ));
     checks.push(Check::ok("tools", "fixed 25-tool contract"));
 
-    let workspace_path = config
-        .get("workspace")
-        .and_then(|workspace| workspace.get("path"))
-        .and_then(Value::as_str)
-        .map(PathBuf::from);
-    let workspace_ok = match workspace_path.as_deref() {
-        Some(path) => match security::canonical_root(path) {
-            Ok(root) => {
-                checks.push(Check::ok("workspace", root.display().to_string()));
-                true
-            }
-            Err(error) => {
-                checks.push(Check::fail(
-                    "workspace",
-                    format!("{error}; set workspace.path to an existing directory"),
-                ));
-                false
-            }
-        },
-        None => {
+    let workspace_ok = match security::canonical_root(Path::new(&daemon.workspace.path)) {
+        Ok(root) => {
+            checks.push(Check::ok("workspace", root.display().to_string()));
+            true
+        }
+        Err(error) => {
             checks.push(Check::fail(
                 "workspace",
-                "workspace.path is missing; set it to the project directory",
+                format!("{error}; set workspace.path to an existing directory"),
             ));
             false
         }
     };
 
-    match ProcessCommand::new("git").arg("--version").output() {
+    let git_version =
+        tokio::task::spawn_blocking(|| ProcessCommand::new("git").arg("--version").output())
+            .await
+            .unwrap_or_else(|error| Err(io::Error::other(error)));
+    match git_version {
         Ok(output) if output.status.success() => checks.push(Check::ok(
             "git",
             String::from_utf8_lossy(&output.stdout).trim().to_owned(),
@@ -144,36 +118,39 @@ pub(super) async fn doctor_checks(cli: &Cli) -> Vec<Check> {
         )),
     }
 
-    for (language, default_command) in [
-        ("rust", "rust-analyzer"),
-        ("python", "basedpyright-langserver"),
-        ("typescript", "typescript-language-server"),
+    let intelligence = &daemon.intelligence;
+    for (language, check_name, settings, default_command) in [
+        (
+            "rust",
+            "intelligence rust",
+            &intelligence.rust,
+            "rust-analyzer",
+        ),
+        (
+            "python",
+            "intelligence python",
+            &intelligence.python,
+            "basedpyright-langserver",
+        ),
+        (
+            "typescript",
+            "intelligence typescript",
+            &intelligence.typescript,
+            "typescript-language-server",
+        ),
     ] {
-        let check_name = match language {
-            "rust" => "intelligence rust",
-            "python" => "intelligence python",
-            "typescript" => "intelligence typescript",
-            _ => unreachable!("fixed language list"),
-        };
-        let settings = config
-            .get("intelligence")
-            .and_then(|value| value.get(language));
-        let enabled = settings
-            .and_then(|value| value.get("enabled"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !enabled {
+        if !settings.enabled {
             checks.push(Check::ok(
                 check_name,
                 "disabled; syntactic and lexical fallback remain available",
             ));
             continue;
         }
-        let command = settings
-            .and_then(|value| value.get("command"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(default_command);
+        let command = if settings.command.is_empty() {
+            default_command
+        } else {
+            settings.command.as_str()
+        };
         if executable_on_path(command) {
             checks.push(Check::ok(
                 check_name,
@@ -199,7 +176,7 @@ pub(super) async fn doctor_checks(cli: &Cli) -> Vec<Check> {
         }
     }
 
-    if matches!(cli.transport, Transport::Http) && server.auth_mode == "bearer" {
+    if matches!(cli.transport, Transport::Http) && server.auth_mode == AuthMode::Bearer {
         let token_path = config_relative_path(&cli.config, &server.token_file);
         match token_file::read_private(&token_path) {
             Ok(Some(value)) if !value.trim().is_empty() => checks.push(Check::ok(
@@ -234,11 +211,8 @@ pub(super) async fn doctor_checks(cli: &Cli) -> Vec<Check> {
 
     if workspace_ok {
         let manager = Arc::new(Application::default());
-        let initialized = match model::parse_daemon_config(&config) {
-            Ok(daemon) => manager.initialize(daemon).await,
-            Err(error) => Err(error),
-        };
-        match initialized {
+        let bash_configured = !daemon.policy.bash.executable.trim().is_empty();
+        match manager.initialize(daemon).await {
             Ok(init) => {
                 let indexed = init.index_ready;
                 let files = init.file_count;
@@ -250,7 +224,6 @@ pub(super) async fn doctor_checks(cli: &Cli) -> Vec<Check> {
                         "initialization returned index_ready=false",
                     ));
                 }
-                let bash_configured = !bash_config.executable.trim().is_empty();
                 let bash_available = init.bash_available;
                 if bash_configured && bash_available {
                     checks.push(Check::ok(
@@ -287,7 +260,7 @@ pub(super) async fn doctor_checks(cli: &Cli) -> Vec<Check> {
     checks
 }
 
-pub(super) async fn run_doctor(cli: &Cli) -> Result<()> {
+pub async fn run_doctor(cli: &Cli) -> Result<()> {
     let checks = doctor_checks(cli).await;
     let failed = checks.iter().any(|check| !check.ok);
     for check in checks {

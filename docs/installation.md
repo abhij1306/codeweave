@@ -109,7 +109,7 @@ A missing or invalid `workspace.path` produces an actionable startup error (`WOR
 
 Do not commit `config.json` or `.mcp-token`.
 
-`server.authMode` accepts only `bearer` or `none`. With HTTP transport and bearer authentication enabled, CodeWeave automatically creates `.mcp-token` on the first run if the configured token file is missing. Existing non-empty token files are reused. Stdio transport neither reads nor creates the bearer-token file.
+`server.authMode` accepts only `bearer` or `none`; any other value fails config loading (and `doctor` reports it under the `config` check). With HTTP transport and bearer authentication enabled, CodeWeave automatically creates `.mcp-token` on the first run if the configured token file is missing. Existing non-empty token files are reused. Stdio transport neither reads nor creates the bearer-token file.
 
 The token is an internal HTTP origin credential for the CodeWeave server. It is not an LLM API key and should not be entered into ChatGPT, Claude, or another AI client.
 

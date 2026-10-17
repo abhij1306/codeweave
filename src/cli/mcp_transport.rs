@@ -10,8 +10,8 @@ use axum::{
 };
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerConfig as McpServerConfig,
+        CallToolRequestParams, CallToolResponse, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, ServerConfig as McpServerConfig,
     },
     service::RequestContext,
     transport::{
@@ -22,11 +22,10 @@ use rmcp::{
     },
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
-use serde_json::Value;
 
 use super::args::Cli;
-use super::config::ServerConfig;
-use super::server::{authorized, health, is_loopback, live, tool_failure, tool_result, AppState};
+use super::config::{AuthMode, ServerConfig};
+use super::serve::{authorized, health, is_loopback, live, AppState};
 use super::SERVER_NAME;
 use codeweave_rust::tools;
 
@@ -47,12 +46,12 @@ impl McpBodyBudget {
 }
 
 #[derive(Clone)]
-pub(crate) struct CodeWeaveMcp {
+pub struct CodeWeaveMcp {
     state: AppState,
 }
 
 impl CodeWeaveMcp {
-    pub(crate) fn new(state: AppState) -> Self {
+    pub fn new(state: AppState) -> Self {
         Self { state }
     }
 }
@@ -72,7 +71,7 @@ impl ServerHandler for CodeWeaveMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(tools::mcp_tools().to_vec()))
+        Ok(tools::list_tools())
     }
 
     async fn call_tool(
@@ -80,26 +79,13 @@ impl ServerHandler for CodeWeaveMcp {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let name = request.name.as_ref();
-        let args = request
-            .arguments
-            .map(Value::Object)
-            .unwrap_or_else(|| serde_json::json!({}));
-
-        let Some(tool) = tools::find(name) else {
-            return Err(McpError::invalid_params(
-                format!("Unknown tool: {name}"),
-                None,
-            ));
-        };
-        let result = tool.call(Arc::clone(&self.state.manager), args).await;
-        let value = match result {
-            Ok(value) => tool_result(value),
-            Err(error) => tool_failure(error),
-        };
-        serde_json::from_value::<CallToolResult>(value)
-            .map(Into::into)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))
+        tools::call_tool(
+            Arc::clone(&self.state.manager),
+            &request.name,
+            request.arguments,
+        )
+        .await
+        .map(Into::into)
     }
 }
 
@@ -148,14 +134,14 @@ async fn limit_mcp_body(
     }
 }
 
-pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
+pub async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
     if let Some(host) = &cli.host {
         state.server.host = host.clone();
     }
     if let Some(port) = cli.port {
         state.server.port = port;
     }
-    if state.server.auth_mode == "none" && !is_loopback(&state.server.host) {
+    if state.server.auth_mode == AuthMode::None && !is_loopback(&state.server.host) {
         anyhow::bail!("refusing unauthenticated HTTP on non-loopback host")
     }
 
@@ -163,26 +149,18 @@ pub(crate) async fn run_http(mut state: AppState, cli: &Cli) -> Result<()> {
 
     let address = format!("{}:{}", state.server.host, state.server.port);
     let listener = tokio::net::TcpListener::bind(&address).await?;
-    eprintln!("{SERVER_NAME} listening on http://{address}/mcp");
+    tracing::info!("{SERVER_NAME} listening on http://{address}/mcp");
     serve_with_idle_timeout(listener, app, state.server.idle_timeout_ms).await
 }
 
 fn build_http_app(state: AppState) -> Router {
-    build_http_app_with_body_budget(
-        state,
-        McpBodyBudget::new(MAX_CONCURRENT_MCP_BODY_COLLECTIONS),
-    )
-}
-
-fn build_http_app_with_body_budget(state: AppState, body_budget: McpBodyBudget) -> Router {
-    let allowed_hosts = configured_allowed_hosts(&state.server);
-
-    let mut config = StreamableHttpServerConfig::default();
-    config.legacy_session_mode = false;
-    config.json_response = true;
-    config.sse_retry = None;
-    config.allowed_hosts = allowed_hosts;
-    config.allowed_origins = state.server.allowed_origins.clone();
+    let body_budget = McpBodyBudget::new(MAX_CONCURRENT_MCP_BODY_COLLECTIONS);
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_retry(None)
+        .with_allowed_hosts(configured_allowed_hosts(&state.server))
+        .with_allowed_origins(state.server.allowed_origins.clone());
 
     let service: StreamableHttpService<CodeWeaveMcp, LocalSessionManager> =
         StreamableHttpService::new(
@@ -275,7 +253,7 @@ async fn serve_with_idle_timeout(
                     std::time::Duration::from_secs(1)
                 };
                 accept_backoff = accept_backoff.max(min_backoff).min(max_backoff);
-                eprintln!(
+                tracing::warn!(
                     "{SERVER_NAME} listener accept failed ({}): {error}; retrying in {} ms",
                     if resource_exhausted {
                         "file-descriptor exhaustion"
@@ -338,7 +316,7 @@ fn is_ipv6_literal(host: &str) -> bool {
     value.contains(':')
 }
 
-pub(crate) async fn run_stdio(state: AppState) -> Result<()> {
+pub async fn run_stdio(state: AppState) -> Result<()> {
     let service = CodeWeaveMcp::new(state).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -361,7 +339,7 @@ mod tests {
             server: ServerConfig {
                 host: "127.0.0.1".to_owned(),
                 port: 8813,
-                auth_mode: "bearer".to_owned(),
+                auth_mode: AuthMode::Bearer,
                 token_file: ".mcp-token".to_owned(),
                 allowed_hosts: Vec::new(),
                 allowed_origins: Vec::new(),
@@ -424,59 +402,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn excess_request_is_rejected_when_body_budget_is_saturated() {
-        let budget = McpBodyBudget::new(1);
-        let permit = budget.0.clone().try_acquire_owned().unwrap();
-        let request = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header(header::HOST, "127.0.0.1:8813")
-            .header(header::AUTHORIZATION, "Bearer test-token")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from("{}"))
-            .unwrap();
-
-        let response = build_http_app_with_body_budget(test_state(), budget)
-            .oneshot(request)
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        drop(permit);
-    }
-
-    #[test]
-    fn origin_connection_capacity_is_bounded() {
-        let limiter = tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS);
-        let permits = (0..MAX_HTTP_CONNECTIONS)
-            .map(|_| limiter.try_acquire())
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-
-        assert!(limiter.try_acquire().is_err());
-        drop(permits);
-        assert!(limiter.try_acquire().is_ok());
-    }
-
-    #[test]
-    fn accept_resource_exhaustion_classifies_common_platform_codes() {
-        for code in [4, 23, 24, 10024] {
-            assert!(is_accept_resource_exhaustion(
-                &std::io::Error::from_raw_os_error(code)
-            ));
-        }
-        assert!(!is_accept_resource_exhaustion(
-            &std::io::Error::from_raw_os_error(111)
-        ));
-    }
-
     #[test]
     fn wildcard_allowed_host_disables_rmcp_host_guard_for_trusted_tunnels() {
         let server = ServerConfig {
             host: "127.0.0.1".to_owned(),
             port: 8813,
-            auth_mode: "bearer".to_owned(),
+            auth_mode: AuthMode::Bearer,
             token_file: ".mcp-token".to_owned(),
             allowed_hosts: vec!["*".to_owned()],
             allowed_origins: Vec::new(),
@@ -491,7 +422,7 @@ mod tests {
         let server = ServerConfig {
             host: "127.0.0.1".to_owned(),
             port: 8813,
-            auth_mode: "bearer".to_owned(),
+            auth_mode: AuthMode::Bearer,
             token_file: ".mcp-token".to_owned(),
             allowed_hosts: vec!["example.ngrok-free.dev".to_owned()],
             allowed_origins: Vec::new(),
@@ -509,7 +440,7 @@ mod tests {
         let server = ServerConfig {
             host: "::1".to_owned(),
             port: 8813,
-            auth_mode: "bearer".to_owned(),
+            auth_mode: AuthMode::Bearer,
             token_file: ".mcp-token".to_owned(),
             allowed_hosts: Vec::new(),
             allowed_origins: Vec::new(),

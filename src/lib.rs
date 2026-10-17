@@ -18,8 +18,11 @@ pub mod symbols;
 pub mod tools;
 pub mod workspace;
 
-#[cfg(test)]
-pub(crate) fn test_bash_executable() -> String {
+/// The Bash executable tests run: Git Bash on Windows, where `bash` on PATH
+/// may be the WSL launcher, and `bash` elsewhere. Shared by the library and
+/// CLI tests; not part of the supported API.
+#[doc(hidden)]
+pub fn test_bash_executable() -> String {
     #[cfg(windows)]
     {
         for root in [

@@ -3,7 +3,7 @@ mod config;
 mod doctor;
 mod install;
 mod mcp_transport;
-mod server;
+mod serve;
 
 #[cfg(test)]
 mod tests;
@@ -15,12 +15,12 @@ use args::{Cli, Command};
 
 const SERVER_NAME: &str = "codeweave";
 
-pub(crate) async fn run() -> Result<()> {
+pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match &cli.command {
         None | Some(Command::Serve) => {
-            server::init_tracing();
-            server::run_serve(cli).await
+            serve::init_tracing();
+            serve::run_serve(cli).await
         }
         Some(Command::Init { path, force }) => {
             let (path, force) = (path.clone(), *force);
