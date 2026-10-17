@@ -331,7 +331,7 @@ impl<'a> ReferenceService<'a> {
             .filter(|file| path_filters.allows(file.path()))
             .filter(|file| reference_scope_allows(request.reference_scope, file))
             .collect::<Vec<_>>();
-        files.sort_by(|left, right| left.path.cmp(&right.path));
+        files.sort_by(|left, right| left.path().cmp(right.path()));
         let scanned_scope = ScannedScope {
             file_count: files.len(),
             byte_count: files.iter().map(|file| file.content().len()).sum(),
