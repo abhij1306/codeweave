@@ -140,7 +140,9 @@ fn failed_write_does_not_leave_an_internal_write_marker() {
         after: None,
     }];
 
-    let error = actor.commit_plan(&plan, "failed-write").unwrap_err();
+    let error = actor
+        .commit_plan(&mut actor.state.writer(), &plan, "failed-write")
+        .unwrap_err();
     assert_eq!(error.0.code, "ATOMIC_WRITE_FAILED");
     let details = error.0.details.as_ref().unwrap();
     assert_eq!(details["failed_path"], "blocked");
@@ -149,9 +151,9 @@ fn failed_write_does_not_leave_an_internal_write_marker() {
     assert_eq!(details["compensation_failures"], json!([]));
     assert_eq!(details["manual_recovery_required"], false);
     assert!(!actor
-        .internal_writes
-        .lock()
-        .contains_key(&actor.root.join("blocked")));
+        .state
+        .ledger()
+        .consume_internal(&actor.root.join("blocked"), std::time::Instant::now()));
 }
 
 #[tokio::test]

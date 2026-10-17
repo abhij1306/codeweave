@@ -1,7 +1,7 @@
 use super::*;
 
-#[test]
-fn git_diff_continuation_preserves_the_original_scope() {
+#[tokio::test]
+async fn git_diff_continuation_preserves_the_original_scope() {
     let root = tempdir().unwrap();
     run_git(root.path(), &["init", "-q"]);
     run_git(
@@ -41,6 +41,7 @@ fn git_diff_continuation_preserves_the_original_scope() {
             "paths": ["a.rs"],
             "max_chars": 1_200
         }))
+        .await
         .unwrap();
     assert_eq!(first["truncated"], true);
     assert!(!first["hunks"].as_array().unwrap().is_empty());
@@ -57,6 +58,7 @@ fn git_diff_continuation_preserves_the_original_scope() {
             "continuation": continuation,
             "max_chars": 5_000
         }))
+        .await
         .unwrap();
     assert!(second["hunks"]
         .as_array()
@@ -72,12 +74,13 @@ fn git_diff_continuation_preserves_the_original_scope() {
             "continuation": continuation,
             "paths": ["b.rs"]
         }))
+        .await
         .unwrap_err();
     assert_eq!(error.0.code, "CONTINUATION_SCOPE_MISMATCH");
 }
 
-#[test]
-fn git_diff_pagination_advances_past_oversized_hunks() {
+#[tokio::test]
+async fn git_diff_pagination_advances_past_oversized_hunks() {
     let root = tempdir().unwrap();
     run_git(root.path(), &["init", "-q"]);
     run_git(
@@ -109,6 +112,7 @@ fn git_diff_pagination_advances_past_oversized_hunks() {
     let actor = test_actor(root.path());
     let first = actor
         .git(&json!({"action": "diff", "paths": ["large.rs"], "max_chars": 100}))
+        .await
         .unwrap();
     assert_eq!(first["hunks"].as_array().unwrap().len(), 1);
     assert!(first["output"].as_str().unwrap().len() > 100);
@@ -117,6 +121,7 @@ fn git_diff_pagination_advances_past_oversized_hunks() {
 
     let second = actor
         .git(&json!({"action": "diff", "continuation": continuation, "max_chars": 100}))
+        .await
         .unwrap();
     assert_eq!(second["hunks"].as_array().unwrap().len(), 1);
     assert_ne!(second["hunks"][0]["id"].as_str().unwrap(), first_id);
