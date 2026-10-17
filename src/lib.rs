@@ -11,6 +11,7 @@ pub mod model;
 pub mod process_runtime;
 pub mod reference_service;
 pub mod repository;
+pub mod requests;
 pub mod retrieval;
 pub mod security;
 pub mod symbols;
