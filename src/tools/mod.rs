@@ -360,6 +360,16 @@ mod tests {
     }
 
     #[test]
+    fn advertised_tools_match_the_published_wire_fixture() {
+        let wire: rmcp::model::ListToolsResult =
+            serde_json::from_value(json!({ "tools": full_list_payload() })).unwrap();
+        let expected: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/tools_list.json")).unwrap();
+
+        assert_eq!(serde_json::to_value(&wire.tools).unwrap(), expected);
+    }
+
+    #[test]
     fn list_payload_shape_uses_only_the_edit_discriminator_union() {
         let access = fixed_access();
         let items = access.list_payload().as_array().unwrap();
