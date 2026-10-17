@@ -1,5 +1,5 @@
 use crate::contracts;
-use crate::intelligence::IntelligenceService;
+use crate::intelligence::{IntelligenceResponse, IntelligenceService};
 use crate::model::{AppError, AppResult, DaemonConfig, WorkspaceConfig};
 use crate::repository::CliGitBackend;
 use crate::security::canonical_root;
@@ -182,33 +182,23 @@ impl Application {
                     AppError::new("NOT_INITIALIZED", "Workspace has not been initialized")
                 })?;
                 let params = params.clone();
-                let operation = params
-                    .get("operation")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let semantic = run_blocking(move || service.execute(&params)).await?;
-                if operation == "rename_preview" {
-                    let changes = semantic
-                        .get("changes")
-                        .cloned()
-                        .unwrap_or_else(|| json!([]));
-                    let snapshot = actor
-                        .summary_ids()?
-                        .get("snapshot_id")
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    let mut preview = actor
-                        .code_edit(
-                            &json!({"preview":true,"changes":changes,"snapshot_id":snapshot}),
-                        )
-                        .await?;
-                    if let Some(object) = preview.as_object_mut() {
-                        object.insert("intelligence".to_owned(), semantic);
+                let response = tokio::task::spawn_blocking(move || service.execute(&params))
+                    .await
+                    .map_err(AppError::internal)??;
+                match response {
+                    IntelligenceResponse::Report(report) => Ok(report),
+                    IntelligenceResponse::RenamePreview(rename) => {
+                        let snapshot = actor
+                            .summary_ids()?
+                            .get("snapshot_id")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let mut preview = actor.code_edit(&rename.edit_request(snapshot)).await?;
+                        if let Some(object) = preview.as_object_mut() {
+                            object.insert("intelligence".to_owned(), rename.into_report());
+                        }
+                        Ok(preview)
                     }
-                    Ok(preview)
-                } else {
-                    Ok(semantic)
                 }
             }
             "code_write" | "code_replace" | "code_replace_range" | "code_insert"
@@ -271,7 +261,7 @@ impl Application {
             actor.id.clone(),
             actor.reference_index(),
             actor.reference_snapshot(),
-        ));
+        )?);
         let open_ms = open_started.elapsed().as_millis();
 
         let bash_probe_started = Instant::now();

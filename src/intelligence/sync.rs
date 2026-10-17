@@ -1,19 +1,11 @@
-use super::normalize::path_uri;
-use super::protocol::TextDocumentSyncKind;
+//! Full-text, hash-versioned document synchronization with a language server.
 use crate::index::content_hash;
-use crate::model::{AppError, AppResult};
-use crate::security::read_workspace_file;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-#[cfg(test)]
-use std::fs;
-use std::path::{Path, PathBuf};
 
+/// The exact text a semantic request is answered against.
 #[derive(Debug, Clone)]
 pub(crate) struct DocumentSnapshot {
-    pub(crate) root: PathBuf,
-    pub(crate) relative: String,
-    pub(crate) path: PathBuf,
     pub(crate) uri: String,
     pub(crate) language_id: &'static str,
     pub(crate) content: String,
@@ -21,41 +13,18 @@ pub(crate) struct DocumentSnapshot {
 }
 
 impl DocumentSnapshot {
-    pub(crate) fn from_content(
-        root: &Path,
-        relative: &str,
-        language_id: &'static str,
-        content: String,
-    ) -> AppResult<Self> {
-        let relative = crate::security::validate_relative(relative)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        let path = root.join(&relative);
-        Ok(Self {
-            root: root.to_owned(),
-            relative,
-            path: path.clone(),
-            uri: path_uri(&path),
+    pub(crate) fn new(uri: String, language_id: &'static str, content: String) -> Self {
+        Self {
+            uri,
             language_id,
             hash: content_hash(&content),
             content,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn read(path: &Path, language_id: &'static str) -> AppResult<Self> {
-        let root = path.parent().unwrap_or_else(|| Path::new("."));
-        let relative = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| AppError::invalid("test document path has no file name"))?;
-        Self::from_content(root, relative, language_id, fs::read_to_string(path)?)
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SynchronizedDocument {
-    pub(crate) path: PathBuf,
     pub(crate) hash: String,
     pub(crate) version: i64,
 }
@@ -72,19 +41,13 @@ pub(crate) struct SyncPlan {
     pub(crate) changed: bool,
 }
 
+/// Record `snapshot` as the server's view of its URI and return the
+/// notification (if any) that makes the server agree.
 pub(crate) fn plan_sync(
-    documents: &mut HashMap<PathBuf, DocumentState>,
+    documents: &mut HashMap<String, DocumentState>,
     snapshot: &DocumentSnapshot,
-    sync_kind: TextDocumentSyncKind,
-) -> AppResult<SyncPlan> {
-    if sync_kind == TextDocumentSyncKind::None {
-        return Err(AppError::new(
-            "LSP_SYNC_UNSUPPORTED",
-            "Language server does not advertise document synchronization",
-        ));
-    }
-
-    let (notification, version, changed) = match documents.get(&snapshot.path) {
+) -> SyncPlan {
+    let (notification, version, changed) = match documents.get(&snapshot.uri) {
         None => (
             Some(json!({
                 "jsonrpc": "2.0",
@@ -120,65 +83,18 @@ pub(crate) fn plan_sync(
     };
 
     documents.insert(
-        snapshot.path.clone(),
+        snapshot.uri.clone(),
         DocumentState {
             hash: snapshot.hash.clone(),
             version,
         },
     );
-    Ok(SyncPlan {
+    SyncPlan {
         notification,
         synchronized: SynchronizedDocument {
-            path: snapshot.path.clone(),
             hash: snapshot.hash.clone(),
             version,
         },
         changed,
-    })
-}
-
-pub(crate) fn verify_current(snapshot: &DocumentSnapshot) -> AppResult<()> {
-    let max_bytes = snapshot.content.len().saturating_add(1);
-    let current = read_workspace_file(&snapshot.root, &snapshot.relative, max_bytes)?
-        .and_then(|file| String::from_utf8(file.bytes).ok())
-        .map(|content| content_hash(&content));
-    if current.as_deref() == Some(snapshot.hash.as_str()) {
-        Ok(())
-    } else {
-        Err(AppError::details(
-            "LSP_STALE_DOCUMENT",
-            "Document changed while the semantic request was running",
-            json!({
-                "path": snapshot.path,
-                "synchronized_hash": snapshot.hash,
-                "current_hash": current
-            }),
-        ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stale_document_hash_is_rejected_after_request() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("main.rs");
-        fs::write(&path, "fn before() {}\n").unwrap();
-        let synchronized = DocumentSnapshot::from_content(
-            root.path(),
-            "main.rs",
-            "rust",
-            fs::read_to_string(&path).unwrap(),
-        )
-        .unwrap();
-        fs::write(&path, "fn after() {}\n").unwrap();
-        let error = verify_current(&synchronized).unwrap_err();
-        assert_eq!(error.0.code, "LSP_STALE_DOCUMENT");
-        assert_ne!(
-            error.0.details.as_ref().unwrap()["synchronized_hash"],
-            error.0.details.as_ref().unwrap()["current_hash"]
-        );
     }
 }
