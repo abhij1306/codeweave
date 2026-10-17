@@ -2,7 +2,7 @@
 //! `CodeIntelligenceRequest`, built once at the boundary.
 use crate::error::{AppError, AppResult};
 use crate::requests::intelligence::{CodeIntelligenceRequest, IntelligenceOperationName};
-use crate::security::validate_relative;
+use crate::security::RelPath;
 
 /// A public position: one-based line, zero-based UTF-16 column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +31,7 @@ pub(crate) enum Operation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntelligenceRequest {
-    /// Validated workspace-relative path with `/` separators.
-    pub(crate) path: String,
+    pub(crate) path: RelPath,
     pub(crate) operation: Operation,
 }
 
@@ -44,9 +43,7 @@ impl TryFrom<CodeIntelligenceRequest> for IntelligenceRequest {
             .path
             .as_deref()
             .ok_or_else(|| AppError::invalid("code_intelligence requires path"))?;
-        let path = validate_relative(path)?
-            .to_string_lossy()
-            .replace('\\', "/");
+        let path = RelPath::new(path)?;
         let position = || {
             let line = request.line.ok_or_else(|| {
                 AppError::invalid("This code_intelligence operation requires line")

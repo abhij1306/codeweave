@@ -2,12 +2,11 @@
 //! those changes CodeWeave wrote itself, and the bounded log of mutation records.
 
 use crate::index::WorkspaceExclusions;
-use crate::security::relative_string;
+use crate::security::{RelPath, WorkspaceRoot};
 use crate::workspace::events::{MutationRecord, MutationSource};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,7 +36,7 @@ fn is_temp_file(path: &Path) -> bool {
 }
 
 struct PendingInner {
-    root: PathBuf,
+    root: WorkspaceRoot,
     exclusions: WorkspaceExclusions,
     paths: Mutex<HashSet<PathBuf>>,
     needs_reconcile: AtomicBool,
@@ -56,10 +55,10 @@ impl PendingHandle {
         let inner = &self.inner;
         let mut pending = inner.paths.lock();
         for path in paths {
-            if !path.starts_with(&inner.root) {
+            if !path.starts_with(inner.root.path()) {
                 continue;
             }
-            let relative = relative_string(&inner.root, &path);
+            let relative = inner.root.relative(&path);
             if relative.is_empty()
                 || inner.exclusions.is_ignored(&path, path.is_dir())
                 || is_temp_file(&path)
@@ -102,7 +101,7 @@ pub(crate) struct ChangeLedger {
 }
 
 impl ChangeLedger {
-    pub(super) fn new(root: PathBuf, exclusions: WorkspaceExclusions) -> Self {
+    pub(super) fn new(root: WorkspaceRoot, exclusions: WorkspaceExclusions) -> Self {
         Self {
             pending: PendingHandle {
                 inner: Arc::new(PendingInner {
@@ -158,7 +157,7 @@ impl ChangeLedger {
         let pending = std::mem::take(&mut *inner.paths.lock());
         let mut drain = PendingDrain::default();
         for path in pending {
-            let relative = relative_string(&inner.root, &path);
+            let relative = inner.root.relative(&path);
             if relative == ".git" || relative.starts_with(".git/") {
                 drain.git_event = true;
                 continue;
@@ -275,9 +274,10 @@ impl ChangeLedger {
             .map(|mutation| (mutation.path.clone(), mutation.timestamp))
             .collect();
         let modified_by_end = |path: &str, ended: &DateTime<Utc>| {
-            fs::metadata(root.join(path))
-                .and_then(|metadata| metadata.modified())
-                .is_ok_and(|modified| DateTime::<Utc>::from(modified) <= *ended)
+            RelPath::new(path)
+                .ok()
+                .and_then(|path| root.modified(&path))
+                .is_some_and(|modified| DateTime::<Utc>::from(modified) <= *ended)
         };
         let mutation_paths: HashSet<String> = candidates
             .into_iter()
@@ -309,18 +309,20 @@ impl ChangeLedger {
 mod tests {
     use super::*;
 
-    fn ledger(root: &Path) -> ChangeLedger {
-        ChangeLedger::new(
-            root.to_path_buf(),
-            WorkspaceExclusions::new(root, &[]).unwrap(),
-        )
+    /// A ledger over `temp` and its canonical root, which observed paths
+    /// must be under.
+    fn ledger(temp: &tempfile::TempDir) -> (ChangeLedger, std::path::PathBuf) {
+        let root = WorkspaceRoot::open(temp.path()).unwrap();
+        let path = root.path().to_path_buf();
+        let exclusions = WorkspaceExclusions::new(&path, &[]).unwrap();
+        (ChangeLedger::new(root, exclusions), path)
     }
 
     #[test]
     fn internal_write_marker_expires_after_its_ttl() {
-        let root = tempfile::tempdir().unwrap();
-        let ledger = ledger(root.path());
-        let path = root.path().join("value.rs");
+        let temp = tempfile::tempdir().unwrap();
+        let (ledger, root) = ledger(&temp);
+        let path = root.join("value.rs");
         let written = Instant::now();
 
         ledger.record_internal(path.clone(), written);
@@ -333,17 +335,17 @@ mod tests {
 
     #[test]
     fn drained_paths_split_internal_writes_from_external_changes() {
-        let root = tempfile::tempdir().unwrap();
-        let ledger = ledger(root.path());
-        let ours = root.path().join("ours.rs");
-        let theirs = root.path().join("theirs.rs");
+        let temp = tempfile::tempdir().unwrap();
+        let (ledger, root) = ledger(&temp);
+        let ours = root.join("ours.rs");
+        let theirs = root.join("theirs.rs");
         let now = Instant::now();
         ledger.record_internal(ours.clone(), now);
 
         ledger.pending_handle().observe([
             ours.clone(),
             theirs.clone(),
-            root.path().join(temp_file_name("ours.rs", "abc")),
+            root.join(temp_file_name("ours.rs", "abc")),
         ]);
         let drain = ledger.drain_pending(now).unwrap();
 

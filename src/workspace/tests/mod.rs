@@ -24,6 +24,7 @@ use crate::requests::bash::{
 use crate::requests::edit::{CodePreviewRequest, CodeTransactionRequest, EditRequest};
 use crate::requests::git::{GitAction, GitPushRequest};
 use crate::requests::retrieval::CodeRetrieveRequest;
+use crate::security::{RelPath, WorkspaceRoot};
 use crate::test_bash_executable;
 use chrono::{Duration as ChronoDuration, Utc};
 use parking_lot::Mutex;
@@ -184,42 +185,50 @@ impl ScriptedRepository {
 }
 
 impl RepositoryBackend for ScriptedRepository {
-    fn status(&self, _root: &Path) -> AppResult<RepoStatus> {
+    fn status(&self, _root: &WorkspaceRoot) -> AppResult<RepoStatus> {
         self.status
             .lock()
             .clone()
             .ok_or_else(|| AppError::new(ErrorCode::GitFailed, "scripted status failure"))
     }
-    fn diff(&self, _: &Path, staged: bool, paths: &[String], _: usize) -> AppResult<Diff> {
-        self.diff_requests.lock().push((staged, paths.to_vec()));
+    fn diff(
+        &self,
+        _: &WorkspaceRoot,
+        staged: bool,
+        paths: &[RelPath],
+        _: usize,
+    ) -> AppResult<Diff> {
+        self.diff_requests
+            .lock()
+            .push((staged, paths.iter().map(RelPath::to_string).collect()));
         Ok(Diff::parse(self.diff.lock().clone()))
     }
-    fn log(&self, _: &Path, _: usize) -> AppResult<String> {
+    fn log(&self, _: &WorkspaceRoot, _: usize) -> AppResult<String> {
         Ok(String::new())
     }
-    fn show(&self, _: &Path, _: &str, _: usize) -> AppResult<String> {
+    fn show(&self, _: &WorkspaceRoot, _: &str, _: usize) -> AppResult<String> {
         Ok(String::new())
     }
     fn blame(
         &self,
-        _: &Path,
-        _: &str,
+        _: &WorkspaceRoot,
+        _: &RelPath,
         _: Option<usize>,
         _: Option<usize>,
         _: usize,
     ) -> AppResult<String> {
         Ok(String::new())
     }
-    fn stage(&self, _: &Path, _: &[String]) -> AppResult<String> {
+    fn stage(&self, _: &WorkspaceRoot, _: &[RelPath]) -> AppResult<String> {
         Ok(String::new())
     }
-    fn commit(&self, _: &Path, _: &str) -> AppResult<String> {
+    fn commit(&self, _: &WorkspaceRoot, _: &str) -> AppResult<String> {
         Ok(String::new())
     }
-    fn restore(&self, _: &Path, _: &[String], _: bool) -> AppResult<String> {
+    fn restore(&self, _: &WorkspaceRoot, _: &[RelPath], _: bool) -> AppResult<String> {
         Ok(String::new())
     }
-    fn push(&self, _: &Path, _: &str, _: &str) -> AppResult<String> {
+    fn push(&self, _: &WorkspaceRoot, _: &str, _: &str) -> AppResult<String> {
         Ok(String::new())
     }
 }

@@ -1,6 +1,7 @@
 use super::*;
 use crate::error::ErrorCode;
 use crate::index::WorkspaceExclusions;
+use crate::security::WorkspaceRoot;
 use serde_json::Value;
 
 fn indexed(files: &[(&str, &str)]) -> (tempfile::TempDir, CodeIndex) {
@@ -11,7 +12,13 @@ fn indexed(files: &[(&str, &str)]) -> (tempfile::TempDir, CodeIndex) {
         std::fs::write(path, content).unwrap();
     }
     let exclusions = WorkspaceExclusions::new(root.path(), &[]).unwrap();
-    let index = CodeIndex::scan(root.path(), 1_000_000, &[], &exclusions).unwrap();
+    let index = CodeIndex::scan(
+        &WorkspaceRoot::open(root.path()).unwrap(),
+        1_000_000,
+        &[],
+        &exclusions,
+    )
+    .unwrap();
     (root, index)
 }
 

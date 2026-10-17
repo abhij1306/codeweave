@@ -21,18 +21,17 @@ use super::uri::UriCodec;
 use super::worker::{WorkerOperation, WorkerResponse};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::index::content_hash;
-use crate::security::read_workspace_file;
+use crate::security::{RelPath, WorkspaceRoot};
 use serde_json::{json, Value};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::path::Path;
 
 /// Largest file a semantic result may point into.
 const MAX_RESULT_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Workspace<'a> {
-    pub(crate) root: &'a Path,
+    pub(crate) root: &'a WorkspaceRoot,
     pub(crate) codec: &'a UriCodec,
     pub(crate) live: &'a LiveIndex,
 }
@@ -199,8 +198,9 @@ fn read_current(workspace: Workspace<'_>, relative: &str) -> AppResult<String> {
     Ok(text)
 }
 
-fn read_text(root: &Path, relative: &str, max_bytes: usize) -> AppResult<Option<String>> {
-    Ok(read_workspace_file(root, relative, max_bytes)?
+fn read_text(root: &WorkspaceRoot, relative: &str, max_bytes: usize) -> AppResult<Option<String>> {
+    Ok(root
+        .read_file(&RelPath::new(relative)?, max_bytes)?
         .and_then(|file| String::from_utf8(file.bytes).ok()))
 }
 

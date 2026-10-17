@@ -1,5 +1,6 @@
 use super::*;
 use crate::error::ErrorCode;
+use crate::security::WorkspaceRoot;
 use crate::symbols::extract_symbols;
 use std::collections::HashSet;
 use std::fs;
@@ -56,12 +57,23 @@ fn incremental_refresh_does_not_follow_symlinks_outside_workspace() {
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(outside.path().join("secret.rs"), "fn outside_secret() {}\n").unwrap();
     let exclusions = WorkspaceExclusions::new(root.path(), &[]).unwrap();
-    let mut index = CodeIndex::scan(root.path(), 1_000_000, &[], &exclusions).unwrap();
+    let mut index = CodeIndex::scan(
+        &WorkspaceRoot::open(root.path()).unwrap(),
+        1_000_000,
+        &[],
+        &exclusions,
+    )
+    .unwrap();
     let link = root.path().join("linked.rs");
     symlink(outside.path().join("secret.rs"), &link).unwrap();
 
     index
-        .refresh_paths(root.path(), &HashSet::from([link]), 1_000_000, &exclusions)
+        .refresh_paths(
+            &WorkspaceRoot::open(root.path()).unwrap(),
+            &HashSet::from([link]),
+            1_000_000,
+            &exclusions,
+        )
         .unwrap();
 
     assert!(index.get("linked.rs").is_none());
@@ -175,7 +187,13 @@ fn configured_exclusions_apply_to_scans_and_incremental_refreshes() {
     )
     .unwrap();
 
-    let mut index = CodeIndex::scan(workspace.path(), 2_000_000, &[], &exclusions).unwrap();
+    let mut index = CodeIndex::scan(
+        &WorkspaceRoot::open(workspace.path()).unwrap(),
+        2_000_000,
+        &[],
+        &exclusions,
+    )
+    .unwrap();
 
     assert!(index.get("src/lib.rs").is_some());
     assert!(index.get("backend/artifacts/result.json").is_none());
@@ -185,7 +203,7 @@ fn configured_exclusions_apply_to_scans_and_incremental_refreshes() {
     fs::write(&generated, "new generated result").unwrap();
     let changed = index
         .refresh_paths(
-            workspace.path(),
+            &WorkspaceRoot::open(workspace.path()).unwrap(),
             &HashSet::from([generated]),
             2_000_000,
             &exclusions,
@@ -228,7 +246,7 @@ fn artifact_scan_canonicalizes_workspace_root_for_containment() {
     let exclusions = WorkspaceExclusions::new(&noncanonical_root, &[]).unwrap();
 
     let index = CodeIndex::scan(
-        &noncanonical_root,
+        &WorkspaceRoot::open(&noncanonical_root).unwrap(),
         2_000_000,
         &["artifacts".to_owned()],
         &exclusions,

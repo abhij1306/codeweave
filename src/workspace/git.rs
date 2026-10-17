@@ -2,7 +2,7 @@ use super::state::MutationPermit;
 use super::{add_phase_metrics, Workspace};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::requests::git::{GitAction, GitDiffRequest, GitPushRequest};
-use crate::security::validate_relative;
+use crate::security::RelPath;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -187,9 +187,8 @@ impl Workspace {
                 self.char_budget(request.max_chars),
             )?,
             GitAction::Blame(request) => {
-                validate_paths(&request.paths)?;
-                let path = request
-                    .paths
+                let paths = validate_paths(&request.paths)?;
+                let path = paths
                     .first()
                     .ok_or_else(|| AppError::invalid("git blame requires one path"))?;
                 self.repository.blame(
@@ -277,16 +276,16 @@ impl Workspace {
         } else {
             (requested_scope, 0)
         };
-        validate_paths(&scope.paths)?;
+        let paths = validate_paths(&scope.paths)?;
         let diff = self.repository.diff(
             &self.root,
             scope.staged,
-            &scope.paths,
+            &paths,
             self.policy.max_context_chars,
         )?;
         let mut ranges = Vec::new();
         if let Some(symbol) = scope.symbol.as_deref() {
-            if scope.paths.len() != 1 {
+            if paths.len() != 1 {
                 return Err(AppError::invalid(
                     "git_diff symbol focus requires exactly one path",
                 ));
@@ -295,7 +294,7 @@ impl Workspace {
                 .state
                 .read()
                 .index()
-                .find_symbols(scope.paths.first().map(String::as_str), symbol);
+                .find_symbols(paths.first().map(RelPath::as_str), symbol);
             if symbols.len() != 1 {
                 return Err(AppError::with_details(
                     if symbols.is_empty() {
@@ -361,12 +360,12 @@ impl Workspace {
     fn git_mutation(&self, action: &GitAction, _permit: &MutationPermit) -> AppResult<String> {
         let output = match action {
             GitAction::Stage(request) => {
-                validate_paths(&request.paths)?;
-                self.repository.stage(&self.root, &request.paths)?
+                let paths = validate_paths(&request.paths)?;
+                self.repository.stage(&self.root, &paths)?
             }
             GitAction::Commit(request) => self.repository.commit(&self.root, &request.message)?,
             GitAction::Restore(request) => {
-                validate_paths(&request.paths)?;
+                let paths = validate_paths(&request.paths)?;
                 if !request.confirm {
                     return Err(AppError::new(
                         ErrorCode::ConfirmationRequired,
@@ -375,7 +374,7 @@ impl Workspace {
                 }
                 let output = self
                     .repository
-                    .restore(&self.root, &request.paths, request.staged)?;
+                    .restore(&self.root, &paths, request.staged)?;
                 self.rescan()?;
                 return Ok(output);
             }
@@ -389,9 +388,6 @@ impl Workspace {
 }
 
 /// Every path a Git action names must stay inside the repository.
-fn validate_paths(paths: &[String]) -> AppResult<()> {
-    for path in paths {
-        validate_relative(path)?;
-    }
-    Ok(())
+fn validate_paths(paths: &[String]) -> AppResult<Vec<RelPath>> {
+    paths.iter().map(|path| RelPath::new(path)).collect()
 }

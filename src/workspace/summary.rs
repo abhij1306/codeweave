@@ -16,7 +16,7 @@ impl Workspace {
         let index = view.index();
         Ok(json!({
             "workspace_id": self.id,
-            "root": self.root,
+            "root": self.root.path(),
             "generation": view.generation(),
             "snapshot_id": view.snapshot_id(),
             "file_count": index.file_count(),
@@ -110,7 +110,7 @@ impl Workspace {
             )]
         };
         let mut result = json!({
-            "workspace_id": self.id, "name": self.name, "root": self.root, "generation": view.generation(), "snapshot_id": view.snapshot_id(),
+            "workspace_id": self.id, "name": self.name, "root": self.root.path(), "generation": view.generation(), "snapshot_id": view.snapshot_id(),
             "file_count": index.file_count(), "languages": index.languages(), "repository": repository, "instructions": instructions,
             "capabilities": {
                 "bash_available": bash_available,

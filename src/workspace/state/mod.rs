@@ -34,8 +34,8 @@ pub(crate) use ledger::{temp_file_name, ChangeLedger, RunWindow};
 use crate::error::{AppError, AppResult};
 use crate::index::{CodeIndex, WorkspaceExclusions};
 use crate::repository::RepoStatus;
+use crate::security::WorkspaceRoot;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The identity of one reconciled state: an instance-local generation counter and
@@ -85,7 +85,7 @@ impl ReconciledState {
     /// from an empty status marked stale, like any later failed refresh.
     pub(crate) fn new(
         workspace_id: &str,
-        root: PathBuf,
+        root: WorkspaceRoot,
         exclusions: WorkspaceExclusions,
         index: CodeIndex,
         repo_status: AppResult<RepoStatus>,

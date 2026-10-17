@@ -26,7 +26,7 @@ use crate::index::{content_hash, CodeIndex, WorkspaceExclusions};
 use crate::model::{PolicyConfig, WorkspaceConfig};
 use crate::repository::{CliGitBackend, RepositoryBackend};
 use crate::retrieval::{execute_index_search, SearchRequest};
-use crate::security::canonical_root;
+use crate::security::WorkspaceRoot;
 use chrono::Utc;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::Mutex;
@@ -50,7 +50,7 @@ const INSTRUCTION_INLINE_CAP: usize = 4_096;
 pub struct Workspace {
     pub id: String,
     pub name: String,
-    root: PathBuf,
+    root: WorkspaceRoot,
     policy: PolicyConfig,
     artifact_paths: Vec<String>,
     exclusions: WorkspaceExclusions,
@@ -66,6 +66,11 @@ pub struct Workspace {
 impl Workspace {
     #[cfg(test)]
     pub fn root_path(&self) -> &Path {
+        self.root.path()
+    }
+
+    /// The workspace root handle every file read and write goes through.
+    pub fn root(&self) -> &WorkspaceRoot {
         &self.root
     }
 
@@ -103,12 +108,12 @@ impl Workspace {
     ) -> AppResult<Self> {
         let opened_started = Instant::now();
         let phase_started = Instant::now();
-        let root = canonical_root(Path::new(&config.path))?;
+        let root = WorkspaceRoot::open(Path::new(&config.path))?;
         let canonicalize_ms = phase_started.elapsed().as_millis();
-        let cache_key = content_hash(&root.to_string_lossy());
+        let cache_key = content_hash(&root.path().to_string_lossy());
         let workspace_cache = cache_root.join("repos").join(cache_key);
         fs::create_dir_all(&workspace_cache)?;
-        let exclusions = WorkspaceExclusions::new(&root, &config.exclude_paths)?;
+        let exclusions = WorkspaceExclusions::new(root.path(), &config.exclude_paths)?;
 
         let phase_started = Instant::now();
         let repo_status = repository.status(&root);
@@ -149,7 +154,7 @@ impl Workspace {
             })
             .map_err(AppError::internal)?;
         watcher
-            .watch(&root, RecursiveMode::Recursive)
+            .watch(root.path(), RecursiveMode::Recursive)
             .map_err(AppError::internal)?;
         let watcher_ms = watcher_started.elapsed().as_millis();
         let runtime_started = Instant::now();

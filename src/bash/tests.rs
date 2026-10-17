@@ -3,9 +3,14 @@ use super::*;
 use crate::error::ErrorCode;
 use crate::model::BashConfig;
 use crate::process_runtime::fake::FakeReaction;
+use crate::security::WorkspaceRoot;
 use crate::test_bash_executable;
 use std::fs;
 use tempfile::tempdir;
+
+fn workspace(root: &std::path::Path) -> WorkspaceRoot {
+    WorkspaceRoot::open(root).unwrap()
+}
 
 fn policy() -> PolicyConfig {
     PolicyConfig {
@@ -44,7 +49,7 @@ async fn explicit_invalid_bash_path_reports_unavailable_before_starting() {
 
     let error = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "printf test".to_owned(),
                 cwd: None,
@@ -77,7 +82,7 @@ async fn cwd_must_exist_inside_workspace() {
 
     let missing = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "printf test".to_owned(),
                 cwd: Some("missing".to_owned()),
@@ -94,7 +99,7 @@ async fn cwd_must_exist_inside_workspace() {
 
     let escaped = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "printf test".to_owned(),
                 cwd: Some("../outside".to_owned()),
@@ -113,7 +118,7 @@ async fn timeout_above_policy_maximum_is_rejected() {
     let supervisor = BashSupervisor::new(policy()).unwrap();
     let error = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "printf test".to_owned(),
                 cwd: None,
@@ -132,7 +137,7 @@ async fn foreground_commands_capture_stdout_stderr_and_failures() {
     let supervisor = BashSupervisor::new(policy()).unwrap();
     let succeeded = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "printf stdout; printf stderr >&2".to_owned(),
                 cwd: None,
@@ -149,7 +154,7 @@ async fn foreground_commands_capture_stdout_stderr_and_failures() {
 
     let failed = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "printf failed >&2; exit 7".to_owned(),
                 cwd: None,
@@ -170,7 +175,7 @@ async fn foreground_process_preserves_quotes_and_non_utf8_output() {
 
     let quoted = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "printf \"first's\"".to_owned(),
                 cwd: None,
@@ -185,7 +190,7 @@ async fn foreground_process_preserves_quotes_and_non_utf8_output() {
 
     let binary = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: r"printf '\377'".to_owned(),
                 cwd: None,
@@ -214,7 +219,7 @@ async fn foreground_wsl_bash_maps_windows_working_directory() {
         return;
     }
 
-    let root = std::env::current_dir().unwrap().canonicalize().unwrap();
+    let root = workspace(&std::env::current_dir().unwrap());
     let mut wsl_policy = policy();
     wsl_policy.bash.executable = wsl_bash.to_string_lossy().into_owned();
     let supervisor = BashSupervisor::new(wsl_policy).unwrap();
@@ -245,7 +250,7 @@ async fn background_commands_can_be_polled_paged_and_cancelled() {
     let supervisor = BashSupervisor::new(policy()).unwrap();
     let started = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "echo started; sleep 30".to_owned(),
                 cwd: None,
@@ -293,7 +298,7 @@ async fn queued_command_waits_for_the_active_run() {
     let supervisor = BashSupervisor::new(policy()).unwrap();
     let active = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "sleep 1".to_owned(),
                 cwd: None,
@@ -306,7 +311,7 @@ async fn queued_command_waits_for_the_active_run() {
     let active_run_id = active["run_id"].as_str().unwrap();
     let queued = supervisor
         .queue(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "printf queued > queued.txt".to_owned(),
                 cwd: None,
@@ -354,7 +359,7 @@ async fn client_abort_keeps_the_detached_run_alive() {
     // Start a slow command on a task we then abort, mirroring a dropped
     // request future.
     let bg = supervisor.clone();
-    let root_path = root.path().to_path_buf();
+    let root_path = workspace(root.path());
     let request_task = tokio::spawn(async move {
         bg.start(
             &root_path,
@@ -374,7 +379,7 @@ async fn client_abort_keeps_the_detached_run_alive() {
     // The detached command still owns the only execution slot.
     let retry = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "echo abandoned; sleep 5".to_owned(),
                 cwd: None,
@@ -398,7 +403,7 @@ async fn client_abort_keeps_the_detached_run_alive() {
     // The next process is clean: only its own output, no leakage.
     let fresh = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "printf fresh-output".to_owned(),
                 cwd: None,
@@ -423,7 +428,7 @@ async fn foreground_budget_auto_promotes_long_command() {
     let supervisor = BashSupervisor::new(promote_policy).unwrap();
     let result = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "echo warming; sleep 30".to_owned(),
                 cwd: None,
@@ -453,11 +458,17 @@ async fn identical_command_is_not_deduplicated() {
         background: None,
         timeout_ms: None,
     };
-    let first = supervisor.start(root.path(), request()).await.unwrap();
+    let first = supervisor
+        .start(&workspace(root.path()), request())
+        .await
+        .unwrap();
     assert_eq!(first["status"], "running");
     let run_id = first["run_id"].as_str().unwrap().to_owned();
 
-    let retry = supervisor.start(root.path(), request()).await.unwrap_err();
+    let retry = supervisor
+        .start(&workspace(root.path()), request())
+        .await
+        .unwrap_err();
     assert_eq!(retry.code(), ErrorCode::RunBusy);
     assert_eq!(retry.details().unwrap()["active_run"]["run_id"], run_id);
 
@@ -465,7 +476,7 @@ async fn identical_command_is_not_deduplicated() {
     // active run so the model can poll or cancel.
     let busy = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "echo other".to_owned(),
                 cwd: None,
@@ -489,7 +500,7 @@ async fn timeout_retains_partial_output() {
     let supervisor = BashSupervisor::new(timeout_policy).unwrap();
     let result = supervisor
         .start(
-            root.path(),
+            &workspace(root.path()),
             StartRequest {
                 command: "printf partial; sleep 30".to_owned(),
                 cwd: None,
@@ -543,7 +554,7 @@ async fn cancel_stops_the_process_group_and_keeps_partial_output() {
     let launcher = Arc::new(FakeLauncher::new("partial", FakeReaction::StopsOnTerminate));
     let supervisor = fake_supervisor(launcher.clone(), policy());
     let started = supervisor
-        .start(root.path(), request(Some(true), None))
+        .start(&workspace(root.path()), request(Some(true), None))
         .await
         .unwrap();
     let run_id = started["run_id"].as_str().unwrap();
@@ -573,7 +584,7 @@ async fn timeout_stops_the_process_and_reports_timed_out() {
     let supervisor = fake_supervisor(launcher.clone(), policy());
 
     let result = supervisor
-        .start(root.path(), request(None, Some(50)))
+        .start(&workspace(root.path()), request(None, Some(50)))
         .await
         .unwrap();
 
@@ -593,7 +604,7 @@ async fn a_process_that_ignores_terminate_is_killed_after_the_grace_period() {
     let supervisor = fake_supervisor(launcher.clone(), policy());
 
     let result = supervisor
-        .start(root.path(), request(None, Some(50)))
+        .start(&workspace(root.path()), request(None, Some(50)))
         .await
         .unwrap();
 
@@ -615,7 +626,7 @@ fn an_abandoned_run_is_cancelled_and_its_process_group_killed() {
         .unwrap();
     let run_id = runtime.block_on(async {
         let started = supervisor
-            .start(root.path(), request(Some(true), None))
+            .start(&workspace(root.path()), request(Some(true), None))
             .await
             .unwrap();
         let run_id = started["run_id"].as_str().unwrap().to_owned();
@@ -642,13 +653,13 @@ async fn a_queued_run_cancelled_before_it_starts_is_never_launched() {
     let launcher = Arc::new(FakeLauncher::new("", FakeReaction::StopsOnTerminate));
     let supervisor = fake_supervisor(launcher.clone(), policy());
     let active = supervisor
-        .start(root.path(), request(Some(true), None))
+        .start(&workspace(root.path()), request(Some(true), None))
         .await
         .unwrap();
     let active_id = active["run_id"].as_str().unwrap();
     wait_until(|| supervisor.status(active_id).unwrap()["status"] == "running").await;
     let queued = supervisor
-        .queue(root.path(), request(None, None))
+        .queue(&workspace(root.path()), request(None, None))
         .await
         .unwrap();
     let queued_id = queued["run_id"].as_str().unwrap();
@@ -681,7 +692,7 @@ async fn cancelling_a_finished_run_leaves_it_unchanged() {
     let launcher = Arc::new(FakeLauncher::new("out", FakeReaction::ExitsWith(3)));
     let supervisor = fake_supervisor(launcher, policy());
     let finished = supervisor
-        .start(root.path(), request(None, None))
+        .start(&workspace(root.path()), request(None, None))
         .await
         .unwrap();
     assert_eq!(finished["status"], "failed");
@@ -703,7 +714,7 @@ async fn only_the_newest_completed_runs_are_retained() {
     let mut run_ids = Vec::new();
     for _ in 0..=MAX_RETAINED_RUNS {
         let finished = supervisor
-            .start(root.path(), request(None, None))
+            .start(&workspace(root.path()), request(None, None))
             .await
             .unwrap();
         run_ids.push(finished["run_id"].as_str().unwrap().to_owned());
@@ -726,7 +737,7 @@ async fn output_streams_are_kept_apart_and_report_dropped_prefixes() {
     small.bash.max_output_chars = 8;
     let supervisor = fake_supervisor(Arc::new(launcher), small);
     let finished = supervisor
-        .start(root.path(), request(None, None))
+        .start(&workspace(root.path()), request(None, None))
         .await
         .unwrap();
     let run_id = finished["run_id"].as_str().unwrap();

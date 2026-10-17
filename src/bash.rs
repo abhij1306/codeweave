@@ -8,7 +8,7 @@ mod readiness;
 
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::model::PolicyConfig;
-use crate::security::resolve_existing;
+use crate::security::{RelPath, WorkspaceRoot};
 use chrono::{DateTime, Utc};
 use execution::{execute, finalize_run_error, AbandonGuard, ExecutionRequest, TERMINATE_GRACE};
 use launch::{Launcher, ShellLauncher};
@@ -23,7 +23,7 @@ pub use readiness::{BashReadiness, Readiness};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -272,7 +272,7 @@ impl BashSupervisor {
 
     fn prepare_start_request(
         &self,
-        root: &Path,
+        root: &WorkspaceRoot,
         request: StartRequest,
     ) -> AppResult<PreparedStartRequest> {
         let launcher = self.launcher()?;
@@ -281,17 +281,13 @@ impl BashSupervisor {
             return Err(AppError::invalid("Bash command cannot be empty"));
         }
         let cwd_relative = request.cwd.unwrap_or_else(|| ".".to_owned());
+        // The child process needs a path; the root handle confirms it names a
+        // directory inside the workspace first.
         let cwd = if cwd_relative == "." {
-            root.to_path_buf()
+            root.path().to_path_buf()
         } else {
-            resolve_existing(root, &cwd_relative)?
+            root.directory(&RelPath::new(&cwd_relative)?)?
         };
-        if !cwd.is_dir() {
-            return Err(AppError::new(
-                ErrorCode::InvalidCwd,
-                "Bash cwd is not a directory",
-            ));
-        }
         let timeout_ms = request
             .timeout_ms
             .unwrap_or(self.policy.bash.default_timeout_ms);
@@ -314,7 +310,11 @@ impl BashSupervisor {
         })
     }
 
-    pub async fn start(&self, root: &Path, request: StartRequest) -> AppResult<serde_json::Value> {
+    pub async fn start(
+        &self,
+        root: &WorkspaceRoot,
+        request: StartRequest,
+    ) -> AppResult<serde_json::Value> {
         let prepared = self.prepare_start_request(root, request)?;
         let permit = match self.run_permit.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -337,7 +337,7 @@ impl BashSupervisor {
 
     pub(crate) async fn queue(
         &self,
-        root: &Path,
+        root: &WorkspaceRoot,
         request: StartRequest,
     ) -> AppResult<serde_json::Value> {
         let mut prepared = self.prepare_start_request(root, request)?;

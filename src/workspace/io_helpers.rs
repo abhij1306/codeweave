@@ -1,9 +1,8 @@
 use super::edit::PlannedFile;
 use super::state::temp_file_name;
-use cap_std::{ambient_authority, fs::Dir};
+use crate::security::{RelPath, WorkspaceRoot};
 use similar::{ChangeTag, TextDiff};
 use std::io;
-use std::path::Path;
 use uuid::Uuid;
 
 pub(super) fn render_diff(plan: &[PlannedFile]) -> String {
@@ -42,101 +41,33 @@ pub(super) fn diff_stat(plan: &[PlannedFile]) -> Vec<(String, usize, usize)> {
                     ChangeTag::Equal => {}
                 }
             }
-            (item.path.clone(), added, removed)
+            (item.path.to_string(), added, removed)
         })
         .collect()
 }
 
-fn workspace_dir(root: &Path) -> io::Result<Dir> {
-    Dir::open_ambient_dir(root, ambient_authority())
-}
-
-fn relative_path(relative: &str) -> io::Result<std::path::PathBuf> {
-    crate::security::validate_relative(relative).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid workspace-relative path: {error}"),
-        )
-    })
-}
-
-pub(super) fn read_optional(root: &Path, relative: &str) -> io::Result<Option<String>> {
-    let dir = workspace_dir(root)?;
-    let relative = relative_path(relative)?;
-    match dir.read_to_string(relative) {
-        Ok(content) => Ok(Some(content)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-pub(super) fn remove_if_exists(root: &Path, relative: &str) -> io::Result<()> {
-    let dir = workspace_dir(root)?;
-    let relative = relative_path(relative)?;
-    match dir.remove_file(relative) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-pub(super) fn atomic_write(root: &Path, relative: &str, content: &str) -> io::Result<()> {
-    let dir = workspace_dir(root)?;
-    let relative = relative_path(relative)?;
-    if let Some(parent) = relative.parent() {
-        if !parent.as_os_str().is_empty() {
-            dir.create_dir_all(parent)?;
-        }
-    }
+/// Write `content` to `relative` through the workspace root, atomically.
+pub(super) fn atomic_write(
+    root: &WorkspaceRoot,
+    relative: &RelPath,
+    content: &str,
+) -> io::Result<()> {
     let name = relative
+        .as_path()
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("file");
-    let temp = relative.with_file_name(temp_file_name(name, &Uuid::new_v4().simple().to_string()));
-    if let Err(error) = dir.write(&temp, content) {
-        let _ = dir.remove_file(&temp);
-        return Err(error);
-    }
-    if let Err(error) = dir.rename(&temp, &dir, &relative) {
-        let _ = dir.remove_file(&temp);
-        return Err(error);
-    }
-    Ok(())
+    root.write_atomic(
+        relative,
+        content,
+        &temp_file_name(name, &Uuid::new_v4().simple().to_string()),
+    )
 }
 
-pub(super) fn restore_one(root: &Path, item: &PlannedFile) -> io::Result<()> {
+/// Put a planned file back to its content before the edit.
+pub(super) fn restore_one(root: &WorkspaceRoot, item: &PlannedFile) -> io::Result<()> {
     match &item.before {
         Some(content) => atomic_write(root, &item.path, content),
-        None => remove_if_exists(root, &item.path),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn atomic_write_creates_and_replaces_files() {
-        let root = tempdir().unwrap();
-        atomic_write(root.path(), "nested/value.txt", "first").unwrap();
-        atomic_write(root.path(), "nested/value.txt", "second").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("nested/value.txt")).unwrap(),
-            "second"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_rejects_symlink_escape() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        symlink(outside.path(), root.path().join("escape")).unwrap();
-
-        assert!(atomic_write(root.path(), "escape/value.txt", "blocked").is_err());
-        assert!(!outside.path().join("value.txt").exists());
+        None => root.remove_file(&item.path),
     }
 }

@@ -141,7 +141,7 @@ impl Application {
             PathBuf::from(config.cache_root.clone()),
         )?);
         let intelligence = Arc::new(IntelligenceService::new(
-            PathBuf::from(&repo.path),
+            actor.root().clone(),
             config.intelligence.clone(),
             actor.id.clone(),
             actor.state_reader(),
