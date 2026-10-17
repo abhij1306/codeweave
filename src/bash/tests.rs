@@ -648,6 +648,7 @@ async fn a_queued_run_cancelled_before_it_starts_is_never_launched() {
         .await
         .unwrap();
     let active_id = active["run_id"].as_str().unwrap();
+    wait_until(|| supervisor.status(active_id).unwrap()["status"] == "running").await;
     let queued = supervisor
         .queue(root.path(), request(None, None))
         .await
