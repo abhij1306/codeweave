@@ -7,6 +7,20 @@ Short definitions of the terms the code and docs use for workspace state.
 (`src/workspace`). It owns the reconciled state, the Git backend, the Bash
 supervisor and the file watcher.
 
+**Workspace root handle** (`WorkspaceRoot`): The canonical root path plus a
+confined directory handle, opened once per workspace (`src/security.rs`). Every
+file read and write goes through it, so no path, symlink or swapped directory
+can reach outside the root.
+
+**RelPath**: A workspace-relative path with `/` separators and no leading `./`,
+checked when it is built: absolute paths and `..`, root or drive components are
+rejected with `OUTSIDE_ROOT`. Index keys, edit plans and Git path arguments use
+it.
+
+**Content hash** (`ContentHash`): The lowercase hex SHA-256 of a file's text.
+Range handles, `expected_hash` preconditions, mutation records and language
+server synchronization compare it.
+
 **Reconciled state**: The index, the cached `git status` result with its stale
 flag, and the stamp, kept under one lock so they always describe the same moment
 (`src/workspace/state`). Readers take a consistent view; all changes go through
@@ -14,8 +28,8 @@ its single writer.
 
 **Stamp**: The generation plus the snapshot id of one reconciled state, always
 read together. The generation is an instance-local counter that rises with each
-published change. The snapshot id is derived from the index contents and HEAD, so
-callers can send it back as an edit precondition.
+published change. The snapshot id (`SnapshotId`) is derived from the index
+contents and HEAD, so callers can send it back as an edit precondition.
 
 **Repository status stale flag**: Set when the last `git status` refresh failed.
 The previous status is kept and responses report `repo_status_stale: true`
