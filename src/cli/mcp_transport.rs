@@ -11,7 +11,7 @@ use axum::{
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerInfo,
+        PaginatedRequestParams, ServerCapabilities, ServerConfig as McpServerConfig,
     },
     service::RequestContext,
     transport::{
@@ -59,8 +59,8 @@ impl CodeWeaveMcp {
 }
 
 impl ServerHandler for CodeWeaveMcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> McpServerConfig {
+        McpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(INSTRUCTIONS)
             .with_server_info(rmcp::model::Implementation::new(
                 SERVER_NAME,
