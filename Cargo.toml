@@ -30,7 +30,7 @@ clap = { version = "4.5", features = ["derive"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
 ignore = "0.4"
 notify = "8.2"
-parking_lot = "0.12"
+parking_lot = "0.13"
 regex = "1.13"
 rayon = "1.12"
 rmcp = { version = "3.2", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
